@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-05-03
+
+### Fixed
+- `bintrail shim` no longer silently truncates `_diff` responses at 1000 rows. The arbitrary cap dropped a partial audit history with no signal to the customer for any PK that exceeded it within the requested window. A `_diff` query is already PK-scoped and time-windowed, so the cap was protecting against a non-issue; customers who hit a real problem can narrow the `BETWEEN` range. The `Options.Limit` doc comment in `internal/query/query.go` is also corrected (`0 → no limit`, not the stale `0 → default 100`) so the contract `_diff` now relies on is documented (#245, #249).
+- `bintrail shim`'s accept loop now uses exponential backoff (100ms → 5s, doubling) instead of a fixed 100ms `time.Sleep`. A wedged listener (fd exhaustion, transient kernel state) previously emitted ~10 error log lines per second indefinitely while the process appeared alive; the new shape cuts steady-state log volume by ~50× without introducing a magic threshold. The sleep is also now a cancellable `select`, so a SIGTERM during a long backoff returns immediately instead of waiting up to 5s (#247, #251).
+
+### Changed
+- The image-selection branch of `internal/shim/handler.go` `runPointInTime` is extracted as a pure `selectImage([]query.ResultRow) map[string]any` helper. Behaviour is observably identical to the prior switch — `RowAfter` wins when present, falls back to `RowBefore` for DELETE events, returns nil for empty input or both-images-empty — but the priority rule is now testable without sqlmock or a real MySQL. Six table-driven cases lock the contract, including the `len() > 0` vs `!= nil` boundary that would silently regress DELETE handling on an empty non-nil RowAfter (#248, #250).
+
 ## [0.7.0] - 2026-05-03
 
 ### Added
