@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-03
+
 ### Added
 - New `bintrail shim` subcommand: an in-process MySQL-protocol server that answers BYOS time-travel SQL queries (`_flashback.*`, `_diff.*`, `_snapshot.*` virtual schemas) by translating them into the existing `query.FetchMerged` engine. The shim sits behind ProxySQL on `127.0.0.1:3308` by default; ProxySQL is the password gate, the shim validates only that the connecting username appears in `shim.yaml`. Recognised statement shapes: `SELECT * FROM _flashback.<table> AS OF '<ts>' WHERE <col> = <value>`, the same shape against `_snapshot`, and `SELECT * FROM _diff.<table> BETWEEN '<t1>' AND '<t2>' WHERE <col> = <value>`. Time-range queries auto-discover S3 archives via `archive_state` so rotated-out hours resolve transparently.
 
