@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-05-04
+
+### Fixed
+- `bintrail shim` no longer falsely classifies the current hour as a coverage gap. The shim was passing the user query's schema (e.g. `e2e_source`) as `DBName` to `query.FetchMerged`, which feeds the planner. The planner reads `information_schema.PARTITIONS WHERE TABLE_SCHEMA = ?`; with the wrong schema it returned zero partitions and treated every queried hour as rotated-out. Under `AllowGaps=false` (the default since 0.7.2) `_diff` queries aborted with a coverage-gap error; `_flashback` and `_snapshot` silently returned zero rows. The shim now plumbs the index DB name from the index DSN through a new `shim.Config.IndexDBName` field. As a hardening bonus, `bintrail shim` refuses to start if the index DSN cannot be parsed or omits the database — both conditions previously degraded silently. New integration tests (`-tags integration`) catch real `information_schema.PARTITIONS` shape drift the existing sqlmock tests cannot (#259, #260, #261).
+
 ## [0.7.2] - 2026-05-04
 
 ### Fixed
