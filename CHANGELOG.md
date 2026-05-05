@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-05-05
+
+### Fixed
+- `bintrail shim` no longer triggers ProxySQL to SHUNN its hostgroup when `monitor` (or any other unknown user) probes the listener. `TenantAuth.GetCredential` now returns `server.ErrAccessDenied` for unknown users, which `(*Conn).handshake` translates to `ER_ACCESS_DENIED_ERROR` (1045) on the wire. Previously the library raised `ER_NO_SUCH_USER` (1449) — ProxySQL classifies that as "backend broken" and SHUNNs the backend, making time-travel queries appear to silently return empty for ~N seconds at a time after every monitor probe. The shim's `handleConn` also classifies handshake errors via a new `classifyHandshakeErr` helper that uses `errors.Is` / `errors.As` against typed sentinels (`io.EOF`, `mysql.ErrBadConn`, `*mysql.MyError` with code 1045) instead of substring matches — so ProxySQL TCP probes drop to `Debug` and auth failures to `Info`, keeping the steady-state shim log clean (#262).
+- `bintrail shim` now accepts fully qualified time-travel queries like `SELECT * FROM _flashback.orders AS OF '...' WHERE id = 1` without requiring a prior `USE <db>`. The shim derives each tenant's source schema from `source_dsn` (via `mysqldriver.ParseDSN`) and pre-seeds `Handler.db` after a successful handshake; an explicit later `USE` from the client still wins. A misconfigured tenant (unparseable or path-less DSN) falls back to the previous "issue USE first" behaviour with a per-tenant warning, and `runShim` emits a startup-time summary log listing the affected users so operators can spot configurations where most tenants will need to issue `USE` manually. New exported `shim.LoadTenantConfigs` returns the validated tenant slice (including `SourceDSN`); `shim.LoadTenants` is preserved as a thin wrapper so existing callers and tests are unchanged (#263).
+
 ## [0.7.3] - 2026-05-04
 
 ### Fixed
