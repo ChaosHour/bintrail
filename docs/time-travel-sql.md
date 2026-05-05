@@ -1,12 +1,12 @@
-# BYOS Time-Travel SQL Setup
+# Time-Travel SQL Setup
 
-This walkthrough takes a BYOS customer from zero to running a working time-travel query against their own MySQL:
+This walkthrough takes you from zero to running a working time-travel query against your MySQL:
 
 ```sql
 SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 12345;
 ```
 
-The query is answered by `bintrail shim`, an in-process MySQL-protocol server (a subcommand of the `bintrail` binary you already have) that intercepts the virtual `_flashback`, `_diff`, and `_snapshot` schemas and resolves them against your bintrail index plus your customer-side S3 archives. ProxySQL sits in front of both your real MySQL and the shim, routing each query to the right backend.
+The query is answered by `bintrail shim`, an in-process MySQL-protocol server (a subcommand of the `bintrail` binary) that intercepts the virtual `_flashback`, `_diff`, and `_snapshot` schemas and resolves them against your bintrail index plus any rotated archives (local directory or `s3://` prefix). ProxySQL sits in front of both your real MySQL and the shim, routing each query to the right backend. The setup is the same whether you populate the index with `bintrail stream` (hosted) or `bintrail agent` (BYOS) — the shim only cares that the index exists and `archive_state` is current.
 
 ```
 ┌─────────────┐     :6033       ┌──────────┐    real query     ┌────────────┐
@@ -19,7 +19,7 @@ The query is answered by `bintrail shim`, an in-process MySQL-protocol server (a
                                 └──────────┘                   └────────────┘
 ```
 
-The whole walkthrough takes about 10 minutes on a fresh Ubuntu 22.04 or Amazon Linux 2023 host that already runs the bintrail agent.
+The whole walkthrough takes about 10 minutes on a fresh Ubuntu 22.04 or Amazon Linux 2023 host that already has a populated bintrail index.
 
 ---
 
@@ -27,12 +27,12 @@ The whole walkthrough takes about 10 minutes on a fresh Ubuntu 22.04 or Amazon L
 
 Before starting, you need:
 
-- **A running BYOS deployment.** The `bintrail agent` is already streaming from your source MySQL into your S3 bucket and the dbtrail metadata API. If you haven't done this yet, follow [`docs/storage.md`](storage.md) (data separation) and the BYOS architecture section of [`docs/deployment.md`](deployment.md) first.
-- **A `.bintrail.env` file** with `BINTRAIL_SOURCE_DSN` and `BINTRAIL_SERVER_ID` set. If you ran `bintrail config init` for your BYOS install you already have this.
-- **The `bintrail` binary** on the host (the same one running the agent). The shim is a subcommand — there is no second binary to download.
+- **A populated bintrail index.** Some process is keeping `binlog_events` current — typically `bintrail stream` (hosted) or `bintrail agent` (BYOS). If rotated hours have been archived, `archive_state` points at the local directory or `s3://` prefix where the Parquet files live. If you haven't set any of this up yet, see [`docs/streaming.md`](streaming.md) and [`docs/rotation-and-status.md`](rotation-and-status.md).
+- **A `.bintrail.env` file** with `BINTRAIL_SOURCE_DSN`, `BINTRAIL_INDEX_DSN`, and `BINTRAIL_SERVER_ID` set. `bintrail config init` scaffolds one.
+- **The `bintrail` binary** on the host. The shim is a subcommand — there is no second binary to download.
 - **Root or `sudo` access** on the host.
-- **The `mysql` client** installed on the host (used to apply ProxySQL config and to generate the password hash below).
-- **A MySQL user your application will use to connect through ProxySQL.** This is *not* the replication user the agent uses — it's a regular application user that ProxySQL authenticates against. Pick a username and a strong password; you'll need both below.
+- **The `mysql` client** installed on the host (used to apply ProxySQL config below).
+- **A MySQL user your application will use to connect through ProxySQL.** This is *not* the replication user the streamer uses — it's a regular application user that ProxySQL authenticates against. Pick a username and a strong password; you'll need both below.
 
 ---
 
@@ -146,8 +146,8 @@ Create `/etc/systemd/system/bintrail-shim.service`:
 
 ```ini
 [Unit]
-Description=bintrail shim - BYOS time-travel SQL backend for ProxySQL
-Documentation=https://github.com/dbtrail/bintrail/blob/main/docs/byos-time-travel-sql.md
+Description=bintrail shim - time-travel SQL backend for ProxySQL
+Documentation=https://github.com/dbtrail/bintrail/blob/main/docs/time-travel-sql.md
 After=network-online.target proxysql.service
 Wants=network-online.target
 
@@ -168,7 +168,7 @@ WantedBy=multi-user.target
 
 > A copy of this unit ships at `deploy/bintrail-shim.service` in the bintrail repo.
 
-The unit reads `BINTRAIL_INDEX_DSN` from `/etc/bintrail/.bintrail.env` (the same file your agent uses) so the shim can answer queries against your index. Make sure that variable is set in the env file before enabling the service.
+The unit reads `BINTRAIL_INDEX_DSN` from `/etc/bintrail/.bintrail.env` (the same file your agent uses) so the shim can answer queries against your index. The DSN must include the index database name (e.g. `…/bintrail_index`) — the shim refuses to start otherwise. Append `--allow-gaps` to `ExecStart` to warn-and-continue on archive failures or coverage gaps instead of returning a MySQL error to the client; the default is strict because the wire protocol has no warning channel.
 
 Enable and start:
 
@@ -229,7 +229,7 @@ SELECT * FROM _diff.orders BETWEEN '2026-05-01' AND '2026-05-02' WHERE id = 1234
 
 `_diff` returns the full per-PK event history within the requested window — there is no implicit row cap. If a single hot row produced thousands of events, you'll get all of them in one response; if that's too much for one query, narrow the `BETWEEN` range.
 
-The shim resolves the row by replaying the relevant binlog events from your bintrail MySQL index. If the timestamp falls outside the index's retention (because hourly partitions have been rotated to S3), the shim auto-discovers the customer-side Parquet archives via `archive_state` and merges results from both sources — same machinery `bintrail query` and `bintrail recover` already use.
+The shim resolves the row by replaying the relevant binlog events from your bintrail MySQL index. If the timestamp falls outside the index's retention (because hourly partitions have been rotated to S3), the shim auto-discovers the Parquet archives via `archive_state` and merges results from both sources — same machinery `bintrail query` and `bintrail recover` already use.
 
 ---
 
@@ -271,7 +271,7 @@ If `bintrail-shim` is dead, `journalctl -u bintrail-shim -n 100` shows why. Comm
 
 ### Time-travel query returns empty
 
-Either the row didn't exist at that timestamp, or the requested time falls in a gap between the live bintrail index and the S3 archive. Check the agent's recent log output:
+The row had no event at-or-before the requested timestamp. A coverage gap or archive failure would surface as a MySQL error instead, not as an empty result (unless you started the shim with `--allow-gaps`). Widen the lookup with `_diff` to inspect the per-PK history, or check the agent is keeping up:
 
 ```sh
 journalctl -u bintrail-agent -n 200

@@ -20,7 +20,7 @@ import (
 )
 
 // Handler implements server.Handler. It serves the small subset of
-// MySQL protocol the BYOS time-travel SQL story needs: USE <db>,
+// MySQL protocol the time-travel SQL story needs: USE <db>,
 // `SELECT * FROM _flashback.<table> AS OF '<ts>' WHERE <col> = <value>`,
 // and a handful of bookkeeping queries the standard MySQL clients send
 // during connection setup.

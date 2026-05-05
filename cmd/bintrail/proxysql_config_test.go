@@ -70,8 +70,8 @@ func TestRunProxySQLConfig(t *testing.T) {
 		out := string(data)
 
 		wants := []string{
-			"-- Bintrail BYOS time-travel SQL",
-			"docs/byos-time-travel-sql.md",
+			"-- Bintrail time-travel SQL",
+			"docs/time-travel-sql.md",
 			"BEGIN;",
 			"DELETE FROM mysql_servers WHERE hostgroup_id IN (990, 991);",
 			"INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES (990, 'db.example.com', 3306);",

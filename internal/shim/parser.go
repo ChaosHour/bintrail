@@ -1,5 +1,5 @@
 // Package shim implements an in-process MySQL-protocol server that
-// answers BYOS time-travel queries by translating them into bintrail's
+// answers time-travel queries by translating them into bintrail's
 // existing query engine.
 //
 // Three virtual-schema statement shapes are recognised:

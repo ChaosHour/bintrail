@@ -185,8 +185,8 @@ func TestGenerateShimYAMLContents(t *testing.T) {
 	out := generateShimYAML(testSourceDSN, testServerID, ":9999")
 
 	wants := []string{
-		"# Bintrail BYOS time-travel SQL",
-		"docs/byos-time-travel-sql.md",
+		"# Bintrail time-travel SQL",
+		"docs/time-travel-sql.md",
 		"listen: ':9999'",
 		"tenants:",
 		"server_id: '" + testServerID + "'",

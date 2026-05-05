@@ -1,6 +1,6 @@
 [Unit]
-Description=bintrail shim - BYOS time-travel SQL backend for ProxySQL
-Documentation=https://github.com/dbtrail/bintrail/blob/main/docs/byos-time-travel-sql.md
+Description=bintrail shim - time-travel SQL backend for ProxySQL
+Documentation=https://github.com/dbtrail/bintrail/blob/main/docs/time-travel-sql.md
 After=network-online.target proxysql.service
 Wants=network-online.target
 
