@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
@@ -21,9 +23,9 @@ import (
 	"github.com/dbtrail/bintrail/internal/shim"
 )
 
-// shimCmd serves the BYOS time-travel SQL endpoint as an in-process
-// MySQL-protocol server. Customers run this alongside the bintrail
-// agent on the same host; ProxySQL routes _flashback / _diff /
+// shimCmd serves the time-travel SQL endpoint as an in-process
+// MySQL-protocol server. Operators run this alongside the streamer
+// (stream or agent) on the same host; ProxySQL routes _flashback / _diff /
 // _snapshot virtual-schema queries to its --listen address.
 //
 // Recognised statement shapes (handled by internal/shim/parser.go):
@@ -46,11 +48,11 @@ import (
 // unreachable from the network anyway.
 var shimCmd = &cobra.Command{
 	Use:   "shim",
-	Short: "Run the BYOS time-travel SQL MySQL-protocol server",
-	Long: `Run an in-process MySQL-protocol server that answers BYOS
+	Short: "Run the time-travel SQL MySQL-protocol server",
+	Long: `Run an in-process MySQL-protocol server that answers
 time-travel SQL queries against the three virtual schemas
 _flashback / _snapshot / _diff. Intended to sit behind ProxySQL on the
-same host — see docs/byos-time-travel-sql.md for the end-to-end setup.
+same host — see docs/time-travel-sql.md for the end-to-end setup.
 
 The shim auto-discovers S3 archives via archive_state, so queries that
 reach back beyond the live MySQL index's retention window resolve
@@ -90,11 +92,39 @@ func init() {
 }
 
 func runShim(cmd *cobra.Command, args []string) error {
-	tenants, err := shim.LoadTenants(shShimConfig)
+	tenantCfgs, err := shim.LoadTenantConfigs(shShimConfig)
 	if err != nil {
 		return err
 	}
-	auth, err := shim.NewTenantAuth(tenants)
+	users := make(map[string]string, len(tenantCfgs))
+	for _, t := range tenantCfgs {
+		users[t.MySQLUser] = t.MySQLPassword
+	}
+	// userSchemas seeds Handler.db at handshake time so fully qualified
+	// time-travel queries like `SELECT * FROM _flashback.orders` work
+	// without a prior `USE <db>` (issue #263). Per-tenant warnings are
+	// emitted by buildUserSchemas; the partial-degradation summary
+	// below catches the more interesting case where so many tenants
+	// have unusable DSNs that the operator should notice at startup.
+	userSchemas := buildUserSchemas(tenantCfgs)
+	if missing := len(tenantCfgs) - len(userSchemas); missing > 0 {
+		// Name the affected users so a 50-tenant deployment doesn't
+		// force the operator to grep the prior per-tenant warnings.
+		missingUsers := make([]string, 0, missing)
+		for _, t := range tenantCfgs {
+			if _, ok := userSchemas[t.MySQLUser]; !ok {
+				missingUsers = append(missingUsers, t.MySQLUser)
+			}
+		}
+		slog.Warn(
+			"shim: some tenants have no usable default schema; queries from those tenants will require explicit `USE <db>`",
+			"tenants", len(tenantCfgs),
+			"with_default_schema", len(userSchemas),
+			"missing", missing,
+			"missing_users", missingUsers,
+		)
+	}
+	auth, err := shim.NewTenantAuth(users)
 	if err != nil {
 		return err
 	}
@@ -129,7 +159,11 @@ func runShim(cmd *cobra.Command, args []string) error {
 		)
 	}
 
-	slog.Info("shim listening", "addr", listener.Addr().String(), "tenants", len(tenants))
+	slog.Info("shim listening",
+		"addr", listener.Addr().String(),
+		"tenants", len(tenantCfgs),
+		"tenants_with_default_schema", len(userSchemas),
+	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -160,7 +194,7 @@ func runShim(cmd *cobra.Command, args []string) error {
 	}
 
 	cfg := shim.Config{AllowGaps: shAllowGaps, NoArchive: shNoArchive, IndexDBName: dsnCfg.DBName}
-	serveLoop(ctx, listener, db, auth, cfg)
+	serveLoop(ctx, listener, db, auth, cfg, userSchemas)
 	return nil
 }
 
@@ -174,7 +208,7 @@ func runShim(cmd *cobra.Command, args []string) error {
 // hiccup doesn't burn CPU and a permanent listener wedge doesn't fill
 // the log at ~10 lines/sec. The backoff resets to zero on every
 // successful Accept so a brief spike doesn't poison the steady state.
-func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, auth shim.TenantAuth, cfg shim.Config) {
+func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
@@ -205,7 +239,7 @@ func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, auth shim
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
-			handleConn(c, db, auth, cfg)
+			handleConn(c, db, auth, cfg, userSchemas)
 		}(conn)
 	}
 }
@@ -254,18 +288,108 @@ func isLoopbackAddr(addr net.Addr) bool {
 	return tcp.IP.IsLoopback()
 }
 
+// classifyHandshakeErr maps an error returned by go-mysql/server's
+// handshake into the slog level and message we want to log it at.
+//
+// ProxySQL's monitor opens a TCP socket on the shim's listen port,
+// reads nothing, then closes. go-mysql surfaces the resulting read
+// failure as either a raw io.EOF / io.ErrUnexpectedEOF (rare paths
+// outside packet/conn.go) or a pingcap-wrapped mysql.ErrBadConn (the
+// usual case — every read in packet/conn.go is wrapped this way, and
+// pingcap's Unwrap chain is errors.Is-compatible). Treat all three
+// as the expected probe shape and demote to Debug so the steady-
+// state log isn't a stack trace per probe.
+//
+// Auth failures from TenantAuth.GetCredential propagate as a
+// *mysql.MyError with code ER_ACCESS_DENIED_ERROR (1045). Note that
+// (*Conn).handshake also rewrites ErrAccessDeniedNoPassword (1698)
+// into 1045 before returning, so checking the single 1045 code
+// covers both no-password and bad-password cases — adding a 1698
+// branch here would be dead code. Log auth failures at Info so an
+// operator can correlate ProxySQL alerts with the shim's view of the
+// failure without an alarming ERROR line per monitor probe.
+//
+// Anything else is unexpected (bad packet, protocol mismatch, …) and
+// stays at Error so it surfaces in alerting.
+//
+// Extracted as a pure function so the classification can be unit-
+// tested with synthetic errors — without it, a future refactor that
+// flips a branch would silently re-introduce the issue #262 log
+// volume regression.
+func classifyHandshakeErr(err error) (slog.Level, string) {
+	switch {
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, gomysql.ErrBadConn):
+		return slog.LevelDebug, "handshake aborted (likely TCP probe)"
+	}
+	var myErr *gomysql.MyError
+	if errors.As(err, &myErr) && myErr.Code == gomysql.ER_ACCESS_DENIED_ERROR {
+		return slog.LevelInfo, "mysql auth failed"
+	}
+	return slog.LevelError, "mysql handshake failed"
+}
+
+// buildUserSchemas derives the per-tenant default schema for shim
+// connections by parsing each tenant's source_dsn /<db> path. The
+// returned map is keyed by mysql_user — handleConn looks the schema
+// up after handshake and seeds Handler.db so fully qualified
+// time-travel queries work without a prior `USE <db>` (issue #263).
+//
+// A tenant whose source_dsn is empty, unparseable, or missing the
+// /<db> path is omitted from the returned map (with a warning log).
+// That keeps a single misconfigured tenant from blocking the rest;
+// the affected user simply falls back to the pre-#263 behaviour of
+// requiring an explicit USE. runShim emits a summary if the count of
+// tenants-with-default-schema is below the total.
+func buildUserSchemas(tenantCfgs []shim.TenantConfig) map[string]string {
+	out := make(map[string]string, len(tenantCfgs))
+	for _, t := range tenantCfgs {
+		if t.SourceDSN == "" {
+			continue
+		}
+		cfg, err := mysqldriver.ParseDSN(t.SourceDSN)
+		if err != nil {
+			slog.Warn(
+				"shim.yaml: source_dsn is unparseable; fully qualified time-travel queries from this tenant will still require `USE <db>`",
+				"mysql_user", t.MySQLUser, "err", err,
+			)
+			continue
+		}
+		if cfg.DBName == "" {
+			slog.Warn(
+				"shim.yaml: source_dsn has no database path; fully qualified time-travel queries from this tenant will still require `USE <db>`",
+				"mysql_user", t.MySQLUser,
+			)
+			continue
+		}
+		out[t.MySQLUser] = cfg.DBName
+	}
+	return out
+}
+
 // handleConn wraps one accepted TCP connection in go-mysql/server's
 // Conn (which performs the MySQL handshake + auth) and dispatches
 // every COM_QUERY through our Handler.
-func handleConn(c net.Conn, db *sql.DB, auth shim.TenantAuth, cfg shim.Config) {
+//
+// userSchemas seeds the handler's default DB from the authenticated
+// tenant's source_dsn so fully qualified time-travel queries
+// (`_flashback.<table>`) succeed without a prior `USE <db>` (issue
+// #263). The seed runs only after a successful handshake — pre-auth
+// we don't know the tenant — and an explicit `USE` from the client
+// still wins because UseDB is called sequentially and overwrites the
+// seeded value.
+func handleConn(c net.Conn, db *sql.DB, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string) {
 	defer c.Close()
 
 	handler := shim.NewHandlerWithConfig(db, cfg, slog.Default())
 	srv := server.NewDefaultServer()
 	mysqlConn, err := server.NewCustomizedConn(c, srv, auth, handler)
 	if err != nil {
-		slog.Error("mysql handshake failed", "err", err, "remote", c.RemoteAddr())
+		level, msg := classifyHandshakeErr(err)
+		slog.Log(context.Background(), level, msg, "err", err, "remote", c.RemoteAddr())
 		return
+	}
+	if schema, ok := userSchemas[mysqlConn.GetUser()]; ok && schema != "" {
+		_ = handler.UseDB(schema)
 	}
 	for {
 		if err := mysqlConn.HandleCommand(); err != nil {
