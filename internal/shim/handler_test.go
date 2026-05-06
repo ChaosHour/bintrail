@@ -4,17 +4,21 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	_ "github.com/go-sql-driver/mysql" // database/sql driver registration
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
+	_ "github.com/go-sql-driver/mysql" // database/sql driver registration
 
+	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/parser"
 	"github.com/dbtrail/bintrail/internal/query"
 )
@@ -107,15 +111,15 @@ func TestHandlerUseDBStoresSchema(t *testing.T) {
 	}
 }
 
-// TestImageToResultColumnOrder — column order in the resultset must
-// be deterministic (alphabetical) so customers comparing two rows
-// across runs see consistent column positions.
+// TestImageToResultColumnOrder — when no DDL order is supplied
+// (snapshot missing or table unknown), columns fall back to
+// alphabetical order so the wire output stays deterministic.
 func TestImageToResultColumnOrder(t *testing.T) {
 	res, err := imageToResult(map[string]any{
 		"name":  "alice",
 		"id":    int64(42),
 		"email": "a@b.com",
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,8 +131,93 @@ func TestImageToResultColumnOrder(t *testing.T) {
 	for i, f := range res.Resultset.Fields {
 		got[i] = string(f.Name)
 	}
-	if !equalStrings(got, want) {
+	if !slices.Equal(got, want) {
 		t.Errorf("column order = %v, want %v", got, want)
+	}
+}
+
+// TestImageToResultRespectsDDLOrder — when ddlOrder is supplied,
+// the wire output emits columns in DDL position so customers see
+// the same column ordering they'd get from a regular `SELECT *`.
+// Without this the time-travel queries return alphabetised columns
+// which mismatches the source table's natural order, surprising
+// any side-by-side comparison the user might run.
+func TestImageToResultRespectsDDLOrder(t *testing.T) {
+	res, err := imageToResult(
+		map[string]any{
+			"id":   int64(42),
+			"sku":  "ABC-1",
+			"qty":  int64(2),
+			"note": "initial",
+		},
+		[]string{"id", "sku", "qty", "note"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"id", "sku", "qty", "note"}
+	got := make([]string, len(res.Resultset.Fields))
+	for i, f := range res.Resultset.Fields {
+		got[i] = string(f.Name)
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("column order = %v, want %v", got, want)
+	}
+}
+
+// TestOrderColumnsEdgeCases pins the merge behaviour for the
+// "image and snapshot disagree" cases. Each branch is a real
+// path the production code can hit when an ALTER TABLE happens
+// between the binlog event being indexed and the snapshot being
+// taken (or vice versa).
+func TestOrderColumnsEdgeCases(t *testing.T) {
+	cases := []struct {
+		name     string
+		image    map[string]any
+		ddlOrder []string
+		want     []string
+	}{
+		{
+			name:     "nil_ddl_order_falls_back_to_alphabetical",
+			image:    map[string]any{"sku": 1, "id": 2, "qty": 3},
+			ddlOrder: nil,
+			want:     []string{"id", "qty", "sku"},
+		},
+		{
+			name:     "empty_ddl_order_falls_back_to_alphabetical",
+			image:    map[string]any{"b": 1, "a": 2},
+			ddlOrder: []string{},
+			want:     []string{"a", "b"},
+		},
+		{
+			name:     "ddl_columns_missing_from_image_are_skipped",
+			image:    map[string]any{"id": 1, "qty": 3},
+			ddlOrder: []string{"id", "sku", "qty", "note"},
+			want:     []string{"id", "qty"},
+		},
+		{
+			name: "image_columns_missing_from_ddl_are_appended_alphabetically",
+			image: map[string]any{
+				"id": 1, "sku": 2, "qty": 3, "added_after": 4, "another_new": 5,
+			},
+			ddlOrder: []string{"id", "sku", "qty"},
+			want:     []string{"id", "sku", "qty", "added_after", "another_new"},
+		},
+		{
+			name:     "exact_match_preserves_ddl_order",
+			image:    map[string]any{"note": 4, "id": 1, "qty": 3, "sku": 2},
+			ddlOrder: []string{"id", "sku", "qty", "note"},
+			want:     []string{"id", "sku", "qty", "note"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := orderColumns(tc.image, tc.ddlOrder)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("orderColumns = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -222,7 +311,7 @@ func TestSelectImage(t *testing.T) {
 // TestImageToResultEmpty — an empty image (zero-key map) should
 // produce a resultset with no rows.
 func TestImageToResultEmpty(t *testing.T) {
-	res, err := imageToResult(map[string]any{})
+	res, err := imageToResult(map[string]any{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,6 +341,374 @@ func TestNewHandlerWiresArchiveFetcher(t *testing.T) {
 	h2 := NewHandlerWithConfig(nil, Config{}, nil)
 	if h2.archiveFetcher == nil {
 		t.Error("NewHandlerWithConfig must wire a non-nil archiveFetcher; got nil")
+	}
+}
+
+// TestNewHandlerWiresResolverFn — same boundary check as for the
+// archive fetcher: both constructors must install a non-nil
+// resolverFn or every time-travel query falls back to alphabetical
+// column order silently. A failure here means a refactor dropped
+// the schema_snapshots wiring; the e2e/shim test would catch it
+// end-to-end but at much higher cost.
+func TestNewHandlerWiresResolverFn(t *testing.T) {
+	if h := NewHandler(nil, nil); h.resolverFn == nil {
+		t.Error("NewHandler must wire a non-nil resolverFn; got nil")
+	}
+	if h := NewHandlerWithConfig(nil, Config{}, nil); h.resolverFn == nil {
+		t.Error("NewHandlerWithConfig must wire a non-nil resolverFn; got nil")
+	}
+}
+
+// TestColumnOrderForFallsBackOnResolverError pins the resilience
+// contract: when the resolver fails to load (no snapshot yet, DB
+// blip, ALTER TABLE the snapshot doesn't know about), columnOrderFor
+// returns nil so imageToResult silently degrades to alphabetical
+// order rather than failing the customer's query. The opposite
+// behaviour (hard-failing on resolver error) would make brand-new
+// installs that haven't run `bintrail snapshot` yet unable to
+// answer any time-travel query.
+func TestColumnOrderForFallsBackOnResolverError(t *testing.T) {
+	cases := []struct {
+		name       string
+		resolverFn func() (*metadata.Resolver, error)
+		want       []string
+	}{
+		{
+			name:       "resolver_load_fails",
+			resolverFn: func() (*metadata.Resolver, error) { return nil, errors.New("snapshot table missing") },
+			want:       nil,
+		},
+		{
+			name: "resolver_loads_but_table_unknown",
+			resolverFn: func() (*metadata.Resolver, error) {
+				return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{}), nil
+			},
+			want: nil,
+		},
+		{
+			name: "resolver_returns_table_in_ddl_order",
+			resolverFn: func() (*metadata.Resolver, error) {
+				return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+					"appdb.orders": {
+						Schema: "appdb", Table: "orders",
+						Columns: []metadata.ColumnMeta{
+							{Name: "id", OrdinalPosition: 1},
+							{Name: "sku", OrdinalPosition: 2},
+							{Name: "qty", OrdinalPosition: 3},
+							{Name: "note", OrdinalPosition: 4},
+						},
+					},
+				}), nil
+			},
+			want: []string{"id", "sku", "qty", "note"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &Handler{
+				logger:     slog.Default(),
+				resolverFn: tc.resolverFn,
+			}
+			got := h.columnOrderFor("appdb", "orders")
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("columnOrderFor = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolverCacheBehaviour pins five properties of the resolver
+// cache that columnOrderFor relies on. Each is documented in
+// handler.go's resolverCache type comment; this test enforces them.
+//
+//  1. Hit-within-TTL: a second columnOrderFor call within the TTL
+//     window must NOT invoke resolverFn — the resolver load is the
+//     expensive operation we're caching.
+//  2. Expiry-triggers-reload: a call after the TTL window invokes
+//     resolverFn again, so a fresh `bintrail snapshot` is picked up
+//     without restarting the shim.
+//  3. Sticky-fallback: when a refresh fails AND the cache holds a
+//     prior good resolver, we keep serving the stale resolver. This
+//     prevents transient index-DB blips from oscillating wire-
+//     protocol column order between DDL and alphabetical for the
+//     same customer connection.
+//  4. Sticky-fallback emits a Warn the first time it fires, so a
+//     persistent index-DB outage is operator-visible. Without this,
+//     a 2-hour outage is invisible because the wire response still
+//     looks healthy.
+//  5. Sticky-fallback Warns are rate-limited to one per TTL window
+//     so a hot shim doesn't spam the log under sustained outage.
+func TestResolverCacheBehaviour(t *testing.T) {
+	tableMeta := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"appdb.orders": {
+			Schema: "appdb", Table: "orders",
+			Columns: []metadata.ColumnMeta{
+				{Name: "id", OrdinalPosition: 1},
+				{Name: "sku", OrdinalPosition: 2},
+			},
+		},
+	})
+	silentLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	t.Run("hit_within_ttl_skips_loader", func(t *testing.T) {
+		now := time.Unix(1_700_000_000, 0)
+		calls := 0
+		c := resolverCache{}
+		load := func() (*metadata.Resolver, error) { calls++; return tableMeta, nil }
+
+		if _, err := c.get(func() time.Time { return now }, time.Minute, load, silentLogger); err != nil {
+			t.Fatalf("first get: %v", err)
+		}
+		if _, err := c.get(func() time.Time { return now.Add(30 * time.Second) }, time.Minute, load, silentLogger); err != nil {
+			t.Fatalf("second get: %v", err)
+		}
+		if calls != 1 {
+			t.Errorf("expected exactly 1 loader call within TTL, got %d", calls)
+		}
+	})
+
+	t.Run("ttl_expiry_triggers_reload", func(t *testing.T) {
+		now := time.Unix(1_700_000_000, 0)
+		calls := 0
+		c := resolverCache{}
+		load := func() (*metadata.Resolver, error) { calls++; return tableMeta, nil }
+
+		if _, err := c.get(func() time.Time { return now }, time.Minute, load, silentLogger); err != nil {
+			t.Fatalf("first get: %v", err)
+		}
+		if _, err := c.get(func() time.Time { return now.Add(2 * time.Minute) }, time.Minute, load, silentLogger); err != nil {
+			t.Fatalf("second get: %v", err)
+		}
+		if calls != 2 {
+			t.Errorf("expected 2 loader calls after TTL expiry, got %d", calls)
+		}
+	})
+
+	t.Run("sticky_fallback_on_load_error", func(t *testing.T) {
+		now := time.Unix(1_700_000_000, 0)
+		c := resolverCache{}
+		ok := func() (*metadata.Resolver, error) { return tableMeta, nil }
+		fail := func() (*metadata.Resolver, error) { return nil, errors.New("transient db blip") }
+
+		if _, err := c.get(func() time.Time { return now }, time.Minute, ok, silentLogger); err != nil {
+			t.Fatalf("warm-up: %v", err)
+		}
+		got, err := c.get(func() time.Time { return now.Add(2 * time.Minute) }, time.Minute, fail, silentLogger)
+		if err != nil {
+			t.Fatalf("expected sticky fallback to mask error, got: %v", err)
+		}
+		if got != tableMeta {
+			t.Errorf("expected sticky fallback to return prior resolver, got %v", got)
+		}
+	})
+
+	t.Run("error_with_no_prior_cache_surfaces", func(t *testing.T) {
+		c := resolverCache{}
+		want := errors.New("first-time db unreachable")
+		_, err := c.get(time.Now, time.Minute, func() (*metadata.Resolver, error) { return nil, want }, silentLogger)
+		if !errors.Is(err, want) {
+			t.Errorf("expected first-time error to surface, got: %v", err)
+		}
+	})
+
+	t.Run("sticky_fallback_warns_first_time", func(t *testing.T) {
+		now := time.Unix(1_700_000_000, 0)
+		c := resolverCache{}
+		ok := func() (*metadata.Resolver, error) { return tableMeta, nil }
+		fail := func() (*metadata.Resolver, error) { return nil, errors.New("db gone") }
+		rec := newRecordingHandler()
+		logger := slog.New(rec)
+
+		// Warm the cache so the next failure triggers sticky fallback.
+		if _, err := c.get(func() time.Time { return now }, time.Minute, ok, logger); err != nil {
+			t.Fatalf("warm-up: %v", err)
+		}
+		// Push past TTL with a failing load. Expect Warn.
+		if _, err := c.get(func() time.Time { return now.Add(2 * time.Minute) }, time.Minute, fail, logger); err != nil {
+			t.Fatalf("get during outage: %v", err)
+		}
+
+		warns := rec.atLevel(slog.LevelWarn)
+		if len(warns) != 1 {
+			t.Fatalf("expected 1 Warn record on first sticky-fallback, got %d: %v", len(warns), rec.records)
+		}
+		if !strings.Contains(warns[0].Message, "stale snapshot") {
+			t.Errorf("expected Warn about stale snapshot, got %q", warns[0].Message)
+		}
+	})
+
+	t.Run("sticky_fallback_warn_is_rate_limited_to_one_per_ttl", func(t *testing.T) {
+		now := time.Unix(1_700_000_000, 0)
+		c := resolverCache{}
+		ok := func() (*metadata.Resolver, error) { return tableMeta, nil }
+		fail := func() (*metadata.Resolver, error) { return nil, errors.New("db gone") }
+		rec := newRecordingHandler()
+		logger := slog.New(rec)
+		ttl := time.Minute
+
+		if _, err := c.get(func() time.Time { return now }, ttl, ok, logger); err != nil {
+			t.Fatalf("warm-up: %v", err)
+		}
+		// Three failing gets close together — only the first should Warn.
+		for i, dt := range []time.Duration{2 * time.Minute, 2*time.Minute + 5*time.Second, 2*time.Minute + 30*time.Second} {
+			if _, err := c.get(func() time.Time { return now.Add(dt) }, ttl, fail, logger); err != nil {
+				t.Fatalf("get #%d during outage: %v", i, err)
+			}
+		}
+
+		if got := len(rec.atLevel(slog.LevelWarn)); got != 1 {
+			t.Errorf("expected 1 Warn within TTL window, got %d", got)
+		}
+
+		// Push past the rate-limit window — expect a second Warn.
+		if _, err := c.get(func() time.Time { return now.Add(2*time.Minute + 70*time.Second) }, ttl, fail, logger); err != nil {
+			t.Fatalf("get past rate-limit: %v", err)
+		}
+		if got := len(rec.atLevel(slog.LevelWarn)); got != 2 {
+			t.Errorf("expected 2 Warns after TTL window expires, got %d", got)
+		}
+	})
+}
+
+// TestColumnOrderForDistinguishesNoSnapshotFromRealError pins the
+// log-level split documented in columnOrderFor: ErrNoSnapshots is
+// the benign first-install state (Debug log only) while any other
+// resolver-load error is a real config/infra problem (Warn log).
+// Both still return nil so the alphabetical fallback path runs.
+//
+// Without this test a future refactor that collapsed both error
+// paths back into the same Debug log would silently un-fix the
+// observability gap that motivated the sentinel — the recording
+// handler asserts on the actual emitted level rather than reading
+// the source.
+func TestColumnOrderForDistinguishesNoSnapshotFromRealError(t *testing.T) {
+	cases := []struct {
+		name      string
+		err       error
+		wantLevel slog.Level
+		wantMsg   string
+	}{
+		{
+			name:      "no_snapshots_logs_debug",
+			err:       metadata.ErrNoSnapshots,
+			wantLevel: slog.LevelDebug,
+			wantMsg:   "no snapshots",
+		},
+		{
+			name:      "real_error_logs_warn",
+			err:       errors.New("connection refused"),
+			wantLevel: slog.LevelWarn,
+			wantMsg:   "schema_snapshots lookup failed",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := newRecordingHandler()
+			h := &Handler{
+				logger:     slog.New(rec),
+				resolverFn: func() (*metadata.Resolver, error) { return nil, tc.err },
+			}
+			if got := h.columnOrderFor("appdb", "orders"); got != nil {
+				t.Errorf("expected nil fallback, got %v", got)
+			}
+			records := rec.atLevel(tc.wantLevel)
+			if len(records) != 1 {
+				t.Fatalf("expected exactly 1 record at level %s, got %d (all records: %v)",
+					tc.wantLevel, len(records), rec.records)
+			}
+			if !strings.Contains(records[0].Message, tc.wantMsg) {
+				t.Errorf("expected message containing %q, got %q", tc.wantMsg, records[0].Message)
+			}
+		})
+	}
+}
+
+// TestColumnOrderForUsesCache pins the wiring between columnOrderFor
+// and resolverCache. Without this test, a refactor that bypassed the
+// cache (e.g. called h.resolverFn() directly) would invalidate every
+// property TestResolverCacheBehaviour pins — the cache subtests would
+// still pass because they exercise the cache type directly, not the
+// integration. The test counts loader invocations across two
+// columnOrderFor calls within the TTL window and asserts the count
+// is exactly 1.
+func TestColumnOrderForUsesCache(t *testing.T) {
+	calls := 0
+	tableMeta := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"appdb.orders": {
+			Schema: "appdb", Table: "orders",
+			Columns: []metadata.ColumnMeta{
+				{Name: "id", OrdinalPosition: 1},
+				{Name: "sku", OrdinalPosition: 2},
+			},
+		},
+	})
+	h := &Handler{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolverFn: func() (*metadata.Resolver, error) {
+			calls++
+			return tableMeta, nil
+		},
+	}
+
+	if got := h.columnOrderFor("appdb", "orders"); !slices.Equal(got, []string{"id", "sku"}) {
+		t.Fatalf("first call: %v", got)
+	}
+	if got := h.columnOrderFor("appdb", "orders"); !slices.Equal(got, []string{"id", "sku"}) {
+		t.Fatalf("second call: %v", got)
+	}
+	if calls != 1 {
+		t.Errorf("expected resolverFn to be invoked exactly once across two columnOrderFor calls "+
+			"within the TTL window (cache wiring regression?), got %d calls", calls)
+	}
+}
+
+// TestMarshalImageOrderedDDL pins the contract that _diff JSON keys
+// follow the source table's DDL order — without this, runDiff's
+// row_before/row_after columns alphabetise (the json.Marshal(map)
+// default), creating an inconsistency with _flashback's reconstructed
+// row.
+func TestMarshalImageOrderedDDL(t *testing.T) {
+	cases := []struct {
+		name     string
+		image    map[string]any
+		ddlOrder []string
+		want     string
+	}{
+		{
+			name:     "ddl_order_respected",
+			image:    map[string]any{"id": 42, "sku": "ABC", "qty": 1, "note": "init"},
+			ddlOrder: []string{"id", "sku", "qty", "note"},
+			want:     `{"id":42,"sku":"ABC","qty":1,"note":"init"}`,
+		},
+		{
+			name:     "nil_image_renders_empty_string",
+			image:    nil,
+			ddlOrder: []string{"id"},
+			want:     "",
+		},
+		{
+			name:     "nil_ddl_order_falls_back_to_alphabetical",
+			image:    map[string]any{"id": 42, "sku": "ABC"},
+			ddlOrder: nil,
+			want:     `{"id":42,"sku":"ABC"}`,
+		},
+		{
+			name:     "image_columns_not_in_ddl_appended_alphabetically",
+			image:    map[string]any{"id": 1, "sku": "X", "added": "new"},
+			ddlOrder: []string{"id", "sku"},
+			want:     `{"id":1,"sku":"X","added":"new"}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := marshalImageOrdered(tc.image, tc.ddlOrder)
+			if got != tc.want {
+				t.Errorf("marshalImageOrdered = %s, want %s", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -604,19 +1061,6 @@ func driveClient(addr, user, password string) error {
 	return nil
 }
 
-// Avoid pulling fmt for simple equality.
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 // equalMaps compares two map[string]any by length and value identity
 // (==). Sufficient for the selectImage tests because they intentionally
 // pass the same map literal as both input and expected output, so a
@@ -635,6 +1079,45 @@ func equalMaps(a, b map[string]any) bool {
 		}
 	}
 	return true
+}
+
+// recordingHandler is a minimal slog.Handler that captures every
+// emitted record into an in-memory slice. Used by tests that need
+// to assert log levels and messages — without it we'd have to
+// either parse a TextHandler's stringly output or skip log-level
+// verification entirely (which is what the prior weakened test
+// resorted to). Concurrent-safe so it can sit behind a logger
+// shared across goroutines if a future test exercises that path.
+type recordingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func newRecordingHandler() *recordingHandler { return &recordingHandler{} }
+
+func (h *recordingHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+func (h *recordingHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(_ string) slog.Handler      { return h }
+
+// atLevel returns all captured records at exactly the given level.
+func (h *recordingHandler) atLevel(level slog.Level) []slog.Record {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []slog.Record
+	for _, r := range h.records {
+		if r.Level == level {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // Compile-time check: TenantAuth implements the credential provider

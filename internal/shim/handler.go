@@ -10,14 +10,26 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
 
+	"github.com/dbtrail/bintrail/internal/metadata"
 	"github.com/dbtrail/bintrail/internal/parquetquery"
 	"github.com/dbtrail/bintrail/internal/parser"
 	"github.com/dbtrail/bintrail/internal/query"
 )
+
+// resolverCacheTTL bounds how long a stale schema_snapshots view
+// can serve column-ordering lookups. 30s is short enough that a
+// fresh `bintrail snapshot` is visible within ops-monitoring time
+// (the typical "I just ran snapshot, why don't I see my new
+// column?" reaction window) and long enough to absorb any
+// reasonable shim QPS without re-loading the entire snapshot per
+// query — the previous per-query reload measurably loaded
+// information_schema-style data on every customer query.
+const resolverCacheTTL = 30 * time.Second
 
 // Handler implements server.Handler. It serves the small subset of
 // MySQL protocol the time-travel SQL story needs: USE <db>,
@@ -39,9 +51,126 @@ type Handler struct {
 	// `bintrail query` and `bintrail recover` use) — exposed as a field
 	// so tests can inject a fake without DuckDB or real S3.
 	archiveFetcher query.ArchiveFetcher
+	// resolverFn loads a metadata.Resolver from the latest
+	// schema_snapshots row. Production wires this to
+	// metadata.NewResolver(indexDB, 0), which issues a MAX(snapshot_id)
+	// lookup plus a full per-snapshot row scan that materialises every
+	// table's column metadata into memory — non-trivial under load.
+	// Tests inject a fake to exercise the column-ordering paths without
+	// an indexDB.
+	//
+	// Wrapped by resolverCache below so successive queries share one
+	// load for up to resolverCacheTTL; a fresh `bintrail snapshot`
+	// becomes visible at the next cache miss without explicit
+	// invalidation. Use resolver() (not resolverFn directly) from
+	// production code so the cache + sticky-fallback policy applies.
+	resolverFn    func() (*metadata.Resolver, error)
+	resolverCache resolverCache
 
 	mu sync.Mutex
 	db string // currently selected database (per COM_INIT_DB)
+}
+
+// resolverCache memoises the latest metadata.Resolver across shim
+// queries. The zero value is ready to use.
+//
+// Caching policy:
+//   - Hit-within-TTL → return cached resolver, no loader call.
+//   - Miss-or-expired → run loader OUTSIDE the mutex (so a slow
+//     index DB does not serialise concurrent shim queries),
+//     then re-acquire to publish.
+//   - Loader fails AND a prior resolver is cached → sticky
+//     fallback: return the stale resolver rather than the error
+//     so transient index-DB blips don't oscillate wire-protocol
+//     column order between DDL and alphabetical across consecutive
+//     customer queries. Logged at Warn (rate-limited to once per
+//     TTL window) so a *persistent* outage is still operator-
+//     visible — without rate limiting a hot shim would spam the
+//     log; without warning at all the outage is invisible
+//     because the wire response still looks healthy.
+//   - Loader fails AND no prior resolver → surface the error so
+//     columnOrderFor can apply its sentinel-vs-real-error split.
+//
+// We do NOT extend the timestamp on a sticky-fallback hit: the
+// next query still tries to refresh, so a recovered DB picks up
+// the new snapshot at the next attempt rather than waiting
+// another full TTL.
+//
+// Thundering-herd note: N concurrent cache misses do N redundant
+// loads (instead of singleflight collapsing to 1+N-1 waits). The
+// trade-off is intentional — TTL bounds miss frequency to once
+// per 30s and shim QPS is interactive (customer-driven), so the
+// extra load cost is bounded; in exchange we avoid serialising
+// every query behind one slow loader. Add singleflight if
+// profiling shows the redundant loads matter.
+type resolverCache struct {
+	mu           sync.Mutex
+	loaded       *metadata.Resolver
+	loadedAt     time.Time
+	lastWarnedAt time.Time // sticky-fallback Warn rate-limiter
+}
+
+// get returns the cached Resolver when fresh, otherwise invokes
+// load (outside the mutex). On load error: returns the stale
+// Resolver if cached + emits a rate-limited Warn; or surfaces the
+// error when no prior resolver exists.
+//
+// `now` is injected for deterministic tests; production passes
+// time.Now. logger receives the sticky-fallback Warn — pass
+// slog.Default() if you don't have a per-handler logger.
+func (c *resolverCache) get(
+	now func() time.Time,
+	ttl time.Duration,
+	load func() (*metadata.Resolver, error),
+	logger *slog.Logger,
+) (*metadata.Resolver, error) {
+	// Snapshot under lock so the publish below races with us only
+	// to its own benefit (we'd see the fresher resolver on relock).
+	c.mu.Lock()
+	cached := c.loaded
+	cachedAt := c.loadedAt
+	c.mu.Unlock()
+
+	if cached != nil && now().Sub(cachedAt) < ttl {
+		return cached, nil
+	}
+
+	r, loadErr := load()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if loadErr != nil {
+		// Distinguish three sub-cases on the relock:
+		//   (a) another goroutine refreshed during our load → use
+		//       the fresh resolver, no warn (it's not actually
+		//       stale).
+		//   (b) cache was empty when we started AND another
+		//       goroutine populated it → same as (a).
+		//   (c) nothing changed → genuine sticky fallback. Warn
+		//       rate-limited so the operator sees a persistent
+		//       outage but the log isn't spammed at shim QPS.
+		if c.loaded != nil && !c.loadedAt.Equal(cachedAt) {
+			return c.loaded, nil // (a) or (b)
+		}
+		if c.loaded != nil {
+			if now().Sub(c.lastWarnedAt) >= ttl {
+				logger.Warn(
+					"shim: resolver refresh failed; serving stale snapshot",
+					"err", loadErr,
+					"stale_age", now().Sub(c.loadedAt).Round(time.Second),
+				)
+				c.lastWarnedAt = now()
+			}
+			return c.loaded, nil
+		}
+		return nil, loadErr
+	}
+
+	c.loaded = r
+	c.loadedAt = now()
+	c.lastWarnedAt = time.Time{} // recovered — reset rate-limit so next outage warns immediately
+	return r, nil
 }
 
 // Config tunes the shim's data-fetch behaviour.
@@ -88,6 +217,7 @@ func NewHandlerWithConfig(indexDB *sql.DB, cfg Config, logger *slog.Logger) *Han
 		cfg:            cfg,
 		logger:         logger,
 		archiveFetcher: parquetquery.Fetch,
+		resolverFn:     func() (*metadata.Resolver, error) { return metadata.NewResolver(indexDB, 0) },
 	}
 }
 
@@ -185,7 +315,58 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 	if image == nil {
 		return emptyResult(), nil
 	}
-	return imageToResult(image)
+	return imageToResult(image, h.columnOrderFor(q.Schema, q.Table))
+}
+
+// columnOrderFor returns the column names of schema.table in DDL
+// (ordinal_position) order so the wire-protocol resultset matches
+// what a regular MySQL `SELECT *` would emit. Returns nil when no
+// snapshot is available or the table is missing from the latest
+// snapshot — the caller falls back to alphabetical ordering of the
+// JSON image keys.
+//
+// Logging policy is split deliberately so operators can tell
+// "first-install with no snapshot yet" apart from real DB-side
+// failure:
+//
+//   - metadata.ErrNoSnapshots → Debug. Benign first-install state;
+//     the operator just hasn't run `bintrail snapshot` yet.
+//   - any other resolver-load error → Warn. Index DB is unreachable
+//     or schema_snapshots is unreadable — a real config/infra
+//     problem the operator should see at default --log-level info.
+//   - table not in snapshot → Debug. Common for tables created
+//     after the latest snapshot was taken; benign and self-fixing
+//     once a fresh snapshot runs.
+//
+// A janky-but-deterministic fallback is strictly better than a
+// hard failure on what is otherwise a working query — but the
+// fallback should be loud when it's hiding a real outage.
+func (h *Handler) columnOrderFor(schema, table string) []string {
+	if h.resolverFn == nil {
+		return nil
+	}
+	r, err := h.resolverCache.get(time.Now, resolverCacheTTL, h.resolverFn, h.logger)
+	if err != nil {
+		if errors.Is(err, metadata.ErrNoSnapshots) {
+			h.logger.Debug("shim: no snapshots yet; falling back to alphabetical column order",
+				"schema", schema, "table", table)
+		} else {
+			h.logger.Warn("shim: schema_snapshots lookup failed; falling back to alphabetical column order",
+				"err", err, "schema", schema, "table", table)
+		}
+		return nil
+	}
+	tm, err := r.Resolve(schema, table)
+	if err != nil {
+		h.logger.Debug("shim: table not in latest snapshot; falling back to alphabetical column order",
+			"err", err, "schema", schema, "table", table)
+		return nil
+	}
+	cols := make([]string, 0, len(tm.Columns))
+	for _, c := range tm.Columns {
+		cols = append(cols, c.Name)
+	}
+	return cols
 }
 
 // selectImage picks the row image that represents the row's state at
@@ -262,6 +443,13 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 		return nil, fmt.Errorf("resolve %s: %w", q.Type, err)
 	}
 
+	// Compute the source-table column order once per query so the
+	// per-row JSON images encode keys in DDL order (matching what
+	// _flashback / _snapshot return for SELECT *). Without this the
+	// row_before / row_after JSON keys would alphabetise — surprising
+	// when a customer compares _diff output side by side with the
+	// reconstructed flashback row.
+	ddlOrder := h.columnOrderFor(q.Schema, q.Table)
 	cols := []string{"event_id", "event_timestamp", "event_type", "gtid", "row_before", "row_after"}
 	values := make([][]any, 0, len(rows))
 	for _, r := range rows {
@@ -274,8 +462,8 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 			r.EventTimestamp.UTC().Format("2006-01-02 15:04:05"),
 			eventTypeName(r.EventType),
 			gtid,
-			marshalImage(r.RowBefore),
-			marshalImage(r.RowAfter),
+			marshalImageOrdered(r.RowBefore, ddlOrder),
+			marshalImageOrdered(r.RowAfter, ddlOrder),
 		})
 	}
 	rs, err := mysql.BuildSimpleTextResultset(cols, values)
@@ -300,37 +488,85 @@ func eventTypeName(t parser.EventType) string {
 	return fmt.Sprintf("type_%d", t)
 }
 
-// marshalImage renders a row image as a JSON string for the _diff
-// resultset. nil maps render as the empty string so customers can
-// distinguish "no image" (INSERT lacks row_before, DELETE lacks
-// row_after) from "empty image".
-func marshalImage(image map[string]any) string {
+// marshalImageOrdered renders a row image as a JSON string for the
+// _diff resultset, emitting keys in ddlOrder so the JSON column
+// order matches what _flashback / _snapshot return. nil maps render
+// as the empty string so customers can distinguish "no image"
+// (INSERT lacks row_before, DELETE lacks row_after) from "empty
+// image".
+//
+// ddlOrder=nil falls back to encoding/json's default
+// alphabetical-key marshalling — same degraded path as
+// imageToResult when no snapshot is available.
+//
+// Built by hand rather than via json.Marshal(map) because the stdlib
+// encoder sorts map keys alphabetically with no override hook. The
+// per-key json.Marshal calls reuse the stdlib encoder for the
+// quoted key and the value, so string escaping (quotes, control
+// chars, non-printable bytes) stays correct without a custom
+// escaper here.
+//
+// Failure modes (all return ""):
+//   - nil image (the documented "no image" sentinel).
+//   - any inner json.Marshal error — e.g. a value of type chan,
+//     func, NaN/Inf float, or a custom type whose MarshalJSON
+//     returns an error. None of these can appear in a row image
+//     decoded from MySQL JSON columns (parser rejects them on
+//     INSERT, json.Unmarshal rejects them on read), so the failure
+//     path is theoretical for production data; if it ever fires
+//     the customer sees a missing row image rather than a partial
+//     one, matching the original marshalImage behaviour.
+func marshalImageOrdered(image map[string]any, ddlOrder []string) string {
 	if image == nil {
 		return ""
 	}
-	b, err := json.Marshal(image)
-	if err != nil {
-		return ""
+	if len(ddlOrder) == 0 {
+		b, err := json.Marshal(image)
+		if err != nil {
+			return ""
+		}
+		return string(b)
 	}
-	return string(b)
+	cols := orderColumns(image, ddlOrder)
+	var sb strings.Builder
+	sb.WriteByte('{')
+	for i, c := range cols {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		keyJSON, err := json.Marshal(c)
+		if err != nil {
+			return ""
+		}
+		sb.Write(keyJSON)
+		sb.WriteByte(':')
+		valJSON, err := json.Marshal(image[c])
+		if err != nil {
+			return ""
+		}
+		sb.Write(valJSON)
+	}
+	sb.WriteByte('}')
+	return sb.String()
 }
 
 // imageToResult turns a single-row JSON object into a mysql.Result
-// shaped for the wire protocol. Column order is the JSON key order
-// after sorting alphabetically — deterministic, and good enough for
-// the MVP. A future revision can pick the order from the schema
-// snapshot to match the source table's DDL.
-func imageToResult(image map[string]any) (*mysql.Result, error) {
+// shaped for the wire protocol. Columns are emitted in ddlOrder
+// (the source table's column ordinal_position from the latest
+// schema_snapshots row) so a customer running
+// `SELECT * FROM _flashback.orders ...` gets the same column
+// ordering they'd get from a regular `SELECT * FROM orders` — no
+// surprising reshuffling between the two.
+//
+// ddlOrder=nil signals "no snapshot available"; in that case we
+// fall back to alphabetical key order, which is deterministic but
+// won't match the table's natural DDL order.
+func imageToResult(image map[string]any, ddlOrder []string) (*mysql.Result, error) {
 	if len(image) == 0 {
 		return emptyResult(), nil
 	}
 
-	cols := make([]string, 0, len(image))
-	for k := range image {
-		cols = append(cols, k)
-	}
-	sort.Strings(cols)
-
+	cols := orderColumns(image, ddlOrder)
 	row := make([]any, len(cols))
 	for i, c := range cols {
 		row[i] = image[c]
@@ -341,6 +577,47 @@ func imageToResult(image map[string]any) (*mysql.Result, error) {
 		return nil, fmt.Errorf("build resultset: %w", err)
 	}
 	return &mysql.Result{Resultset: rs}, nil
+}
+
+// orderColumns returns the column emission order for a row image:
+//
+//  1. Columns from ddlOrder that are present in image, in
+//     ddlOrder sequence — this is the canonical case.
+//  2. Then any columns present in image but not in ddlOrder, sorted
+//     alphabetically. Catches the edge case where the binlog event
+//     pre-dates a recent ALTER TABLE captured by the next snapshot,
+//     so the image carries a column the snapshot doesn't know about
+//     (or vice versa). Better to surface it at the end than to drop
+//     it silently.
+//
+// Pure function — extracted from imageToResult specifically so the
+// ordering rules can be unit-tested without spinning up MySQL.
+func orderColumns(image map[string]any, ddlOrder []string) []string {
+	if len(ddlOrder) == 0 {
+		cols := make([]string, 0, len(image))
+		for k := range image {
+			cols = append(cols, k)
+		}
+		sort.Strings(cols)
+		return cols
+	}
+
+	cols := make([]string, 0, len(image))
+	seen := make(map[string]bool, len(image))
+	for _, c := range ddlOrder {
+		if _, ok := image[c]; ok {
+			cols = append(cols, c)
+			seen[c] = true
+		}
+	}
+	var extras []string
+	for k := range image {
+		if !seen[k] {
+			extras = append(extras, k)
+		}
+	}
+	sort.Strings(extras)
+	return append(cols, extras...)
 }
 
 // emptyResult is the wire-protocol "zero rows" reply. We still need a
