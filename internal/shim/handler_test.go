@@ -517,6 +517,287 @@ func TestSelectImage(t *testing.T) {
 	}
 }
 
+// TestExtractFullTableImagesPinsDivergence locks in the contract
+// divergence between full-table reconstruction (#276) and the existing
+// point-lookup path. Given the SAME DELETE event:
+//   - selectImage returns the row_before — the row's last known state.
+//   - extractFullTableImages skips it — the row didn't exist at AS OF.
+//
+// A future refactor that "unifies" the two paths would silently break
+// either point-lookup forensics or full-table correctness. Pinning
+// both behaviors against the same input here turns that into a loud
+// test failure.
+func TestExtractFullTableImagesPinsDivergence(t *testing.T) {
+	deleteRow := query.ResultRow{
+		EventType: parser.EventDelete,
+		RowBefore: map[string]any{"id": int64(1), "qty": int64(5)},
+	}
+	insertRow := query.ResultRow{
+		EventType: parser.EventInsert,
+		RowAfter:  map[string]any{"id": int64(2), "qty": int64(7)},
+	}
+	// Empty row_after is the "rare — corrupted index" branch. Drop
+	// it so the resultset doesn't overstate the row count with an
+	// all-null phantom row.
+	emptyAfterRow := query.ResultRow{
+		EventType: parser.EventInsert,
+		RowAfter:  nil,
+	}
+
+	if got := selectImage([]query.ResultRow{deleteRow}); got == nil {
+		t.Errorf("selectImage([DELETE]) must keep row_before for point-lookup; got nil")
+	}
+	if got := extractFullTableImages([]query.ResultRow{deleteRow}); len(got) != 0 {
+		t.Errorf("extractFullTableImages([DELETE]) must skip the row; got %v", got)
+	}
+	if got := extractFullTableImages([]query.ResultRow{emptyAfterRow}); len(got) != 0 {
+		t.Errorf("extractFullTableImages([INSERT with empty row_after]) must skip the row; got %v", got)
+	}
+
+	mixed := []query.ResultRow{insertRow, deleteRow, emptyAfterRow, insertRow}
+	images := extractFullTableImages(mixed)
+	if len(images) != 2 {
+		t.Errorf("extractFullTableImages: DELETE + empty_after must both be skipped, kept rows = %d, want 2", len(images))
+	}
+}
+
+// TestRunPointInTimeDispatchesByPKColumn pins the fix for the empty-
+// string PK collision: `WHERE id = ''` is a legitimate single-row
+// query against a NOT-NULL VARCHAR with empty default, and a dispatch
+// on q.PKValue would silently flip it into a 100k-row table scan.
+//
+// The previous version of this test re-implemented `q.PKColumn == ""`
+// inline and asserted the predicate against itself — a tautology that
+// would still pass even if runPointInTime ignored its argument
+// entirely. This rewrite drives runPointInTime through sqlmock and
+// observes which SQL pattern reaches the index DB, which is the
+// only thing that proves the dispatch is correct.
+//
+// Path detection:
+//   - Point-lookup SQL contains `pk_hash = SHA2` (the hash + value
+//     guard the SQL builder emits when Options.PKValues != "").
+//   - Full-table SQL omits that filter entirely. We detect it via
+//     the cost-cap behavioural signature: only runFullTable performs
+//     the >cap check, so seeding cap+1 rows surfaces 1104 iff
+//     dispatch reached runFullTable.
+func TestRunPointInTimeDispatchesByPKColumn(t *testing.T) {
+	t.Run("PKColumn_set_runs_point_lookup_sql", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		mock.MatchExpectationsInOrder(false)
+		mock.ExpectQuery("information_schema.PARTITIONS").
+			WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME", "PARTITION_DESCRIPTION"}))
+		// Anchor on `pk_hash = SHA2` — unique to the point-lookup SQL.
+		// If runPointInTime wrongly dispatched to runFullTable, the
+		// emitted SQL would lack pk_hash and ExpectationsWereMet would
+		// fail with "expected query was not matched".
+		mock.ExpectQuery("pk_hash = SHA2").
+			WillReturnRows(emptyBinlogEventsRows())
+
+		h := &Handler{
+			indexDB: db,
+			cfg:     Config{AllowGaps: true, IndexDBName: "bintrail_index", NoArchive: true},
+			logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+			archiveFetcher: func(ctx context.Context, _ query.Options, _ string) ([]query.ResultRow, error) {
+				return nil, nil
+			},
+		}
+		h.UseDB("myapp")
+
+		q := TimeTravelQuery{Type: TypeFlashback, Schema: "myapp", Table: "orders",
+			PKColumn: "id", PKValue: "42", AsOf: time.Now().UTC()}
+		_, _ = h.runPointInTime(q) // result irrelevant; mock matching is the assertion
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("expected point-lookup SQL with pk_hash filter; got: %v", err)
+		}
+	})
+
+	t.Run("empty_PKColumn_dispatches_to_full_table", func(t *testing.T) {
+		// Behavioural proof of dispatch: only runFullTable performs
+		// the cap check. Lower the cap to 1 via Config (no global
+		// state), seed 2 rows, expect ER_TOO_BIG_SELECT. If
+		// runPointInTime stayed on the point-lookup branch despite
+		// PKColumn="", no cap check would fire and the test would
+		// fail loud.
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		mock.MatchExpectationsInOrder(false)
+		mock.ExpectQuery("information_schema.PARTITIONS").
+			WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME", "PARTITION_DESCRIPTION"}))
+		rows := sqlmock.NewRows(binlogEventsColumns())
+		now := time.Now().UTC()
+		for i := 0; i < 2; i++ {
+			rows.AddRow(int64(i+1), "binlog.000001", int64(100), int64(200), now,
+				nil, nil, "myapp", "orders", parser.EventInsert,
+				fmt.Sprintf("%d", i+1), nil, nil,
+				fmt.Sprintf(`{"id":%d,"sku":"X"}`, i+1), 0)
+		}
+		mock.ExpectQuery("FROM binlog_events").WillReturnRows(rows)
+
+		h := &Handler{
+			indexDB: db,
+			cfg: Config{AllowGaps: true, IndexDBName: "bintrail_index",
+				NoArchive: true, FullTableRowCap: 1},
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			archiveFetcher: func(ctx context.Context, _ query.Options, _ string) ([]query.ResultRow, error) {
+				return nil, nil
+			},
+		}
+		h.UseDB("myapp")
+
+		q := TimeTravelQuery{Type: TypeFlashback, Schema: "myapp", Table: "orders",
+			AsOf: now} // PKColumn / PKValue both empty
+		_, err = h.runPointInTime(q)
+		if err == nil {
+			t.Fatal("expected ER_TOO_BIG_SELECT (proves dispatch reached runFullTable); got nil")
+		}
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) || myErr.Code != gomysql.ER_TOO_BIG_SELECT {
+			t.Errorf("expected ER_TOO_BIG_SELECT (1104), got %v", err)
+		}
+	})
+}
+
+// binlogEventsColumns is the column list scanned by query.Engine.Fetch.
+// Extracted so the cap-overflow tests don't duplicate the literal.
+func binlogEventsColumns() []string {
+	return []string{
+		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
+		"gtid", "connection_id", "schema_name", "table_name", "event_type",
+		"pk_values", "changed_columns", "row_before", "row_after", "schema_version",
+	}
+}
+
+// emptyBinlogEventsRows is the empty-resultset stub for query.Engine.Fetch.
+func emptyBinlogEventsRows() *sqlmock.Rows {
+	return sqlmock.NewRows(binlogEventsColumns())
+}
+
+// TestImagesToResultColumnsFromUnionWhenNoDDLOrder pins the union-
+// across-images behavior for the no-snapshot fallback. Using only
+// images[0]'s keys would silently drop a column added by a later
+// event in the same query (e.g. a row captured pre-ALTER followed
+// by a row captured post-ALTER).
+func TestImagesToResultColumnsFromUnionWhenNoDDLOrder(t *testing.T) {
+	images := []map[string]any{
+		{"id": 1, "sku": "A"},                           // pre-ALTER
+		{"id": 2, "sku": "B", "added_after_alter": "X"}, // post-ALTER
+	}
+	res, err := imagesToResult(images, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotCols := make([]string, len(res.Resultset.Fields))
+	for i, f := range res.Resultset.Fields {
+		gotCols[i] = string(f.Name)
+	}
+	wantCols := []string{"added_after_alter", "id", "sku"}
+	if !slices.Equal(gotCols, wantCols) {
+		t.Errorf("cols = %v, want %v (no-ddlOrder fallback must union image keys, "+
+			"not pick from images[0])", gotCols, wantCols)
+	}
+}
+
+// TestImagesToResultDDLOrderStrictWhenSnapshotPresent pins the
+// snapshot-driven semantic the docstring describes: when ddlOrder is
+// supplied, every column in it appears in the resultset even if no
+// image carries it (NULL on the wire). A future refactor that
+// reverted to "intersect ddlOrder with images[0] keys" would silently
+// elide post-ALTER columns from queries that span the ALTER.
+func TestImagesToResultDDLOrderStrictWhenSnapshotPresent(t *testing.T) {
+	images := []map[string]any{
+		{"id": 1, "sku": "A"}, // missing the post-ALTER column
+	}
+	ddlOrder := []string{"id", "sku", "qty", "note"}
+	res, err := imagesToResult(images, ddlOrder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotCols := make([]string, len(res.Resultset.Fields))
+	for i, f := range res.Resultset.Fields {
+		gotCols[i] = string(f.Name)
+	}
+	if !slices.Equal(gotCols, ddlOrder) {
+		t.Errorf("cols = %v, want %v (ddlOrder must be honored verbatim)", gotCols, ddlOrder)
+	}
+}
+
+// TestImagesToResultBuildsResultset covers the multi-row resultset
+// builder added for #276. The single-row imageToResult path is
+// covered by TestImageToResultColumnOrder / TestImageToResultRespectsDDLOrder.
+func TestImagesToResultBuildsResultset(t *testing.T) {
+	cases := []struct {
+		name     string
+		images   []map[string]any
+		ddlOrder []string
+		wantRows int
+		wantCols []string
+	}{
+		{
+			name:     "empty_input_returns_empty_resultset",
+			images:   nil,
+			wantRows: 0,
+			wantCols: []string{"_flashback"},
+		},
+		{
+			name:     "single_row_uses_ddl_order",
+			images:   []map[string]any{{"id": 1, "sku": "ABC", "qty": 3}},
+			ddlOrder: []string{"id", "sku", "qty"},
+			wantRows: 1,
+			wantCols: []string{"id", "sku", "qty"},
+		},
+		{
+			name: "multi_row_uses_first_image_for_columns",
+			images: []map[string]any{
+				{"id": 1, "sku": "A", "qty": 1},
+				{"id": 2, "sku": "B", "qty": 2},
+				{"id": 3, "sku": "C", "qty": 3},
+			},
+			ddlOrder: []string{"id", "sku", "qty"},
+			wantRows: 3,
+			wantCols: []string{"id", "sku", "qty"},
+		},
+		{
+			// A row missing a column known to ddlOrder gets a NULL
+			// in that position rather than failing the whole query —
+			// this mirrors how MySQL itself handles a column added
+			// after some rows already existed.
+			name: "row_missing_column_yields_null",
+			images: []map[string]any{
+				{"id": 1, "sku": "A", "qty": 1},
+				{"id": 2, "sku": "B"},
+			},
+			ddlOrder: []string{"id", "sku", "qty"},
+			wantRows: 2,
+			wantCols: []string{"id", "sku", "qty"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := imagesToResult(tc.images, tc.ddlOrder)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(res.Resultset.RowDatas); got != tc.wantRows {
+				t.Errorf("rows = %d, want %d", got, tc.wantRows)
+			}
+			gotCols := make([]string, len(res.Resultset.Fields))
+			for i, f := range res.Resultset.Fields {
+				gotCols[i] = string(f.Name)
+			}
+			if !slices.Equal(gotCols, tc.wantCols) {
+				t.Errorf("cols = %v, want %v", gotCols, tc.wantCols)
+			}
+		})
+	}
+}
+
 // TestImageToResultEmpty — an empty image (zero-key map) should
 // produce a resultset with no rows.
 func TestImageToResultEmpty(t *testing.T) {
@@ -980,6 +1261,88 @@ func TestRunPointInTimeInvokesArchiveFetcher(t *testing.T) {
 	}
 	if !called {
 		t.Error("expected archiveFetcher to be invoked when archive_state has rows; was not called")
+	}
+}
+
+// TestRunFullTableEnforcesCostCap exercises the load-bearing OOM
+// guardrail: when FetchMerged returns more rows than the configured
+// cap, runFullTable must surface ER_TOO_BIG_SELECT (1104) on the
+// wire, not silently truncate (which would hand the customer a
+// partial, unverifiable resultset) and not crash.
+//
+// The cap is configured per-Handler via Config.FullTableRowCap so
+// this test can lower it to 3 on a local Handler instance without
+// touching a global var — that keeps the test parallel-safe and
+// matches the production path (a future per-tenant override would
+// flow through the same field).
+//
+// A regression that drops the +1 sentinel on Limit (e.g. `Limit:
+// cap` without the +1) silently turns the cap into "exactly cap
+// rows accepted, no error." This test catches that.
+func TestRunFullTableEnforcesCostCap(t *testing.T) {
+	const testCap = 3
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Planner queries information_schema.PARTITIONS; stub empty so
+	// the planner returns nil. AllowGaps=true below disables strict
+	// gap enforcement so the planner-empty path doesn't short-circuit
+	// with a *GapError before runFullTable gets a chance to evaluate
+	// the cap.
+	mock.MatchExpectationsInOrder(false)
+	mock.ExpectQuery("information_schema.PARTITIONS").
+		WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME", "PARTITION_DESCRIPTION"}))
+
+	// Return cap+1 binlog_events rows. row_after is a JSON image so
+	// the scan path produces a non-DELETE non-empty image — ensures
+	// extractFullTableImages doesn't filter them out before the cap
+	// check sees them.
+	rows := sqlmock.NewRows(binlogEventsColumns())
+	now := time.Now().UTC()
+	for i := 0; i < testCap+1; i++ {
+		rows.AddRow(
+			int64(i+1), "binlog.000001", int64(100), int64(200), now,
+			nil, nil, "myapp", "orders", parser.EventInsert,
+			fmt.Sprintf("%d", i+1), nil, nil,
+			fmt.Sprintf(`{"id":%d,"sku":"X"}`, i+1), 0,
+		)
+	}
+	mock.ExpectQuery("FROM binlog_events").WillReturnRows(rows)
+
+	h := &Handler{
+		indexDB: db,
+		cfg: Config{AllowGaps: true, IndexDBName: "bintrail_index",
+			NoArchive: true, FullTableRowCap: testCap},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		archiveFetcher: func(ctx context.Context, _ query.Options, _ string) ([]query.ResultRow, error) {
+			return nil, nil
+		},
+	}
+	h.UseDB("myapp")
+
+	q := TimeTravelQuery{
+		Type:   TypeFlashback,
+		Schema: "myapp",
+		Table:  "orders",
+		AsOf:   now,
+		// PKColumn deliberately empty — that's how runPointInTime
+		// dispatches into runFullTable.
+	}
+	_, err = h.runFullTable(q)
+	if err == nil {
+		t.Fatal("expected ER_TOO_BIG_SELECT for rows > cap; got nil")
+	}
+	var myErr *gomysql.MyError
+	if !errors.As(err, &myErr) {
+		t.Fatalf("expected *mysql.MyError, got %T: %v", err, err)
+	}
+	if myErr.Code != gomysql.ER_TOO_BIG_SELECT {
+		t.Errorf("wire code = %d, want %d (ER_TOO_BIG_SELECT, msg=%q)",
+			myErr.Code, gomysql.ER_TOO_BIG_SELECT, myErr.Message)
 	}
 }
 
