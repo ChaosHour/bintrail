@@ -78,6 +78,7 @@ var (
 	shShimConfig string
 	shNoArchive  bool
 	shAllowGaps  bool
+	shAuthMethod string
 )
 
 func init() {
@@ -86,6 +87,7 @@ func init() {
 	shimCmd.Flags().StringVar(&shShimConfig, "shim-config", "shim.yaml", "Path to shim.yaml (the file produced by 'bintrail init-shim')")
 	shimCmd.Flags().BoolVar(&shNoArchive, "no-archive", false, "Skip archive auto-discovery; query only the live MySQL index")
 	shimCmd.Flags().BoolVar(&shAllowGaps, "allow-gaps", false, "Warn and continue when an archive source fails or the planner detects a coverage gap, instead of returning a MySQL protocol error to the client (default: strict, fail loudly)")
+	shimCmd.Flags().StringVar(&shAuthMethod, "auth-method", "", "MySQL auth plugin to advertise during the handshake. Empty (default) keeps mysql_native_password for backwards compatibility. Set to 'caching_sha2_password' or 'sha256_password' on MySQL 8.4+ instances where mysql_native_password is disabled by default. Requires ProxySQL 2.7+ upstream.")
 	_ = shimCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(shimCmd)
 	rootCmd.AddCommand(shimCmd)
@@ -193,8 +195,29 @@ func runShim(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("index DSN must include the database name (e.g. /bintrail_index)")
 	}
 
-	cfg := shim.Config{AllowGaps: shAllowGaps, NoArchive: shNoArchive, IndexDBName: dsnCfg.DBName}
-	serveLoop(ctx, listener, db, auth, cfg, userSchemas)
+	cfg := shim.Config{
+		AllowGaps:   shAllowGaps,
+		NoArchive:   shNoArchive,
+		IndexDBName: dsnCfg.DBName,
+		AuthMethod:  shAuthMethod,
+	}
+	// Build the *server.Server once at startup, not per connection:
+	//
+	//  - typo in --auth-method fails the daemon immediately rather than
+	//    silently dropping every incoming connection (which would log
+	//    server-side and look like a TCP close to the client),
+	//  - the caching_sha2_password cache is per-Server (the
+	//    Server.cacheShaPassword sync.Map field in go-mysql v1.13.0);
+	//    a per-connection Server resets the cache on every accept and
+	//    the "caching" in the plugin name silently does nothing,
+	//  - RSA-2048 keypair generation runs once per process (~50ms) not
+	//    once per connection. *server.Server is goroutine-safe by
+	//    upstream design — per-connection state lives on *server.Conn.
+	srv, err := shim.NewMySQLServer(cfg.AuthMethod)
+	if err != nil {
+		return fmt.Errorf("auth method: %w", err)
+	}
+	serveLoop(ctx, listener, db, srv, auth, cfg, userSchemas)
 	return nil
 }
 
@@ -208,7 +231,7 @@ func runShim(cmd *cobra.Command, args []string) error {
 // hiccup doesn't burn CPU and a permanent listener wedge doesn't fill
 // the log at ~10 lines/sec. The backoff resets to zero on every
 // successful Accept so a brief spike doesn't poison the steady state.
-func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string) {
+func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, srv *server.Server, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
@@ -239,7 +262,7 @@ func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, auth shim
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
-			handleConn(c, db, auth, cfg, userSchemas)
+			handleConn(c, db, srv, auth, cfg, userSchemas)
 		}(conn)
 	}
 }
@@ -377,11 +400,10 @@ func buildUserSchemas(tenantCfgs []shim.TenantConfig) map[string]string {
 // we don't know the tenant — and an explicit `USE` from the client
 // still wins because UseDB is called sequentially and overwrites the
 // seeded value.
-func handleConn(c net.Conn, db *sql.DB, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string) {
+func handleConn(c net.Conn, db *sql.DB, srv *server.Server, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string) {
 	defer c.Close()
 
 	handler := shim.NewHandlerWithConfig(db, cfg, slog.Default())
-	srv := server.NewDefaultServer()
 	mysqlConn, err := server.NewCustomizedConn(c, srv, auth, handler)
 	if err != nil {
 		level, msg := classifyHandshakeErr(err)
