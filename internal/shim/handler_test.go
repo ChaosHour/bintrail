@@ -94,6 +94,145 @@ func TestHandlerRejectsNonFlashbackQuery(t *testing.T) {
 	}
 }
 
+// TestHandlerWireErrorCodes pins the wire codes the shim returns to
+// MySQL clients. ORMs and monitoring rely on these to tell user input
+// errors apart from server crashes; an untyped `fmt.Errorf` collapses
+// to ER_UNKNOWN_ERROR (1105) which is the wrong signal.
+//
+//   - malformed time-travel (recognised virtual schema, bad shape) → 1064
+//   - non-time-travel routed to the shim                            → 1235
+func TestHandlerWireErrorCodes(t *testing.T) {
+	h := NewHandler(nil, nil)
+	h.UseDB("myapp")
+
+	cases := []struct {
+		name    string
+		query   string
+		wantErr uint16
+	}{
+		{
+			name:    "malformed_flashback_missing_as_of",
+			query:   "SELECT * FROM _flashback.orders WHERE id = 1",
+			wantErr: gomysql.ER_PARSE_ERROR,
+		},
+		{
+			name:    "malformed_diff_bad_between",
+			query:   "SELECT * FROM _diff.orders WHERE id = 1",
+			wantErr: gomysql.ER_PARSE_ERROR,
+		},
+		{
+			name:    "non_time_travel_query",
+			query:   "SELECT * FROM orders WHERE id = 1",
+			wantErr: gomysql.ER_NOT_SUPPORTED_YET,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := h.HandleQuery(tc.query)
+			if err == nil {
+				t.Fatalf("expected error for %q", tc.query)
+			}
+			var myErr *gomysql.MyError
+			if !errors.As(err, &myErr) {
+				t.Fatalf("expected *mysql.MyError so server emits a typed wire code, got %T: %v", err, err)
+			}
+			if myErr.Code != tc.wantErr {
+				t.Errorf("wire code = %d, want %d (msg=%q)", myErr.Code, tc.wantErr, myErr.Message)
+			}
+		})
+	}
+
+	// The "no USE <db>" path is structurally distinct: parser sees a
+	// virtual schema prefix but no default DB and returns its own
+	// error before even attempting the regex match. Pin this case
+	// separately so a future split between "syntax error" (1064) and
+	// "session-state error" (e.g. 1046) is a deliberate decision, not
+	// a silent regression.
+	t.Run("missing_use_db_returns_1064", func(t *testing.T) {
+		h := NewHandler(nil, nil) // deliberately no UseDB
+		_, err := h.HandleQuery("SELECT * FROM _flashback.orders AS OF '2026-01-01' WHERE id = 1")
+		if err == nil {
+			t.Fatal("expected error when no schema is selected")
+		}
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) {
+			t.Fatalf("expected *mysql.MyError, got %T: %v", err, err)
+		}
+		if myErr.Code != gomysql.ER_PARSE_ERROR {
+			t.Errorf("wire code = %d, want %d (msg=%q)", myErr.Code, gomysql.ER_PARSE_ERROR, myErr.Message)
+		}
+		// The operator hint ("USE <database>") is the actionable
+		// part of this error — without it the 1064 is correctly
+		// typed but useless to the human reading it.
+		if !strings.Contains(myErr.Message, "USE") {
+			t.Errorf("error should hint at USE <database>; got %q", myErr.Message)
+		}
+	})
+}
+
+// TestHandlerInternalErrorsKeepDefaultWireCode pins the *inverse* half
+// of #277's contract: failures inside runPointInTime / runDiff (DB
+// timeouts, FetchMerged errors, archive_state lookup failures) must
+// NOT be wrapped in *mysql.MyError so go-mysql/server emits the
+// catch-all ER_UNKNOWN_ERROR (1105). A future refactor that wraps
+// these in mysql.NewError(ER_PARSE_ERROR, ...) would silently flip
+// "the server is broken" into "your query is malformed" — exactly
+// the user-vs-server-fault confusion #277 was filed to eliminate.
+func TestHandlerInternalErrorsKeepDefaultWireCode(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// We force *some* internal failure inside FetchMerged by failing
+	// the archive_state lookup. The exact propagation path is
+	// implementation detail (ResolveArchiveSources may swallow the
+	// first hit; the planner's archive_state re-query may carry it;
+	// an unmocked information_schema query may surface it instead).
+	// What matters for the contract is that whatever error reaches
+	// HandleQuery's caller is a plain Go error, not a pre-typed
+	// *mysql.MyError. The ExpectationsWereMet check below ensures
+	// the archive_state query was actually issued — a refactor that
+	// stops touching FetchMerged would fail the test loudly rather
+	// than silently keeping a passing assertion.
+	mock.MatchExpectationsInOrder(false)
+	mock.ExpectQuery("FROM archive_state").
+		WillReturnError(errors.New("simulated archive_state lookup failure"))
+	t.Cleanup(func() {
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectation not met — the FetchMerged path "+
+				"this test pins is no longer being exercised: %v", err)
+		}
+	})
+
+	h := &Handler{
+		indexDB: db,
+		// AllowGaps=false is the production default and is the mode
+		// that propagates archive errors rather than degrading to a
+		// Warn. Pin it explicitly so a flip in the zero-value default
+		// doesn't quietly change which path this test exercises.
+		cfg:    Config{IndexDBName: "bintrail_index", AllowGaps: false},
+		logger: slog.Default(),
+		archiveFetcher: func(ctx context.Context, opts query.Options, src string) ([]query.ResultRow, error) {
+			return nil, nil
+		},
+	}
+	h.UseDB("myapp")
+
+	_, err = h.HandleQuery("SELECT * FROM _flashback.orders AS OF '2026-01-01 00:00:00' WHERE id = 1")
+	if err == nil {
+		t.Fatal("expected error from failing archive_state lookup")
+	}
+	var myErr *gomysql.MyError
+	if errors.As(err, &myErr) {
+		t.Errorf("internal failure must NOT be wrapped in *mysql.MyError "+
+			"(go-mysql/server would then emit %d instead of the catch-all 1105); "+
+			"got code=%d msg=%q", myErr.Code, myErr.Code, myErr.Message)
+	}
+}
+
 // TestHandlerUseDBStoresSchema — the schema set via UseDB is held
 // for use by subsequent HandleQuery calls. The end-to-end coverage
 // for "UseDB then run flashback" lives in TestEndToEndHandshake; here
