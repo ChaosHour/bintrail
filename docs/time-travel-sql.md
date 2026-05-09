@@ -67,9 +67,7 @@ Edit `shim.yaml`, uncomment the two TODO lines, and paste the values:
 
 `bintrail proxysql-config` recomputes the SHA1 hash ProxySQL needs from `mysql_password` automatically — you do not need to run a manual SHA1 recipe.
 
-> **Auth note**: both `bintrail shim` and ProxySQL validate the application's password against the same `mysql_password` (the shim using cleartext directly via the MySQL native-password handshake; ProxySQL using its derived SHA1). The shim's listen address defaults to `127.0.0.1:3308` so it is not reachable from the network. Treat `shim.yaml` as you'd treat `.bintrail.env` — it contains a password and ships at 0o600.
-
-> **Auth scheme — `mysql_native_password` (default) and `caching_sha2_password` (opt-in)**: the shim defaults to `mysql_native_password` so existing deployments see no behaviour change. Operators on a MySQL 8.4+ instance with `mysql_native_password` disabled by policy can switch by passing `--auth-method=caching_sha2_password` to `bintrail shim` (or setting `BINTRAIL_AUTH_METHOD=caching_sha2_password`). Requires ProxySQL **2.7+** between the application and the shim — the LTS 2.6 line is not verified to negotiate SHA2 against backends. Note: on MySQL 8.4 with the default `mysql_native_password` plugin disabled, the application user used by ProxySQL must be created with `IDENTIFIED WITH mysql_native_password BY '<password>'` if you stay on the native-password path, or with `IDENTIFIED WITH caching_sha2_password` if you switch.
+> **Auth note**: both `bintrail shim` and ProxySQL validate the application's password against the same `mysql_password`. The default is `mysql_native_password`; `caching_sha2_password` is opt-in via `--auth-method` (see Step 4). The shim's listen address defaults to `127.0.0.1:3308` so it is not reachable from the network. Treat `shim.yaml` as you'd treat `.bintrail.env` — it contains a password and ships at 0o600.
 
 ---
 
@@ -172,6 +170,14 @@ WantedBy=multi-user.target
 
 The unit reads `BINTRAIL_INDEX_DSN` from `/etc/bintrail/.bintrail.env` (the same file your agent uses) so the shim can answer queries against your index. The DSN must include the index database name (e.g. `…/bintrail_index`) — the shim refuses to start otherwise. Append `--allow-gaps` to `ExecStart` to warn-and-continue on archive failures or coverage gaps instead of returning a MySQL error to the client; the default is strict because the wire protocol has no warning channel.
 
+**Auth method on MySQL 8.4+.** If your MySQL has `mysql_native_password` disabled (the default since 8.4), append `--auth-method=caching_sha2_password` to `ExecStart` (or `Environment=BINTRAIL_AUTH_METHOD=caching_sha2_password`):
+
+```ini
+ExecStart=/usr/local/bin/bintrail shim --shim-config /etc/bintrail/shim.yaml --auth-method=caching_sha2_password
+```
+
+Requires ProxySQL **2.7+** between the application and the shim — the LTS 2.6 line isn't verified to negotiate SHA2 against backends, so operators on 2.6 keep the default (`mysql_native_password`). The application user used by ProxySQL must match the chosen scheme: `IDENTIFIED WITH mysql_native_password BY '<password>'` for the default path, `IDENTIFIED WITH caching_sha2_password BY '<password>'` for the opt-in. `sha256_password` is also accepted by `--auth-method` if your environment requires it.
+
 Enable and start:
 
 ```sh
@@ -216,20 +222,24 @@ Connect through ProxySQL:
 mysql -u app_user -p -h 127.0.0.1 -P 6033 myapp
 ```
 
-Three statement shapes are recognised:
+Four statement shapes are recognised:
 
 ```sql
--- Row state at a point in time:
+-- Row state at a point in time (point-lookup, fast):
 SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 12345;
 
--- Same shape, reserved for future baseline-lookup integration:
-SELECT * FROM _snapshot.orders  AS OF '2026-05-02 10:00:00' WHERE id = 12345;
+-- Full-table reconstruction at AS OF (no WHERE) — every row that
+-- existed at that instant. Same shape works against _snapshot:
+SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00';
+SELECT * FROM _snapshot.orders  AS OF '2026-05-02 10:00:00';
 
 -- All events for one row in a time window:
 SELECT * FROM _diff.orders BETWEEN '2026-05-01' AND '2026-05-02' WHERE id = 12345;
 ```
 
 `_diff` returns the full per-PK event history within the requested window — there is no implicit row cap. If a single hot row produced thousands of events, you'll get all of them in one response; if that's too much for one query, narrow the `BETWEEN` range.
+
+Full-table `_flashback` / `_snapshot` queries are buffered and capped at 100,000 rows; exceeding the cap surfaces as `ER_TOO_BIG_SELECT` (code 1104) with a hint to narrow the AS OF range or add a PK filter. DELETE events are correctly suppressed — rows that did not exist at the AS OF instant don't appear in the resultset (same semantic as Oracle's `AS OF`). For ad-hoc filtering, joins, or aggregations, pipe the resultset to `duckdb`, `pandas`, or any tool that consumes a `SELECT *` stream — the shim deliberately stays a forensic point-lookup + full-table tool, not a SQL planner.
 
 The shim resolves the row by replaying the relevant binlog events from your bintrail MySQL index. If the timestamp falls outside the index's retention (because hourly partitions have been rotated to S3), the shim auto-discovers the Parquet archives via `archive_state` and merges results from both sources — same machinery `bintrail query` and `bintrail recover` already use.
 
@@ -271,6 +281,17 @@ ss -tlnp | grep 3308
 
 If `bintrail-shim` is dead, `journalctl -u bintrail-shim -n 100` shows why. Common causes: missing or unreadable `shim.yaml`, missing `BINTRAIL_INDEX_DSN`, a `mysql_password` value that's not a valid YAML string (quote it).
 
+### MySQL error codes the shim returns
+
+The shim emits typed wire codes so ORMs and monitoring can distinguish *user input* errors from *server fault* errors — a 1105 spike no longer means "any time-travel query failed". Codes you may see:
+
+- **1064 `ER_PARSE_ERROR`** — a query mentions `_flashback` / `_snapshot` / `_diff` but doesn't match any supported shape (missing `AS OF`, missing `BETWEEN`, missing `USE <db>`, unparseable timestamp). Same code MySQL itself returns for any SQL syntax error.
+- **1235 `ER_NOT_SUPPORTED_YET`** — a non-virtual-schema query reached the shim (typically a direct connection to `:3308` bypassing ProxySQL). Hostgroup routing is misconfigured.
+- **1526 `ER_NO_PARTITION_FOR_GIVEN_VALUE`** — the AS OF or BETWEEN range falls outside what this index retains (rotated out of MySQL with no archive coverage). Operators narrow the time range or check `archive_state` and the shim's `--allow-gaps` flag.
+- **1045 `ER_ACCESS_DENIED_ERROR`** — credential mismatch (see the section above).
+- **1104 `ER_TOO_BIG_SELECT`** — full-table `_flashback` / `_snapshot` returned more than 100,000 rows. Narrow the AS OF or add a `WHERE <pk> = <value>` to fall back to the point-lookup path.
+- **1105 `ER_UNKNOWN_ERROR`** — real internal failure (DB timeout, archive S3 outage, build-resultset bug). This is the catch-all "the server is broken, retry" signal; persistent 1105s warrant inspecting the shim log.
+
 ### Time-travel query returns empty
 
 The row had no event at-or-before the requested timestamp. A coverage gap or archive failure would surface as a MySQL error instead, not as an empty result (unless you started the shim with `--allow-gaps`). Widen the lookup with `_diff` to inspect the per-PK history, or check the agent is keeping up:
@@ -292,4 +313,6 @@ The bintrail index retains the most recent hours via partition rotation; older d
 - **Single source MySQL per shim.** The current `bintrail shim` is one-tenant-per-instance. If you have multiple source MySQLs you want time-travel SQL against, run one shim per instance with separate listen ports and separate ProxySQL hostgroups.
 - **No TLS termination on the shim port.** `bintrail shim` accepts plain MySQL protocol on `127.0.0.1:3308` by default. If you need TLS between ProxySQL and the shim, terminate at ProxySQL or via an `stunnel` sidecar.
 - **`_snapshot` is currently a synonym for `_flashback`.** The shim reserves the `_snapshot.*` virtual schema for a future baseline-lookup integration (the `bintrail dump` / `bintrail baseline` pipeline) so it can answer for rows that have never appeared in binlog events. Today both schemas resolve to "row state at the most recent event at-or-before the given timestamp".
+- **Full-table reconstruction is buffered, not streamed.** The MVP buffers up to 100,000 rows per query and surfaces overflow as `ER_TOO_BIG_SELECT` (1104). A streaming wire-protocol path (no row cap) is deferred until an operator reports the cap as a real bottleneck. PK-filtered point-lookups are unaffected.
+- **No JOINs, aggregations, or non-PK WHERE filters inside the shim.** Run them outside on the resultset (`duckdb`, `pandas`, `awk`). The shim's job is to deliver correct historical row state; SQL execution against that state is the operator's tool of choice.
 - **ProxySQL itself is not provisioned by bintrail.** `bintrail proxysql-config` only writes routing rules; you install and harden ProxySQL itself (admin password, frontend TLS, monitoring) using the standard ProxySQL docs.

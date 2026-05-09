@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-05-09
+
+### Added
+- `bintrail shim` reconstructs the full row state of a table at AS OF when the query omits `WHERE`: `SELECT * FROM _flashback.<table> AS OF '<ts>'` (and the same against `_snapshot.<table>`) returns every row that existed at the requested instant. DELETE events are correctly suppressed — rows that didn't exist at AS OF don't appear in the resultset (matches Oracle's `AS OF` semantic). The PK-filtered point-lookup path is unchanged. Buffered with a 100,000-row cap; overflow surfaces as `ER_TOO_BIG_SELECT` (1104) so monitoring can distinguish it from a real shim crash. Streaming the resultset (no cap) is deferred until an operator reports it as a bottleneck. JOINs, aggregations, and non-PK WHERE filters are intentionally out of scope — pipe the resultset to `duckdb`, `pandas`, or any downstream SQL tool (#276).
+- `bintrail shim` accepts `--auth-method` (and `BINTRAIL_AUTH_METHOD`) to advertise `caching_sha2_password` or `sha256_password` instead of the historical `mysql_native_password` default. Useful on MySQL 8.4+ instances where `mysql_native_password` is disabled by policy. The default is unchanged so existing deployments see no behaviour difference. Implementation generates an in-memory self-signed RSA-2048 keypair once per process (the `cacheShaPassword sync.Map` and tlsConfig live on a single shared `*server.Server`, so SHA2 caching actually caches and a typo in the flag fails the daemon at startup, not silently per-connection). Requires ProxySQL 2.7+ between the application and the shim — the LTS 2.6 line isn't verified to negotiate SHA2 against backends. See `docs/time-travel-sql.md` Step 4 for the systemd recipe (#274).
+
+### Fixed
+- `bintrail shim` returns typed MySQL wire codes for client-input rejections so ORMs and monitoring can distinguish user input errors from server faults: `ER_PARSE_ERROR` (1064) for malformed time-travel queries (recognised virtual schema, bad shape / bad AS OF / missing `USE <db>`), `ER_NOT_SUPPORTED_YET` (1235) for non-time-travel queries routed to the shim. Real internal failures (DB timeout, archive S3 outage, build-resultset bug) keep returning `ER_UNKNOWN_ERROR` (1105) so the catch-all "the server is broken" signal is preserved (#277).
+- `bintrail shim` returns `ER_NO_PARTITION_FOR_GIVEN_VALUE` (1526) for coverage-gap errors instead of the catch-all 1105, so an operator monitoring 1105 spikes can tell "the user asked for an AS OF outside index retention" apart from "the shim crashed". Wrap is localised in `runPointInTime` / `runDiff` via `errors.Is(err, *query.GapError)`; everything else still returns 1105 (#283).
+
 ## [0.7.4] - 2026-05-05
 
 ### Fixed
