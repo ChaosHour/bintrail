@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // Store defines the persistence interface for OAuth and tenant data.
@@ -79,12 +80,52 @@ type RefreshTokenRecord struct {
 }
 
 // Tenant represents a customer's backend mapping.
+//
+// AuthSecretHash is the bcrypt hash of the per-tenant secret submitted on the
+// OAuth authorize page. The cleartext secret itself is never stored or
+// returned to API consumers; the hash is also excluded from JSON responses
+// (`json:"-"`) so admin GET / LIST endpoints don't expose it to offline
+// brute-force after a less-than-strict admin-token leak.
+//
+// Strict-mode invariant (revised after the #132 multi-agent review): a
+// tenant with an empty AuthSecretHash is INVALID and cannot authorize —
+// see VerifySecret. The earlier "gradual rollout" design accepted such
+// tenants to ease migration but preserved the very tenant-ID-only auth
+// vulnerability #132 was filed to close, AND added a wire-level oracle
+// (302 vs 401) attackers could use to enumerate unmigrated tenants and
+// obtain auth codes for free. Operators must set an auth_secret on every
+// active tenant before this PR is rolled out; `createTenant` rejects
+// POSTs without one for the same reason.
 type Tenant struct {
-	TenantID   string `dynamodbav:"tenant_id" json:"tenant_id"`
-	Tier       string `dynamodbav:"tier" json:"tier"`
-	BackendURL string `dynamodbav:"backend_url" json:"backend_url"`
-	IndexDSN   string `dynamodbav:"index_dsn" json:"index_dsn"`
-	Status     string `dynamodbav:"status" json:"status"`
+	TenantID       string `dynamodbav:"tenant_id" json:"tenant_id"`
+	Tier           string `dynamodbav:"tier" json:"tier"`
+	BackendURL     string `dynamodbav:"backend_url" json:"backend_url"`
+	IndexDSN       string `dynamodbav:"index_dsn" json:"index_dsn"`
+	Status         string `dynamodbav:"status" json:"status"`
+	AuthSecretHash string `dynamodbav:"auth_secret_hash" json:"-"`
+}
+
+// VerifySecret checks the submitted cleartext secret against the stored
+// bcrypt hash. Returns false on any mismatch — AND on an empty stored
+// hash (strict mode; see the Tenant docstring for the design rationale).
+// Operators dealing with legacy tenants migrated before #132 should
+// rotate the secret with `PUT /admin/tenants/<id> {"auth_secret":"…"}`
+// rather than rely on an empty-hash fallback.
+func (t *Tenant) VerifySecret(plaintext string) bool {
+	if t.AuthSecretHash == "" {
+		return false
+	}
+	return bcrypt.CompareHashAndPassword([]byte(t.AuthSecretHash), []byte(plaintext)) == nil
+}
+
+// HashSecret bcrypt-hashes a cleartext secret for storage on a Tenant. Returns
+// an error only if bcrypt itself fails (e.g. input exceeds 72 bytes).
+func HashSecret(plaintext string) (string, error) {
+	b, err := bcrypt.GenerateFromPassword([]byte(plaintext), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 // ─── DynamoDB implementation ─────────────────────────────────────────────────

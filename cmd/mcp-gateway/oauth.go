@@ -159,6 +159,11 @@ func (c *OAuthConfig) AuthorizeSubmitHandler(w http.ResponseWriter, r *http.Requ
 	state := r.FormValue("state")
 	codeChallenge := r.FormValue("code_challenge")
 	tenantID := r.FormValue("tenant_id")
+	// tenant_secret is OPTIONAL on the wire so legacy tenants without
+	// an AuthSecretHash continue to authorize during the gradual
+	// rollout — see Tenant.VerifySecret in store.go. A tenant that
+	// HAS configured a secret will reject an empty submission below.
+	tenantSecret := r.FormValue("tenant_secret")
 
 	if clientID == "" || redirectURI == "" || codeChallenge == "" || tenantID == "" {
 		jsonError(w, "invalid_request", "missing required fields", http.StatusBadRequest)
@@ -192,6 +197,32 @@ func (c *OAuthConfig) AuthorizeSubmitHandler(w http.ResponseWriter, r *http.Requ
 	}
 	if tenant == nil || tenant.Status != "active" {
 		jsonError(w, "invalid_request", "unknown or inactive tenant", http.StatusBadRequest)
+		return
+	}
+
+	// #132 strict mode: validate the per-tenant secret. VerifySecret
+	// returns false on either a mismatched cleartext OR an empty
+	// stored hash, so legacy tenants migrated from before #132 fail
+	// closed until an admin sets a secret via
+	// PUT /admin/tenants/<id> {"auth_secret":"…"}. The earlier
+	// gradual-rollout design (legacy → 302 with auth code) was a
+	// wire-level oracle attackers could use to enumerate unmigrated
+	// tenants AND obtain free auth codes; closing the oracle is
+	// load-bearing for the security contract #132 was filed for.
+	//
+	// slog.Warn so an operator alerting on auth failures sees
+	// brute-force probes. tenant_id is passed as a structured
+	// attribute only — never interpolated into the message string —
+	// to avoid log injection (defense-in-depth on top of the
+	// tenantIDRE regex in admin.go that rejects newlines).
+	// legacy_no_secret_configured surfaces the inventory the
+	// previous gradual-rollout log used to expose, so operators
+	// can still grep gateway logs for the unmigrated tenants.
+	if !tenant.VerifySecret(tenantSecret) {
+		slog.Warn("authorize rejected: tenant secret missing or incorrect",
+			"tenant_id", tenantID,
+			"legacy_no_secret_configured", tenant.AuthSecretHash == "")
+		jsonError(w, "invalid_request", "tenant secret is missing or incorrect", http.StatusUnauthorized)
 		return
 	}
 
@@ -438,7 +469,7 @@ var authorizePage = `<!DOCTYPE html>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 400px; margin: 80px auto; padding: 0 20px; color: #333; }
     h1 { font-size: 1.4em; }
     label { display: block; margin-top: 16px; font-weight: 600; }
-    input[type=text] { width: 100%%; padding: 8px; margin-top: 4px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+    input[type=text], input[type=password] { width: 100%%; padding: 8px; margin-top: 4px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
     button { margin-top: 20px; padding: 10px 24px; background: #2563eb; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 1em; }
     button:hover { background: #1d4ed8; }
     .note { font-size: 0.85em; color: #666; margin-top: 8px; }
@@ -455,6 +486,9 @@ var authorizePage = `<!DOCTYPE html>
     <label for="tenant_id">Tenant ID</label>
     <input type="text" id="tenant_id" name="tenant_id" required placeholder="e.g. acme-corp">
     <p class="note">This is the identifier you received when you set up Bintrail.</p>
+    <label for="tenant_secret">Tenant Secret</label>
+    <input type="password" id="tenant_secret" name="tenant_secret" required placeholder="set by your tenant administrator">
+    <p class="note">Required. If you don't have one yet, ask your tenant administrator to set one via the admin API.</p>
     <button type="submit">Authorize</button>
   </form>
 </body>
