@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -549,6 +550,7 @@ exit 1
 	dmpOutputDir = filepath.Join(dir, "out")
 	dmpFormat = "text"
 
+	dumpCmd.SetContext(context.Background())
 	err := runDump(dumpCmd, nil)
 	if err == nil {
 		t.Fatal("expected error from failing mydumper, got nil")

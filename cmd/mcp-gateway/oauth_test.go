@@ -162,10 +162,15 @@ func TestAuthorizeSubmitHandler_redirectsWithCode(t *testing.T) {
 		ClientSecret: "secret",
 		RedirectURIs: []string{"https://claude.ai/api/mcp/auth_callback"},
 	}
+	secretHash, err := HashSecret("hunter2")
+	if err != nil {
+		t.Fatalf("HashSecret: %v", err)
+	}
 	store.Tenants["acme-corp"] = &Tenant{
-		TenantID: "acme-corp",
-		Tier:     "paid",
-		Status:   "active",
+		TenantID:       "acme-corp",
+		Tier:           "paid",
+		Status:         "active",
+		AuthSecretHash: secretHash,
 	}
 	cfg := &OAuthConfig{Issuer: "https://mcp.dbtrail.com", Store: store}
 
@@ -175,6 +180,7 @@ func TestAuthorizeSubmitHandler_redirectsWithCode(t *testing.T) {
 		"state":          {"xyz"},
 		"code_challenge": {"abc123"},
 		"tenant_id":      {"acme-corp"},
+		"tenant_secret":  {"hunter2"},
 	}
 	req := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
