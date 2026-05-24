@@ -12,7 +12,7 @@ func TestMergeResults_dedup(t *testing.T) {
 		{EventID: 1, EventTimestamp: ts, SchemaName: "b"}, // duplicate
 		{EventID: 2, EventTimestamp: ts.Add(time.Second)},
 	}
-	got := MergeResults(rows, 0)
+	got := MergeResults(rows, 0, "")
 	if len(got) != 2 {
 		t.Fatalf("expected 2 rows, got %d", len(got))
 	}
@@ -29,7 +29,7 @@ func TestMergeResults_sort(t *testing.T) {
 		{EventID: 2, EventTimestamp: ts1},
 		{EventID: 1, EventTimestamp: ts2},
 	}
-	got := MergeResults(rows, 0)
+	got := MergeResults(rows, 0, "")
 	if got[0].EventID != 1 {
 		t.Errorf("expected event 1 first (earlier timestamp), got %d", got[0].EventID)
 	}
@@ -41,7 +41,7 @@ func TestMergeResults_sortByEventID(t *testing.T) {
 		{EventID: 5, EventTimestamp: ts},
 		{EventID: 3, EventTimestamp: ts},
 	}
-	got := MergeResults(rows, 0)
+	got := MergeResults(rows, 0, "")
 	if got[0].EventID != 3 {
 		t.Errorf("expected event 3 first (same timestamp, lower ID), got %d", got[0].EventID)
 	}
@@ -54,7 +54,7 @@ func TestMergeResults_limit(t *testing.T) {
 		{EventID: 2, EventTimestamp: ts.Add(time.Second)},
 		{EventID: 3, EventTimestamp: ts.Add(2 * time.Second)},
 	}
-	got := MergeResults(rows, 2)
+	got := MergeResults(rows, 2, "")
 	if len(got) != 2 {
 		t.Fatalf("expected 2 rows after limit, got %d", len(got))
 	}
@@ -66,14 +66,14 @@ func TestMergeResults_zeroLimit(t *testing.T) {
 		{EventID: 1, EventTimestamp: ts},
 		{EventID: 2, EventTimestamp: ts.Add(time.Second)},
 	}
-	got := MergeResults(rows, 0)
+	got := MergeResults(rows, 0, "")
 	if len(got) != 2 {
 		t.Fatalf("expected all rows with limit=0, got %d", len(got))
 	}
 }
 
 func TestMergeResults_empty(t *testing.T) {
-	got := MergeResults(nil, 10)
+	got := MergeResults(nil, 10, "")
 	if len(got) != 0 {
 		t.Fatalf("expected 0 rows, got %d", len(got))
 	}
@@ -104,7 +104,7 @@ func TestMergeAndTrim_perPKBeforeGlobal(t *testing.T) {
 		{EventID: 8, EventTimestamp: ts(8), PKValues: "c"},
 		{EventID: 9, EventTimestamp: ts(9), PKValues: "c"},
 	}
-	got := MergeAndTrim(rows, 6, 1)
+	got := MergeAndTrim(rows, 6, 1, "")
 	if len(got) != 3 {
 		t.Fatalf("expected 3 rows (1 per PK) after correct trim ordering, got %d: %+v", len(got), got)
 	}
@@ -141,13 +141,123 @@ func TestMergeAndTrim_crossSourceDedup(t *testing.T) {
 		{EventID: 2, EventTimestamp: ts.Add(time.Second), PKValues: "a"},
 		{EventID: 3, EventTimestamp: ts.Add(2 * time.Second), PKValues: "a"},
 	}
-	got := MergeAndTrim(rows, 0, 2)
+	got := MergeAndTrim(rows, 0, 2, "")
 	if len(got) != 2 {
 		t.Fatalf("expected 2 rows after dedup (3 unique) + LimitPerPK=2 trim, got %d", len(got))
 	}
 	// Latest two events kept: IDs 2 and 3 in ASC order.
 	if got[0].EventID != 2 || got[1].EventID != 3 {
 		t.Errorf("expected events [2,3] (latest 2 in ASC order), got %v", []uint64{got[0].EventID, got[1].EventID})
+	}
+}
+
+// TestMergeAndTrim_descOrderWithLimitPerPK pins the #1511 DESC branch in
+// MergeAndTrim. Three PKs each carry three events; with Limit=4 +
+// LimitPerPK=2 + Order=DESC, the per-PK cap must select the timestamp-latest
+// 2 events per PK (6 rows), the result must be re-sorted DESC, and the
+// global cap must slice from the NEW end (newest 4 rows). A regression that
+// slices from the ASC end would return [a:1, a:2, b:4, b:5] — the oldest 4
+// of the per-PK-trimmed set — instead of [c:9, c:8, b:6, b:5].
+func TestMergeAndTrim_descOrderWithLimitPerPK(t *testing.T) {
+	ts := func(m int) time.Time {
+		return time.Date(2026, 3, 1, 12, m, 0, 0, time.UTC)
+	}
+	rows := []ResultRow{
+		{EventID: 1, EventTimestamp: ts(1), PKValues: "a"},
+		{EventID: 2, EventTimestamp: ts(2), PKValues: "a"},
+		{EventID: 3, EventTimestamp: ts(3), PKValues: "a"},
+		{EventID: 4, EventTimestamp: ts(4), PKValues: "b"},
+		{EventID: 5, EventTimestamp: ts(5), PKValues: "b"},
+		{EventID: 6, EventTimestamp: ts(6), PKValues: "b"},
+		{EventID: 7, EventTimestamp: ts(7), PKValues: "c"},
+		{EventID: 8, EventTimestamp: ts(8), PKValues: "c"},
+		{EventID: 9, EventTimestamp: ts(9), PKValues: "c"},
+	}
+
+	t.Run("desc", func(t *testing.T) {
+		got := MergeAndTrim(rows, 4, 2, "DESC")
+		if len(got) != 4 {
+			t.Fatalf("expected 4 rows after DESC + Limit=4 + LimitPerPK=2, got %d: %+v", len(got), got)
+		}
+
+		// Per-PK cap keeps the latest 2 per PK → IDs 2,3 (a) + 5,6 (b) + 8,9 (c).
+		// DESC re-sort → 9,8,6,5,3,2. Global Limit=4 slices to 9,8,6,5.
+		wantIDs := []uint64{9, 8, 6, 5}
+		for i, r := range got {
+			if r.EventID != wantIDs[i] {
+				t.Errorf("row %d: EventID=%d, want %d (full ids=%v)", i, r.EventID, wantIDs[i],
+					func() []uint64 {
+						ids := make([]uint64, len(got))
+						for j := range got {
+							ids[j] = got[j].EventID
+						}
+						return ids
+					}())
+			}
+		}
+
+		// Direction sanity: timestamps strictly decreasing.
+		for i := 1; i < len(got); i++ {
+			if !got[i-1].EventTimestamp.After(got[i].EventTimestamp) {
+				t.Errorf("DESC ordering broken at i=%d: got[%d].ts=%v not after got[%d].ts=%v",
+					i, i-1, got[i-1].EventTimestamp, i, got[i].EventTimestamp)
+			}
+		}
+
+		// Each PK appears at most LimitPerPK=2 times.
+		counts := map[string]int{}
+		for _, r := range got {
+			counts[r.PKValues]++
+		}
+		for pk, n := range counts {
+			if n > 2 {
+				t.Errorf("PK %q appears %d times, exceeds LimitPerPK=2", pk, n)
+			}
+		}
+	})
+
+	// Symmetric ASC: confirm the existing behavior is unchanged. The per-PK
+	// cap still keeps IDs {2,3,5,6,8,9}; ASC order → 2,3,5,6,8,9; Limit=4
+	// slices to 2,3,5,6 (oldest 4 from the per-PK-trimmed set).
+	t.Run("asc", func(t *testing.T) {
+		got := MergeAndTrim(rows, 4, 2, "ASC")
+		if len(got) != 4 {
+			t.Fatalf("expected 4 rows after ASC + Limit=4 + LimitPerPK=2, got %d: %+v", len(got), got)
+		}
+		wantIDs := []uint64{2, 3, 5, 6}
+		for i, r := range got {
+			if r.EventID != wantIDs[i] {
+				t.Errorf("row %d: EventID=%d, want %d", i, r.EventID, wantIDs[i])
+			}
+		}
+		for i := 1; i < len(got); i++ {
+			if got[i].EventTimestamp.Before(got[i-1].EventTimestamp) {
+				t.Errorf("ASC ordering broken at i=%d: got[%d].ts=%v before got[%d].ts=%v",
+					i, i, got[i].EventTimestamp, i-1, got[i-1].EventTimestamp)
+			}
+		}
+	})
+}
+
+// TestMergeAndTrim_descTieBreakByEventID confirms that when multiple events
+// share the same timestamp, DESC ordering breaks ties by event_id DESC. With
+// three events at the same timestamp, IDs 1, 2, 3 → DESC order 3, 2, 1.
+func TestMergeAndTrim_descTieBreakByEventID(t *testing.T) {
+	ts := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	rows := []ResultRow{
+		{EventID: 1, EventTimestamp: ts, PKValues: "a"},
+		{EventID: 2, EventTimestamp: ts, PKValues: "b"},
+		{EventID: 3, EventTimestamp: ts, PKValues: "c"},
+	}
+	got := MergeAndTrim(rows, 0, 0, "DESC")
+	if len(got) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(got))
+	}
+	wantIDs := []uint64{3, 2, 1}
+	for i, r := range got {
+		if r.EventID != wantIDs[i] {
+			t.Errorf("row %d: EventID=%d, want %d", i, r.EventID, wantIDs[i])
+		}
 	}
 }
 
