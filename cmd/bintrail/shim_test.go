@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -209,34 +211,40 @@ func (l *alwaysErrorListener) Addr() net.Addr {
 // noise). Anything else stays at error.
 func TestClassifyHandshakeErr(t *testing.T) {
 	cases := []struct {
-		name      string
-		err       error
-		wantLevel slog.Level
+		name          string
+		err           error
+		wantLevel     slog.Level
+		wantIsMonitor bool
 	}{
-		{"raw io.EOF", io.EOF, slog.LevelDebug},
-		{"unexpected EOF", io.ErrUnexpectedEOF, slog.LevelDebug},
+		{"raw io.EOF", io.EOF, slog.LevelDebug, false},
+		{"unexpected EOF", io.ErrUnexpectedEOF, slog.LevelDebug, false},
 		// fmt.Errorf+%w produces an Unwrap-compatible chain that exercises the same
 		// errors.Is path go-mysql's pingcap-wrapped reads do. We avoid importing
 		// github.com/pingcap/errors directly per CLAUDE.md ("Do not import transitive
 		// deps directly") — the production behaviour is what matters, and errors.Is
 		// resolves both wrap shapes the same way.
-		{"wrapped ErrBadConn", fmt.Errorf("io.ReadFull(header) failed: %w", gomysql.ErrBadConn), slog.LevelDebug},
-		// ProxySQL monitor user → debug (issue #316).
-		{"ER_ACCESS_DENIED_ERROR monitor user is debug", gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "monitor", "127.0.0.1:46948", "YES"), slog.LevelDebug},
-		// Real tenant user → info (the load-bearing claim — without this,
-		// the #316 demote would silence every real auth failure too).
-		{"ER_ACCESS_DENIED_ERROR tenant user is info", gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "alice", "127.0.0.1:46948", "YES"), slog.LevelInfo},
-		{"unrelated MyError stays error", gomysql.NewDefaultError(gomysql.ER_HANDSHAKE_ERROR), slog.LevelError},
-		{"plain unrelated error", errors.New("protocol mismatch"), slog.LevelError},
+		{"wrapped ErrBadConn", fmt.Errorf("io.ReadFull(header) failed: %w", gomysql.ErrBadConn), slog.LevelDebug, false},
+		// ProxySQL monitor user → debug + isMonitor=true (issue #316/#326).
+		{"ER_ACCESS_DENIED_ERROR monitor user is debug", gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "monitor", "127.0.0.1:46948", "YES"), slog.LevelDebug, true},
+		// Real tenant user → info, isMonitor=false (the load-bearing claim —
+		// without this, the #316 demote would silence every real auth failure
+		// too AND the monitor-denied aggregator would inflate with tenant
+		// failures, hiding actual monitor probe load).
+		{"ER_ACCESS_DENIED_ERROR tenant user is info", gomysql.NewDefaultError(gomysql.ER_ACCESS_DENIED_ERROR, "alice", "127.0.0.1:46948", "YES"), slog.LevelInfo, false},
+		{"unrelated MyError stays error", gomysql.NewDefaultError(gomysql.ER_HANDSHAKE_ERROR), slog.LevelError, false},
+		{"plain unrelated error", errors.New("protocol mismatch"), slog.LevelError, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			level, msg := classifyHandshakeErr(tc.err)
+			level, msg, isMonitor := classifyHandshakeErr(tc.err)
 			if level != tc.wantLevel {
 				t.Errorf("classifyHandshakeErr level = %v, want %v (msg=%q)", level, tc.wantLevel, msg)
 			}
 			if msg == "" {
 				t.Errorf("classifyHandshakeErr msg empty for %v", tc.err)
+			}
+			if isMonitor != tc.wantIsMonitor {
+				t.Errorf("classifyHandshakeErr isMonitor = %v, want %v (err=%v)", isMonitor, tc.wantIsMonitor, tc.err)
 			}
 		})
 	}
@@ -314,5 +322,131 @@ func TestBuildUserSchemas(t *testing.T) {
 		if _, ok := got[u]; ok {
 			t.Errorf("buildUserSchemas[%q] should be absent (bad/empty DSN), got %q", u, got[u])
 		}
+	}
+}
+
+// TestMonitorDeniedBump pins the aggregation behavior for the periodic
+// emit's forensic signal. Each bump increments the count, accumulates
+// the source remote into a bounded distinct set, and bookends with
+// first/last seen timestamps. A regression that detached count from
+// the distinct set (or vice versa) would silently lose the "one IP
+// hammering vs many IPs probing" distinction that operators need to
+// tell credential stuffing from a misconfigured ProxySQL.
+func TestMonitorDeniedBump(t *testing.T) {
+	monitorDeniedReset()
+	t.Cleanup(monitorDeniedReset)
+
+	monitorDeniedBump("10.0.0.1:54321")
+	monitorDeniedBump("10.0.0.1:54322") // same host, different port — one source
+	monitorDeniedBump("10.0.0.2:60001")
+
+	monitorDenied.mu.Lock()
+	count := monitorDenied.count
+	distinct := len(monitorDenied.distinctRemotes)
+	firstSeen := monitorDenied.firstSeen
+	lastSeen := monitorDenied.lastSeen
+	monitorDenied.mu.Unlock()
+
+	if count != 3 {
+		t.Errorf("count = %d, want 3", count)
+	}
+	if distinct != 2 {
+		t.Errorf("distinct = %d, want 2 (same host different ports collapses)", distinct)
+	}
+	if firstSeen.IsZero() {
+		t.Error("firstSeen unset after bumps")
+	}
+	if lastSeen.IsZero() {
+		t.Error("lastSeen unset after bumps")
+	}
+	if lastSeen.Before(firstSeen) {
+		t.Errorf("lastSeen (%v) before firstSeen (%v)", lastSeen, firstSeen)
+	}
+}
+
+// TestMonitorDeniedBumpRemoteCap pins the bounded-set defense. A wide-
+// source burst (e.g. credential stuffing from 200 IPs) must not blow
+// memory by retaining one entry per probe — past the cap, additional
+// distinct remotes are dropped from the set but `count` keeps climbing.
+// The emit reports `distinct_remotes_truncated_at` so alerting can
+// tell "we saw at least N sources" from "exactly N sources".
+func TestMonitorDeniedBumpRemoteCap(t *testing.T) {
+	monitorDeniedReset()
+	t.Cleanup(monitorDeniedReset)
+
+	for i := 0; i < monitorDeniedRemoteCap*3; i++ {
+		monitorDeniedBump(fmt.Sprintf("10.0.0.%d:1234", i))
+	}
+
+	monitorDenied.mu.Lock()
+	count := monitorDenied.count
+	distinct := len(monitorDenied.distinctRemotes)
+	monitorDenied.mu.Unlock()
+
+	if count != int64(monitorDeniedRemoteCap*3) {
+		t.Errorf("count = %d, want %d (count keeps climbing past cap)", count, monitorDeniedRemoteCap*3)
+	}
+	if distinct != monitorDeniedRemoteCap {
+		t.Errorf("distinct = %d, want %d (set bounded at cap)", distinct, monitorDeniedRemoteCap)
+	}
+}
+
+// TestMonitorDeniedPeriodicEmit pins the two contract claims of
+// emitMonitorDenied:
+//   - count == 0 emits nothing (no steady-state log noise when ProxySQL's
+//     monitor is configured correctly and never fails),
+//   - count >  0 emits one INFO line with count, distinct_remotes,
+//     first_seen, last_seen, interval — then resets state so the next
+//     interval starts fresh.
+//
+// A regression that emitted on zero (operator drowns in 5-minute
+// heartbeats) or failed to reset (counts compound forever, reporting
+// absurd totals) would both silently break the design.
+func TestMonitorDeniedPeriodicEmit(t *testing.T) {
+	t.Cleanup(monitorDeniedReset)
+	monitorDeniedReset()
+
+	// count == 0 path: emit nothing.
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	emitMonitorDenied(logger)
+	if buf.Len() != 0 {
+		t.Errorf("empty emit: got log output %q, want empty (no steady-state noise)", buf.String())
+	}
+
+	// Populated path: bump from two distinct hosts, emit, expect one
+	// log line that names every forensic field.
+	monitorDeniedBump("10.0.0.1:54321")
+	monitorDeniedBump("10.0.0.2:54322")
+	monitorDeniedBump("10.0.0.1:54323")
+	buf.Reset()
+	emitMonitorDenied(logger)
+	out := buf.String()
+	for _, want := range []string{
+		"monitor probes denied",
+		"count=3",
+		"distinct_remotes=2",
+		"first_seen=",
+		"last_seen=",
+		"interval=",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("emit missing %q; got %q", want, out)
+		}
+	}
+	monitorDenied.mu.Lock()
+	count := monitorDenied.count
+	distinct := len(monitorDenied.distinctRemotes)
+	firstSeen := monitorDenied.firstSeen
+	monitorDenied.mu.Unlock()
+	if count != 0 || distinct != 0 || !firstSeen.IsZero() {
+		t.Errorf("state not reset after emit: count=%d distinct=%d firstSeen=%v", count, distinct, firstSeen)
+	}
+
+	// After reset, a second emit at count==0 stays silent.
+	buf.Reset()
+	emitMonitorDenied(logger)
+	if buf.Len() != 0 {
+		t.Errorf("second emit after reset: got %q, want empty", buf.String())
 	}
 }
