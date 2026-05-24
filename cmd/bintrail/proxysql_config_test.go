@@ -2,11 +2,17 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
+	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/DATA-DOG/go-sqlmock"
 )
 
 const (
@@ -38,6 +44,7 @@ func resetPCFlags() {
 	pcProxySQLMySQLPort = 6033
 	pcForce = false
 	pcBackendAuthPlugin = backendAuthNative
+	pcValidate = false
 }
 
 const validShimYAML = `listen: ':3308'
@@ -835,4 +842,404 @@ func TestRunProxySQLConfigForceOverwrites(t *testing.T) {
 			t.Errorf("expected mode 0o600 after --force overwrite, got 0o%o", mode)
 		}
 	})
+}
+
+// captureWarnLogs swaps slog.Default() with a text-handler writing to a
+// bytes.Buffer for the duration of the test. Returns the buffer; the
+// cleanup is registered with t. Use buf.String() in assertions.
+func captureWarnLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// TestValidateBackendAuthPlugin covers the pure SQL helper that probes
+// mysql.user. The integration-side warn-emission decisions are tested
+// separately in TestRunProxySQLConfigValidate_*.
+//
+// The helper drops the bogus host filter the previous version applied
+// (mysql.user.host is the client-host pattern, not the server's
+// hostname — the old `host = ?` branch was effectively dead code in
+// production). All host rows for the requested user are returned.
+func TestValidateBackendAuthPlugin(t *testing.T) {
+	t.Run("returns all (host, plugin) rows for the user", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		defer db.Close()
+
+		mock.ExpectQuery("SELECT host, plugin FROM mysql.user").
+			WithArgs("app_user").
+			WillReturnRows(sqlmock.NewRows([]string{"host", "plugin"}).
+				AddRow("%", "mysql_native_password").
+				AddRow("localhost", "mysql_native_password"))
+
+		got, err := validateBackendAuthPlugin(db, "app_user")
+		if err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		want := map[string]string{"%": "mysql_native_password", "localhost": "mysql_native_password"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet expectations: %v", err)
+		}
+	})
+
+	t.Run("returns split-plugin grants verbatim", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		defer db.Close()
+
+		// The realistic conflict case: same user, different plugins
+		// per host pattern. QueryRow + LIMIT 1 in the previous impl
+		// hid this; Query + iterate surfaces it for the orchestrator
+		// to warn about.
+		mock.ExpectQuery("SELECT host, plugin FROM mysql.user").
+			WithArgs("app_user").
+			WillReturnRows(sqlmock.NewRows([]string{"host", "plugin"}).
+				AddRow("localhost", "mysql_native_password").
+				AddRow("%", "caching_sha2_password"))
+
+		got, err := validateBackendAuthPlugin(db, "app_user")
+		if err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		if got["localhost"] != "mysql_native_password" || got["%"] != "caching_sha2_password" {
+			t.Errorf("split-plugin grants not preserved: %v", got)
+		}
+	})
+
+	t.Run("propagates query error", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		defer db.Close()
+
+		mock.ExpectQuery("SELECT host, plugin FROM mysql.user").
+			WillReturnError(errors.New("Access denied; you need (at least one of) the SELECT privilege(s)"))
+
+		_, err = validateBackendAuthPlugin(db, "app_user")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "Access denied") {
+			t.Errorf("expected privilege error to propagate, got %v", err)
+		}
+	})
+
+	t.Run("returns empty map when user not present", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		defer db.Close()
+
+		mock.ExpectQuery("SELECT host, plugin FROM mysql.user").
+			WillReturnRows(sqlmock.NewRows([]string{"host", "plugin"}))
+
+		got, err := validateBackendAuthPlugin(db, "app_user")
+		if err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("expected empty map, got %v", got)
+		}
+	})
+}
+
+// TestRunProxySQLConfigValidate_pluginMatch: the tenant user's plugin in
+// mysql.user matches --backend-auth-plugin; no warn log is emitted.
+// Note we probe the TENANT user (app_user from validShimYAML), not the
+// DSN user (user from pcTestSourceDSN) — this is the load-bearing fix
+// over the original #327 implementation. ProxySQL re-handshakes as the
+// tenant; probing the DSN user checked the wrong identity.
+func TestRunProxySQLConfigValidate_pluginMatch(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(orig) })
+	os.Chdir(dir)
+
+	t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
+	writeShimYAML(t, dir, validShimYAML)
+	resetPCFlags()
+	pcValidate = true
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("SELECT host, plugin FROM mysql.user").
+		WithArgs("app_user"). // tenant user from validShimYAML
+		WillReturnRows(sqlmock.NewRows([]string{"host", "plugin"}).
+			AddRow("%", "mysql_native_password"))
+
+	prevConnect := pcConnect
+	pcConnect = func(string) (*sql.DB, error) { return db, nil }
+	t.Cleanup(func() { pcConnect = prevConnect })
+
+	buf := captureWarnLogs(t)
+
+	if err := runProxySQLConfig(proxysqlConfigCmd, nil); err != nil {
+		t.Fatalf("runProxySQLConfig: %v", err)
+	}
+	logs := buf.String()
+	if strings.Contains(logs, "mismatch") {
+		t.Errorf("unexpected mismatch warn for matching plugin; logs:\n%s", logs)
+	}
+	if strings.Contains(logs, "could not run") || strings.Contains(logs, "not found") {
+		t.Errorf("unexpected skip/missing warn for clean path; logs:\n%s", logs)
+	}
+}
+
+// TestRunProxySQLConfigValidate_pluginMismatch: the tenant user has
+// caching_sha2_password but operator specified mysql_native_password;
+// expect a warn log naming both plugins and the tenant_user.
+func TestRunProxySQLConfigValidate_pluginMismatch(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(orig) })
+	os.Chdir(dir)
+
+	t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
+	writeShimYAML(t, dir, validShimYAML)
+	resetPCFlags()
+	pcValidate = true
+	pcBackendAuthPlugin = backendAuthNative // operator says native
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("SELECT host, plugin FROM mysql.user").
+		WithArgs("app_user").
+		WillReturnRows(sqlmock.NewRows([]string{"host", "plugin"}).
+			AddRow("%", "caching_sha2_password"))
+
+	prevConnect := pcConnect
+	pcConnect = func(string) (*sql.DB, error) { return db, nil }
+	t.Cleanup(func() { pcConnect = prevConnect })
+
+	buf := captureWarnLogs(t)
+
+	if err := runProxySQLConfig(proxysqlConfigCmd, nil); err != nil {
+		t.Fatalf("runProxySQLConfig: %v", err)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "mismatch") {
+		t.Errorf("expected mismatch warn; logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, "caching_sha2_password") || !strings.Contains(logs, backendAuthNative) {
+		t.Errorf("warn should name both plugins; logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, "app_user") {
+		t.Errorf("warn should name the tenant_user (app_user); logs:\n%s", logs)
+	}
+	// SQL must still be generated despite the warning.
+	if _, err := os.Stat(filepath.Join(dir, "proxysql-setup.sql")); err != nil {
+		t.Errorf("expected SQL file generated despite warn; stat: %v", err)
+	}
+}
+
+// TestRunProxySQLConfigValidate_splitPluginGrants: same tenant user has
+// different plugins per host pattern (legitimate setup: native locally,
+// caching_sha2 remotely). The previous LIMIT 1 query silently picked
+// one row in storage-engine order; this fix surfaces the conflict.
+func TestRunProxySQLConfigValidate_splitPluginGrants(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(orig) })
+	os.Chdir(dir)
+
+	t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
+	writeShimYAML(t, dir, validShimYAML)
+	resetPCFlags()
+	pcValidate = true
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("SELECT host, plugin FROM mysql.user").
+		WithArgs("app_user").
+		WillReturnRows(sqlmock.NewRows([]string{"host", "plugin"}).
+			AddRow("localhost", "mysql_native_password").
+			AddRow("%", "caching_sha2_password"))
+
+	prevConnect := pcConnect
+	pcConnect = func(string) (*sql.DB, error) { return db, nil }
+	t.Cleanup(func() { pcConnect = prevConnect })
+
+	buf := captureWarnLogs(t)
+
+	if err := runProxySQLConfig(proxysqlConfigCmd, nil); err != nil {
+		t.Fatalf("runProxySQLConfig: %v", err)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "split-plugin") {
+		t.Errorf("expected split-plugin warn; logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, "app_user") {
+		t.Errorf("warn should name the tenant_user; logs:\n%s", logs)
+	}
+}
+
+// TestRunProxySQLConfigValidate_userNotFound: the tenant user doesn't
+// exist in mysql.user — distinct from a query failure (this is a hard
+// operator error: the SQL we're about to write references a user that
+// won't exist on the backend, and ProxySQL will fail at handshake).
+func TestRunProxySQLConfigValidate_userNotFound(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(orig) })
+	os.Chdir(dir)
+
+	t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
+	writeShimYAML(t, dir, validShimYAML)
+	resetPCFlags()
+	pcValidate = true
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("SELECT host, plugin FROM mysql.user").
+		WithArgs("app_user").
+		WillReturnRows(sqlmock.NewRows([]string{"host", "plugin"})) // empty
+
+	prevConnect := pcConnect
+	pcConnect = func(string) (*sql.DB, error) { return db, nil }
+	t.Cleanup(func() { pcConnect = prevConnect })
+
+	buf := captureWarnLogs(t)
+
+	if err := runProxySQLConfig(proxysqlConfigCmd, nil); err != nil {
+		t.Fatalf("runProxySQLConfig: %v", err)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "not found in mysql.user") {
+		t.Errorf("expected 'not found in mysql.user' warn; logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, "app_user") {
+		t.Errorf("warn should name the tenant_user; logs:\n%s", logs)
+	}
+}
+
+// TestRunProxySQLConfigValidate_queryError: probing mysql.user fails
+// (e.g. permission denied); validation warns and continues — SQL still
+// generated.
+func TestRunProxySQLConfigValidate_queryError(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(orig) })
+	os.Chdir(dir)
+
+	t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
+	writeShimYAML(t, dir, validShimYAML)
+	resetPCFlags()
+	pcValidate = true
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("SELECT host, plugin FROM mysql.user").
+		WillReturnError(errors.New("Access denied for user 'user'@'%' to database 'mysql'"))
+
+	prevConnect := pcConnect
+	pcConnect = func(string) (*sql.DB, error) { return db, nil }
+	t.Cleanup(func() { pcConnect = prevConnect })
+
+	buf := captureWarnLogs(t)
+
+	if err := runProxySQLConfig(proxysqlConfigCmd, nil); err != nil {
+		t.Fatalf("runProxySQLConfig must not error on validation query failure: %v", err)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "could not run for tenant") {
+		t.Errorf("expected 'could not run for tenant' warn; logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, "query failed") {
+		t.Errorf("expected 'query failed' in skip warn; logs:\n%s", logs)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "proxysql-setup.sql")); err != nil {
+		t.Errorf("expected SQL file generated despite validation failure; stat: %v", err)
+	}
+}
+
+// TestRunProxySQLConfigValidate_connectError: connecting to the source
+// fails entirely; we warn and continue. Locks in that validation never
+// blocks SQL gen even when the DB is unreachable.
+func TestRunProxySQLConfigValidate_connectError(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(orig) })
+	os.Chdir(dir)
+
+	t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
+	writeShimYAML(t, dir, validShimYAML)
+	resetPCFlags()
+	pcValidate = true
+
+	prevConnect := pcConnect
+	pcConnect = func(string) (*sql.DB, error) {
+		return nil, errors.New("dial tcp: connection refused")
+	}
+	t.Cleanup(func() { pcConnect = prevConnect })
+
+	buf := captureWarnLogs(t)
+
+	if err := runProxySQLConfig(proxysqlConfigCmd, nil); err != nil {
+		t.Fatalf("runProxySQLConfig must not error when connect fails: %v", err)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "could not connect") {
+		t.Errorf("expected 'could not connect' warn; logs:\n%s", logs)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "proxysql-setup.sql")); err != nil {
+		t.Errorf("expected SQL file generated despite connect failure; stat: %v", err)
+	}
+}
+
+// TestRunProxySQLConfigValidate_optInOnly verifies the default (no
+// --validate) does NOT touch the DB. Guards against accidentally
+// making the probe default-on.
+func TestRunProxySQLConfigValidate_optInOnly(t *testing.T) {
+	dir := t.TempDir()
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(orig) })
+	os.Chdir(dir)
+
+	t.Setenv("BINTRAIL_SOURCE_DSN", pcTestSourceDSN)
+	writeShimYAML(t, dir, validShimYAML)
+	resetPCFlags()
+	// pcValidate stays false (default)
+
+	called := false
+	prevConnect := pcConnect
+	pcConnect = func(string) (*sql.DB, error) {
+		called = true
+		return nil, errors.New("should never be called")
+	}
+	t.Cleanup(func() { pcConnect = prevConnect })
+
+	if err := runProxySQLConfig(proxysqlConfigCmd, nil); err != nil {
+		t.Fatalf("runProxySQLConfig: %v", err)
+	}
+	if called {
+		t.Error("pcConnect was called when --validate was off; validation must be opt-in")
+	}
 }

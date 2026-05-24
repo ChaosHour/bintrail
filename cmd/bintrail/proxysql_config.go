@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha1"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/dbtrail/bintrail/internal/config"
 	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 	yaml "go.yaml.in/yaml/v2"
@@ -66,7 +68,13 @@ var (
 	pcProxySQLMySQLPort  uint
 	pcForce              bool
 	pcBackendAuthPlugin  string
+	pcValidate           bool
 )
+
+// pcConnect is the indirection seam for opening the source DB during
+// --validate pre-flight. Tests override it to inject a sqlmock DB without
+// requiring a live MySQL. Defaults to config.Connect.
+var pcConnect = config.Connect
 
 // Valid values for --backend-auth-plugin. Default is the SHA1
 // (mysql_native_password) form because that preserves pre-#310 behaviour
@@ -87,7 +95,17 @@ func init() {
 	proxysqlConfigCmd.Flags().UintVar(&pcProxySQLMySQLPort, "proxysql-mysql-port", 6033, "ProxySQL's client-facing MySQL protocol port (used in the help comment)")
 	proxysqlConfigCmd.Flags().BoolVarP(&pcForce, "force", "f", false, "Overwrite the output file if it already exists")
 	proxysqlConfigCmd.Flags().StringVar(&pcBackendAuthPlugin, "backend-auth-plugin", backendAuthNative,
-		"Backend MySQL auth plugin: 'mysql_native_password' stores SHA1 (default, current behaviour); 'caching_sha2_password' stores cleartext so ProxySQL can complete the backend handshake against MySQL 8.0+ defaults")
+		"Backend MySQL auth plugin: 'mysql_native_password' stores SHA1 (default, current behaviour); "+
+			"'caching_sha2_password' stores cleartext. NOTE: caching_sha2_password requires TLS between "+
+			"ProxySQL and the MySQL backend, OR the SHA2 auth cache already primed for that user. Without "+
+			"either, the ProxySQL→backend handshake fails on first connect — see ProxySQL docs.")
+	proxysqlConfigCmd.Flags().BoolVar(&pcValidate, "validate", false,
+		"Opt-in pre-flight: connect to BINTRAIL_SOURCE_DSN and verify the auth plugin in mysql.user for each "+
+			"tenant from shim.yaml matches --backend-auth-plugin. ProxySQL re-handshakes as the tenant user "+
+			"(NOT the DSN user), so we probe tenants. Warns (does not error) on mismatch, on split-plugin "+
+			"grants (same user with different plugins per host), or when the probe itself fails (e.g. "+
+			"SELECT on mysql.user denied — common for non-admin DSN users; the warning then says validation "+
+			"could not run). Never blocks SQL generation.")
 	bindCommandEnv(proxysqlConfigCmd)
 	rootCmd.AddCommand(proxysqlConfigCmd)
 }
@@ -156,6 +174,16 @@ func runProxySQLConfig(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Opt-in pre-flight: probe mysql.user for EACH TENANT's plugin and
+	// warn-and-continue when it doesn't match --backend-auth-plugin
+	// (#327). ProxySQL re-handshakes as the tenant user, NOT the DSN
+	// user — so iterating tenants from shim.yaml is the only meaningful
+	// signal. Validation failures never block SQL generation (the
+	// operator can re-apply later).
+	if pcValidate {
+		runBackendAuthPluginValidation(sourceDSN, tenants, pcBackendAuthPlugin)
+	}
+
 	content := generateProxySQLSetupSQL(host, port, uint16(pcShimPort), uint16(pcProxySQLMySQLPort), tenants, pcBackendAuthPlugin)
 
 	if pcOut == "-" {
@@ -202,6 +230,123 @@ func runProxySQLConfig(cmd *cobra.Command, args []string) error {
 	fmt.Printf("ProxySQL setup SQL written to %s\n", pcOut)
 	fmt.Printf("Apply it: mysql -u admin -P 6032 -h <proxysql-host> < %s\n", pcOut)
 	return nil
+}
+
+// runBackendAuthPluginValidation orchestrates the --validate path:
+// open a connection, then for each tenant from shim.yaml probe
+// mysql.user for ALL (host, plugin) grants matching its mysql_user
+// and emit the appropriate warn log on mismatch, split-plugin, or
+// missing-row. Any failure short-circuits per-tenant with a warn —
+// SQL generation always proceeds regardless (#327).
+//
+// Why tenants, not the DSN user: ProxySQL re-handshakes against the
+// backend as the tenant user (the one stored in mysql_users at apply
+// time). Probing the DSN user (typically the bintrail admin/indexer
+// account) checks the wrong identity entirely.
+func runBackendAuthPluginValidation(sourceDSN string, tenants []shimTenant, expected string) {
+	if len(tenants) == 0 {
+		slog.Warn("backend auth-plugin validation skipped: no tenants in shim.yaml")
+		return
+	}
+	db, err := pcConnect(sourceDSN)
+	if err != nil {
+		slog.Warn("backend auth-plugin validation skipped: could not connect to source", "err", err)
+		return
+	}
+	defer db.Close()
+	for _, t := range tenants {
+		grants, err := validateBackendAuthPlugin(db, t.MySQLUser)
+		if err != nil {
+			// Most common cause: DSN user lacks SELECT on mysql.user
+			// (security best practice for non-admin DSNs). Either way
+			// we couldn't verify this tenant — warn and continue.
+			slog.Warn("backend auth-plugin validation could not run for tenant: query failed",
+				"err", err, "tenant_user", t.MySQLUser)
+			continue
+		}
+		if len(grants) == 0 {
+			// User not present in mysql.user. Distinct from a query
+			// failure — this is a HARD operator error (the generated
+			// ProxySQL config will reference a user that doesn't
+			// exist on the backend; the handshake will fail). Worth
+			// a separate, louder warn so it doesn't get filed under
+			// "probably permissions".
+			slog.Warn(
+				"backend auth-plugin validation: tenant user not found in mysql.user — ProxySQL handshake will fail",
+				"tenant_user", t.MySQLUser,
+			)
+			continue
+		}
+		// Collect distinct plugins across all host patterns for this
+		// user. A split (same user, different plugins per host) is its
+		// own diagnostic — operators with both `@'localhost'` and
+		// `@'%'` rows configured asymmetrically need to know.
+		hostPlugins := make(map[string]string, len(grants))
+		distinctPlugins := make(map[string]struct{}, 2)
+		for host, plugin := range grants {
+			hostPlugins[host] = plugin
+			distinctPlugins[plugin] = struct{}{}
+		}
+		if len(distinctPlugins) > 1 {
+			slog.Warn(
+				"backend auth-plugin validation: split-plugin grants for tenant — ProxySQL handshake outcome depends on which host pattern matches the connection",
+				"tenant_user", t.MySQLUser, "host_plugins", hostPlugins, "expected", expected,
+			)
+			continue
+		}
+		// Single plugin across all hosts — compare to expected.
+		var actual string
+		for p := range distinctPlugins {
+			actual = p
+		}
+		if actual != expected {
+			hosts := make([]string, 0, len(hostPlugins))
+			for host := range hostPlugins {
+				hosts = append(hosts, host)
+			}
+			slog.Warn(
+				"backend auth plugin mismatch — ProxySQL backend handshake will fail at runtime",
+				"expected", expected, "actual", actual,
+				"tenant_user", t.MySQLUser, "hosts", hosts,
+			)
+		}
+	}
+}
+
+// validateBackendAuthPlugin returns a map of host-pattern → auth plugin
+// for every mysql.user row matching the given user. Empty map means no
+// rows (the user doesn't exist on this server). Non-nil error means the
+// query itself failed (typically: DSN user lacks SELECT on mysql.user).
+//
+// Returning a map (vs. a single string from QueryRow + LIMIT 1) is the
+// load-bearing change vs. the original #327 implementation. The
+// previous code silently picked one row in non-deterministic
+// storage-engine order, hiding split-plugin grants and giving operators
+// false confidence after a passing --validate run.
+//
+// Note: mysql.user.host is the CLIENT host pattern (where the user may
+// connect FROM), not the server's hostname. The original code passed
+// the backend's hostname as a filter, which was a category error — the
+// match condition was effectively dead in production. This version
+// drops the host filter entirely; the caller iterates all matches.
+func validateBackendAuthPlugin(db *sql.DB, user string) (grants map[string]string, err error) {
+	rows, err := db.Query("SELECT host, plugin FROM mysql.user WHERE user = ?", user)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	grants = make(map[string]string)
+	for rows.Next() {
+		var host, plugin string
+		if err := rows.Scan(&host, &plugin); err != nil {
+			return nil, err
+		}
+		grants[host] = plugin
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return grants, nil
 }
 
 // parseProxySQLBackend extracts the host and port from a go-sql-driver
