@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -19,6 +20,22 @@ import (
 	"github.com/dbtrail/bintrail/internal/parquetquery"
 	"github.com/dbtrail/bintrail/internal/parser"
 	"github.com/dbtrail/bintrail/internal/query"
+)
+
+// showTablesFromVirtualRE matches the interactive `SHOW [FULL] TABLES
+// FROM <virtual>` form against the three virtual schemas (#315). Without
+// this interception the query falls through to ProxySQL's passthrough
+// rule, hits the real MySQL, and gets ER_BAD_DB (1049 "Unknown database
+// '_flashback'") — the #1 first-thing-a-DBA-types friction in interactive
+// time-travel sessions. The shim answers with the table list from the
+// latest schema snapshot.
+//
+// `SHOW TABLES FROM <realdb>` does NOT match this regex (the schema
+// alternation is anchored to the three virtual prefixes) so legitimate
+// real-database SHOW TABLES routed to the shim by mistake still falls
+// through to the default unsupported-query path.
+var showTablesFromVirtualRE = regexp.MustCompile(
+	"(?i)^\\s*SHOW\\s+(?:FULL\\s+)?TABLES\\s+(?:FROM|IN)\\s+`?(_flashback|_diff|_snapshot)`?\\s*;?\\s*$",
 )
 
 // defaultFullTableRowCap bounds the buffered resultset for the
@@ -283,6 +300,14 @@ func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 	currentDB := h.db
 	h.mu.Unlock()
 
+	// SHOW TABLES FROM _flashback/_diff/_snapshot (#315). Intercepted
+	// here, before Parse(), so the table list comes from the latest
+	// schema snapshot rather than letting the query fall through to the
+	// real MySQL (which returns ER_BAD_DB on the virtual schema).
+	if m := showTablesFromVirtualRE.FindStringSubmatch(qstr); m != nil {
+		return h.runShowTablesFromVirtual(currentDB, m[1])
+	}
+
 	q, perr := Parse(qstr, currentDB)
 	if perr == nil {
 		// Cross-cut PK validation (#296). Applied here, not inside each
@@ -412,7 +437,120 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 	if image == nil {
 		return emptyResult(), nil
 	}
+	// When q.Columns is set (#313 user-supplied projection), bypass
+	// imageToResult's orderColumns step — orderColumns is designed for
+	// SELECT * and DROPS missing-from-image columns + APPENDS image
+	// columns absent from ddlOrder (alphabetically). Both behaviours
+	// silently expand and reshuffle the user's explicit projection. The
+	// multi-row sibling imagesToResult already uses cols verbatim, so
+	// runFullTable was unaffected.
+	if q.Columns != nil {
+		return imageToResultVerbatim(image, q.Columns)
+	}
 	return imageToResult(image, h.columnOrderFor(q.Schema, q.Table))
+}
+
+// imageToResultVerbatim is the user-projection sibling of imageToResult.
+// Unlike imageToResult (which goes through orderColumns to drop missing
+// keys and append snapshot-unknown extras), this function uses cols
+// verbatim — exactly the columns the user listed, in the order they
+// listed them, with NULL for any column missing from the image. That
+// matches MySQL's behaviour for `SELECT <col>, <col> FROM <table>`
+// after an ALTER TABLE DROP COLUMN: the column name stays, the value
+// is NULL.
+//
+// Pure function — separated from imageToResult so the two semantics
+// stay independently testable and the contract on each is single-purpose.
+func imageToResultVerbatim(image map[string]any, cols []string) (*mysql.Result, error) {
+	row := make([]any, len(cols))
+	for i, c := range cols {
+		row[i] = image[c] // nil for missing key → NULL on wire
+	}
+	rs, err := mysql.BuildSimpleTextResultset(cols, [][]any{row})
+	if err != nil {
+		return nil, fmt.Errorf("build verbatim resultset: %w", err)
+	}
+	return &mysql.Result{Resultset: rs}, nil
+}
+
+// effectiveColumnOrder returns the column ordering for the multi-row
+// path (runFullTable → imagesToResult). A non-nil q.Columns means the
+// user listed columns explicitly (#313); imagesToResult uses its
+// ddlOrder argument verbatim and emits NULL for missing image keys —
+// the contract this function relies on.
+//
+// DO NOT pass the result of this function into the single-row
+// imageToResult: that path goes through orderColumns, which is
+// designed for SELECT * and silently drops missing-from-image entries
+// while appending image-only keys alphabetically. For single-row
+// user-projection results, use imageToResultVerbatim directly (see
+// runPointInTime).
+func (h *Handler) effectiveColumnOrder(q TimeTravelQuery) []string {
+	if q.Columns != nil {
+		return q.Columns
+	}
+	return h.columnOrderFor(q.Schema, q.Table)
+}
+
+// runShowTablesFromVirtual answers `SHOW [FULL] TABLES FROM
+// _flashback/_diff/_snapshot` (#315). The virtual schemas have no MySQL
+// counterpart on the backend, so passing the query through ProxySQL would
+// hit ER_BAD_DB. Instead we return the list of tables present in the
+// latest schema snapshot for currentDB — every one of those tables is a
+// legitimate target for `SELECT * FROM <virtualSchema>.<table> ...`.
+//
+// `virtualSchema` is the literal `_flashback` / `_diff` / `_snapshot`
+// captured from the SHOW; it's used only for the resultset column name
+// (mirroring real MySQL's `Tables_in_<dbname>` convention).
+func (h *Handler) runShowTablesFromVirtual(currentDB, virtualSchema string) (*mysql.Result, error) {
+	colName := "Tables_in_" + virtualSchema
+	if currentDB == "" {
+		return nil, mysql.NewError(mysql.ER_NO_DB_ERROR, fmt.Sprintf(
+			"no database selected; issue `USE <database>;` against your real schema first, then SHOW TABLES FROM %s",
+			virtualSchema,
+		))
+	}
+
+	r, err := h.resolverCache.get(time.Now, resolverCacheTTL, h.resolverFn, h.logger)
+	if err != nil {
+		// Pre-snapshot install: the virtual schemas exist but have no
+		// indexable tables yet. Empty resultset rather than an error so
+		// `SHOW TABLES` behaves like it would against a freshly-created
+		// real database with no tables. Operators see "Empty set" — the
+		// natural prompt to run `bintrail snapshot` is already in
+		// ErrNoSnapshots' message text, surfaced elsewhere.
+		if errors.Is(err, metadata.ErrNoSnapshots) {
+			rs, rsErr := mysql.BuildSimpleTextResultset([]string{colName}, nil)
+			if rsErr != nil {
+				// BuildSimpleTextResultset on (1 column, nil values) is
+				// empirically infallible today, but a future go-mysql
+				// release could tighten the contract. Surface via Warn so
+				// Sentry / structured logs catch it; the user still gets
+				// the empty-set semantic.
+				h.logger.Warn("shim: build empty SHOW TABLES resultset failed",
+					"err", rsErr, "current_db", currentDB, "virtual_schema", virtualSchema)
+				return nil, fmt.Errorf("build empty SHOW TABLES resultset: %w", rsErr)
+			}
+			return &mysql.Result{Resultset: rs}, nil
+		}
+		// Wrap with currentDB + virtualSchema so a multi-tenant shim log
+		// lets oncall attribute the failure to a specific connection's
+		// USE and virtual-schema target — same triage-friendly pattern
+		// wrapFetchError uses for the data-fetch paths.
+		return nil, fmt.Errorf("resolve schema snapshot for SHOW TABLES FROM %s (current_db=%s): %w",
+			virtualSchema, currentDB, err)
+	}
+
+	tables := r.Tables(currentDB)
+	values := make([][]any, 0, len(tables))
+	for _, t := range tables {
+		values = append(values, []any{t.Table})
+	}
+	rs, err := mysql.BuildSimpleTextResultset([]string{colName}, values)
+	if err != nil {
+		return nil, fmt.Errorf("build SHOW TABLES resultset: %w", err)
+	}
+	return &mysql.Result{Resultset: rs}, nil
 }
 
 // runFullTable reconstructs the full row state of a table at q.AsOf
@@ -466,7 +604,7 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 		))
 	}
 
-	return imagesToResult(extractFullTableImages(rows), h.columnOrderFor(q.Schema, q.Table))
+	return imagesToResult(extractFullTableImages(rows), h.effectiveColumnOrder(q))
 }
 
 // extractFullTableImages picks the post-image of every non-DELETE
