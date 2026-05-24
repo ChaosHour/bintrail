@@ -103,6 +103,24 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		t.Fatalf("WriteRow 2: %v", err)
 	}
 
+	// Row 3: binlog_file is null (the dbtrail/bintrail#318 case — customer
+	// indexes that predate the NOT NULL constraint or rows from external
+	// pipelines). Confirms the Parquet writer accepts NULL at column index 1.
+	row3 := []string{
+		"3", "", "300", "400", "2026-02-19 10:00:02",
+		"def456:1", "67890", "mydb", "orders", "1", "44",
+		`["col1"]`, `{"id":44}`, `{"id":44,"v":1}`, "1",
+	}
+	nulls3 := []bool{
+		false,
+		true, // binlog_file null
+		false, false, false, false, false, false, false, false, false,
+		false, false, false, false,
+	}
+	if err := w.WriteRow(row3, nulls3); err != nil {
+		t.Fatalf("WriteRow 3: %v", err)
+	}
+
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -119,8 +137,32 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		t.Fatalf("OpenFile: %v", err)
 	}
 
-	if pf.NumRows() != 2 {
-		t.Errorf("NumRows = %d, want 2", pf.NumRows())
+	if pf.NumRows() != 3 {
+		t.Errorf("NumRows = %d, want 3", pf.NumRows())
+	}
+
+	// Read back the rows and verify binlog_file NULL semantics: row 1 (the
+	// first non-NULL row written) carries "binlog.000001"; row 3 is the
+	// dbtrail/bintrail#318 case — must be a real Parquet NULL, not an
+	// empty string smuggled into the column. Without nulls[1]=!binlogFile.Valid
+	// in archive.go, the writer would emit "" and IsNull() would be false.
+	//
+	// parquet-go orders row values alphabetically by column name, not by
+	// schema declaration order — binlog_file sorts to index 0.
+	binlogFileIdx := parquetColumnIndex(t, pf, "binlog_file")
+	reader := parquet.NewReader(pf)
+	defer reader.Close()
+	parquetRows := make([]parquet.Row, 3)
+	if n, err := reader.ReadRows(parquetRows); err != nil || n != 3 {
+		t.Fatalf("ReadRows returned (%d, %v), want (3, nil)", n, err)
+	}
+	if parquetRows[0][binlogFileIdx].IsNull() {
+		t.Errorf("row 0 binlog_file: got NULL, want \"binlog.000001\"")
+	} else if got := parquetRows[0][binlogFileIdx].String(); got != "binlog.000001" {
+		t.Errorf("row 0 binlog_file: got %q, want \"binlog.000001\"", got)
+	}
+	if !parquetRows[2][binlogFileIdx].IsNull() {
+		t.Errorf("row 2 binlog_file: got %q, want NULL", parquetRows[2][binlogFileIdx].String())
 	}
 
 	// Verify key-value metadata was embedded.
@@ -134,4 +176,20 @@ func TestWriteReadRoundTrip(t *testing.T) {
 	if _, ok := pf.Lookup("bintrail.archive.version"); !ok {
 		t.Error("expected bintrail.archive.version metadata key")
 	}
+}
+
+// parquetColumnIndex looks up the position of a column in the file's leaf
+// schema. parquet-go's NewReader returns rows whose values are ordered by
+// the schema's leaf walk (alphabetical for our flat schemas), not by the
+// order columns were passed to NewWriter — so callers that want to assert
+// on a specific column must look up its index dynamically.
+func parquetColumnIndex(t *testing.T, pf *parquet.File, name string) int {
+	t.Helper()
+	for i, col := range pf.Schema().Columns() {
+		if len(col) == 1 && col[0] == name {
+			return i
+		}
+	}
+	t.Fatalf("column %q not found in parquet schema", name)
+	return -1
 }
