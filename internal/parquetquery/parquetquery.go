@@ -448,9 +448,21 @@ func canTerminateEarly(results []query.ResultRow, remainingFiles []string, limit
 	if len(results) < limit || len(remainingFiles) == 0 {
 		return false
 	}
-	// Sort results to find the limit-th by (event_timestamp, event_id).
-	sorted := make([]query.ResultRow, len(results))
-	copy(sorted, results)
+	// Filter out drift rows with zero timestamp (dbtrail/bintrail#318).
+	// They sort to year 0001 and would otherwise pin cutoff to the past,
+	// making every remaining file's hour appear after it → early
+	// termination silently drops all later real data.
+	sorted := make([]query.ResultRow, 0, len(results))
+	for _, r := range results {
+		if !r.EventTimestamp.IsZero() {
+			sorted = append(sorted, r)
+		}
+	}
+	if len(sorted) < limit {
+		// After filtering, we don't have enough real-timestamp rows to
+		// ground a cutoff — keep reading.
+		return false
+	}
 	slices.SortFunc(sorted, func(a, b query.ResultRow) int {
 		if c := a.EventTimestamp.Compare(b.EventTimestamp); c != 0 {
 			return c
@@ -774,22 +786,27 @@ func parseFileHour(path string) (time.Time, bool) {
 func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 	var results []query.ResultRow
 	for rows.Next() {
+		// Every NOT NULL column is scanned defensively. The Parquet
+		// writer in internal/archive now correctly preserves NULL for
+		// every column its Scan saw as NULL, so the consumer side must
+		// handle the same set. See dbtrail/bintrail#318. event_id stays
+		// a bare int64 since AUTO_INCREMENT cannot be NULL.
 		var (
 			eventID        int64
 			binlogFile     sql.NullString
-			startPos       int64
-			endPos         int64
-			eventTimestamp time.Time
+			startPos       sql.NullInt64
+			endPos         sql.NullInt64
+			eventTimestamp sql.NullTime
 			gtid           sql.NullString
 			connID         sql.NullInt64
-			schemaName     string
-			tableName      string
-			eventType      int32
-			pkValues       string
+			schemaName     sql.NullString
+			tableName      sql.NullString
+			eventType      sql.NullInt32
+			pkValues       sql.NullString
 			changedCols    sql.NullString
 			rowBefore      sql.NullString
 			rowAfter       sql.NullString
-			schemaVersion  int32
+			schemaVersion  sql.NullInt32
 		)
 		if err := rows.Scan(
 			&eventID, &binlogFile, &startPos, &endPos, &eventTimestamp,
@@ -802,14 +819,14 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 		r := query.ResultRow{
 			EventID:        uint64(eventID),
 			BinlogFile:     binlogFile.String,
-			StartPos:       uint64(startPos),
-			EndPos:         uint64(endPos),
-			EventTimestamp: eventTimestamp,
-			SchemaName:     schemaName,
-			TableName:      tableName,
-			EventType:      parser.EventType(eventType),
-			PKValues:       pkValues,
-			SchemaVersion:  uint32(schemaVersion),
+			StartPos:       uint64(startPos.Int64),
+			EndPos:         uint64(endPos.Int64),
+			EventTimestamp: eventTimestamp.Time,
+			SchemaName:     schemaName.String,
+			TableName:      tableName.String,
+			EventType:      parser.EventType(eventType.Int32),
+			PKValues:       pkValues.String,
+			SchemaVersion:  uint32(schemaVersion.Int32),
 		}
 		if gtid.Valid {
 			r.GTID = &gtid.String
