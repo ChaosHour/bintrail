@@ -657,18 +657,18 @@ func TestAgentCLI_CanonicalizesServerUUID(t *testing.T) {
 }
 
 // TestAgentServerUUIDHelpWarnsAboutSilentIgnore guards the warning that
-// closes the SaaS-side silent-ignore window documented in #317. If the
-// dbtrail SaaS predates the matching reconciliation logic, sending a
-// --server-uuid does NOT prevent a duplicate byos-<server-id> record —
-// the help text must surface that explicitly so operators verify in the
-// dashboard rather than assuming success.
+// closes the SaaS-side silent-ignore window (originally #317, updated by
+// #336/#337 after nethalo/dbtrail#1490 hardened the SaaS to log unmatched
+// UUIDs and refuse to bind). The help text must surface that a mismatched
+// UUID is a visible server-side failure so operators verify in the
+// dashboard rather than assuming the bind succeeded.
 func TestAgentServerUUIDHelpWarnsAboutSilentIgnore(t *testing.T) {
 	flag := agentCmd.Flag("server-uuid")
 	if flag == nil {
 		t.Fatal("--server-uuid flag not registered")
 	}
 	usage := flag.Usage
-	for _, want := range []string{"silently ignored", "dbtrail dashboard"} {
+	for _, want := range []string{"logged server-side", "will NOT bind", "dashboard"} {
 		if !strings.Contains(usage, want) {
 			t.Errorf("--server-uuid help missing %q; full usage: %s", want, usage)
 		}
