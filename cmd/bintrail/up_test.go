@@ -2,12 +2,15 @@ package main
 
 import "testing"
 
-// TestPopulateStreamFlags asserts the full up* → strm* fan-out so that adding
-// a new flag to `up` without wiring it into `runStream` (or renaming a flag on
-// one side and not the other) fails CI instead of silently dropping the value.
-//
-// Save/restore via t.Cleanup keeps the test idempotent — other tests that read
-// strm* package globals see them unchanged.
+// This file mutates up*/strm* package globals via save-and-restore. DO NOT
+// add t.Parallel() to any test here or to sibling tests that read strm*
+// globals — concurrent runs would cross-write each other's state. The whole
+// package effectively serializes on these globals already (runStream/runUp
+// read them at start), so parallelism is not a real benefit anyway.
+
+// TestPopulateStreamFlags asserts the up* → strm* fan-out so a flag added to
+// up but not wired into runStream fails CI rather than silently dropping the
+// value.
 func TestPopulateStreamFlags(t *testing.T) {
 	// ── Save originals ─────────────────────────────────────────────────────
 	orig := struct {

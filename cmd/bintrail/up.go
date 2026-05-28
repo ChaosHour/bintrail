@@ -131,10 +131,8 @@ func runUpStream(cmd *cobra.Command, args []string) error {
 }
 
 // populateStreamFlags copies every up* package global into the corresponding
-// strm* global, plus the resolved server-id. Extracted from runUpStream so a
-// unit test can assert the full fan-out without launching the streamer — the
-// "added a new --foo flag to up and forgot to wire it into runStream" footgun
-// is exactly what this catches.
+// strm* global, plus the resolved server-id. Extracted from runUpStream so the
+// up→strm fan-out is unit-testable.
 func populateStreamFlags(serverID uint32) {
 	strmIndexDSN = upIndexDSN
 	strmSourceDSN = upSourceDSN

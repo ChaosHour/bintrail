@@ -93,6 +93,21 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	return runDoctorTo(cmd.Context(), os.Stdout, docFormat, docSourceDSN, docIndexDSN, docSchemas)
 }
 
+// binlogRetentionMinSeconds is the minimum binlog retention bintrail asks for
+// (docs/streaming.md:279). Hoisted so the check function and any test referring
+// to the threshold share a single source of truth.
+const binlogRetentionMinSeconds = 172800
+
+// queryErrorRemediation returns the generic remediation block for "the SELECT
+// itself failed" FAIL paths. Connection drops outnumber permission gaps in
+// practice, so retry is bullet 1 and grants are bullet 2.
+func queryErrorRemediation(query string) string {
+	return "The check could not query " + query + ". Common causes (most likely first):\n" +
+		"  - Connection dropped or timed out: retry once before investigating further\n" +
+		"  - User lacks required SELECT privilege on the relevant system table or variable\n" +
+		"  - Server overloaded — raise the per-check timeout or check server load"
+}
+
 // runDoctorTo is the testable core of the doctor command. It runs every check
 // against sourceDSN (and optionally indexDSN), renders the report to w using
 // format ("text" or "json"), and returns a non-nil error iff any required
@@ -190,9 +205,10 @@ func checkLogBin(db *sql.DB) checkResult {
 	err := db.QueryRow("SELECT @@log_bin").Scan(&val)
 	if err != nil {
 		return checkResult{
-			Name:   "log_bin enabled",
-			Status: statusFail,
-			Detail: err.Error(),
+			Name:        "log_bin enabled",
+			Status:      statusFail,
+			Detail:      err.Error(),
+			Remediation: queryErrorRemediation("@@log_bin"),
 		}
 	}
 	if val != "1" && !strings.EqualFold(val, "ON") {
@@ -298,13 +314,13 @@ func checkBinlogRetention(db *sql.DB) checkResult {
 			Detail: "binlog_expire_logs_seconds=0 (no automatic expiration)",
 		}
 	}
-	if seconds < 172800 {
+	if seconds < binlogRetentionMinSeconds {
 		return checkResult{
 			Name:   "Binlog retention >= 2 days",
 			Status: statusWarn,
 			Detail: fmt.Sprintf("binlog_expire_logs_seconds=%d (%dh)", seconds, seconds/3600),
-			Remediation: "Set retention to at least 2 days (172800s) so bintrail can fill gaps after a restart:\n\n" +
-				"  SET PERSIST binlog_expire_logs_seconds = 172800;",
+			Remediation: fmt.Sprintf("Set retention to at least 2 days (%ds) so bintrail can fill gaps after a restart:\n\n"+
+				"  SET PERSIST binlog_expire_logs_seconds = %d;", binlogRetentionMinSeconds, binlogRetentionMinSeconds),
 		}
 	}
 	return checkResult{
@@ -318,9 +334,10 @@ func checkReplicationGrants(ctx context.Context, db *sql.DB) checkResult {
 	rows, err := db.QueryContext(ctx, "SHOW GRANTS")
 	if err != nil {
 		return checkResult{
-			Name:   "REPLICATION SLAVE + CLIENT grants",
-			Status: statusFail,
-			Detail: err.Error(),
+			Name:        "REPLICATION SLAVE + CLIENT grants",
+			Status:      statusFail,
+			Detail:      err.Error(),
+			Remediation: queryErrorRemediation("SHOW GRANTS"),
 		}
 	}
 	defer rows.Close()
@@ -330,9 +347,10 @@ func checkReplicationGrants(ctx context.Context, db *sql.DB) checkResult {
 		var g string
 		if err := rows.Scan(&g); err != nil {
 			return checkResult{
-				Name:   "REPLICATION SLAVE + CLIENT grants",
-				Status: statusFail,
-				Detail: err.Error(),
+				Name:        "REPLICATION SLAVE + CLIENT grants",
+				Status:      statusFail,
+				Detail:      err.Error(),
+				Remediation: queryErrorRemediation("SHOW GRANTS"),
 			}
 		}
 		grants = append(grants, g)
@@ -460,9 +478,10 @@ func checkSchemaVisibility(ctx context.Context, db *sql.DB, schemas []string) ch
 	var tableCount, schemaCount int
 	if err := db.QueryRowContext(ctx, query, args...).Scan(&tableCount, &schemaCount); err != nil {
 		return checkResult{
-			Name:   "Schema visibility",
-			Status: statusFail,
-			Detail: err.Error(),
+			Name:        "Schema visibility",
+			Status:      statusFail,
+			Detail:      err.Error(),
+			Remediation: queryErrorRemediation("information_schema.TABLES"),
 		}
 	}
 
@@ -504,9 +523,10 @@ func checkIndexConnection(ctx context.Context, dsn, dbName string) checkResult {
 	var version string
 	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err != nil {
 		return checkResult{
-			Name:   "Index MySQL connection",
-			Status: statusFail,
-			Detail: err.Error(),
+			Name:        "Index MySQL connection",
+			Status:      statusFail,
+			Detail:      err.Error(),
+			Remediation: queryErrorRemediation("VERSION()"),
 		}
 	}
 	return checkResult{
@@ -526,6 +546,9 @@ func checkIndexWriteAccess(ctx context.Context, dsn, dbName string) checkResult 
 			Name:   "Index write access",
 			Status: statusFail,
 			Detail: err.Error(),
+			Remediation: "Could not connect to --index-dsn. Verify the host/port/user are correct " +
+				"and that the user has connect privileges. The database itself does not need to " +
+				"exist yet — `bintrail init` (or `bintrail up`) will create it given CREATE DATABASE.",
 		}
 	}
 	defer db.Close()
@@ -533,7 +556,7 @@ func checkIndexWriteAccess(ctx context.Context, dsn, dbName string) checkResult 
 }
 
 // checkIndexWriteAccessOn runs the actual SCHEMATA/CREATE/DROP probe sequence
-// against an already-open *sql.DB. Split out for sqlmock testing.
+// against an already-open *sql.DB.
 func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) checkResult {
 	// First ensure the database exists. If it doesn't, we need CREATE DATABASE privilege.
 	var dbExists string
@@ -559,9 +582,7 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) che
 			Name:   "Index write access",
 			Status: statusFail,
 			Detail: dbErr.Error(),
-			Remediation: "Could not query information_schema.SCHEMATA. Common causes:\n" +
-				"  - User lacks SELECT on information_schema (rare; granted by default)\n" +
-				"  - Connection dropped: retry after verifying network and server health",
+			Remediation: queryErrorRemediation("information_schema.SCHEMATA"),
 		}
 	}
 
