@@ -3,9 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/DATA-DOG/go-sqlmock"
 )
 
 func TestExtractGrantUser(t *testing.T) {
@@ -28,6 +31,21 @@ func TestExtractGrantUser(t *testing.T) {
 			name:  "trailing IDENTIFIED BY clause (older MySQL)",
 			grant: "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'10.0.0.5' IDENTIFIED BY '<secret>'",
 			want:  "'repl'@'10.0.0.5'",
+		},
+		{
+			name:  "WITH GRANT OPTION suffix",
+			grant: "GRANT ALL PRIVILEGES ON *.* TO 'admin'@'%' WITH GRANT OPTION",
+			want:  "'admin'@'%'",
+		},
+		{
+			name:  "lowercase TO is uppercased by ToUpper search",
+			grant: "grant select on db.* to 'app'@'localhost'",
+			want:  "'app'@'localhost'",
+		},
+		{
+			name:  "backtick-quoted identifier",
+			grant: "GRANT USAGE ON *.* TO `bintrail`@`%`",
+			want:  "`bintrail`@`%`",
 		},
 		{
 			name:  "no TO clause",
@@ -173,6 +191,242 @@ func TestDoctorReportWriteJSON(t *testing.T) {
 	}
 	if out.Checks[1].Remediation != "GRANT X ON *.* ..." {
 		t.Errorf("remediation lost: %q", out.Checks[1].Remediation)
+	}
+}
+
+func TestCheckLogBin(t *testing.T) {
+	// The check has unique string-comparison logic (not delegating to an
+	// existing validator) so it is the highest-value sqlmock target — a
+	// regression here would silently PASS on a server with binary logging off.
+	tests := []struct {
+		name       string
+		returnVal  string
+		queryErr   error
+		wantStatus checkStatus
+		wantDetail string
+	}{
+		{name: "ON via 1", returnVal: "1", wantStatus: statusPass, wantDetail: "ON"},
+		{name: "ON via literal", returnVal: "ON", wantStatus: statusPass, wantDetail: "ON"},
+		{name: "ON case-insensitive", returnVal: "on", wantStatus: statusPass, wantDetail: "ON"},
+		{name: "OFF literal", returnVal: "OFF", wantStatus: statusFail, wantDetail: `log_bin="OFF"`},
+		{name: "OFF via 0", returnVal: "0", wantStatus: statusFail, wantDetail: `log_bin="0"`},
+		{name: "empty string", returnVal: "", wantStatus: statusFail, wantDetail: `log_bin=""`},
+		{name: "query error", queryErr: errors.New("denied"), wantStatus: statusFail, wantDetail: "denied"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+
+			exp := mock.ExpectQuery("SELECT @@log_bin")
+			if tt.queryErr != nil {
+				exp.WillReturnError(tt.queryErr)
+			} else {
+				exp.WillReturnRows(sqlmock.NewRows([]string{"@@log_bin"}).AddRow(tt.returnVal))
+			}
+
+			got := checkLogBin(db)
+			if got.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q", got.Status, tt.wantStatus)
+			}
+			if !strings.Contains(got.Detail, tt.wantDetail) {
+				t.Errorf("Detail = %q, want substring %q", got.Detail, tt.wantDetail)
+			}
+			// FAIL outcomes must carry remediation so the user has a path forward;
+			// exception: query errors (detail itself is the remediation hint).
+			if tt.wantStatus == statusFail && tt.queryErr == nil && got.Remediation == "" {
+				t.Error("FAIL outcome with no remediation breaks doctor's promise")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
+func TestCheckBinlogRetention(t *testing.T) {
+	// Three logical branches plus error paths:
+	//   1. MySQL 8.0+ via @@binlog_expire_logs_seconds (>= threshold, below, zero, unparseable)
+	//   2. Legacy MySQL 5.7 fallback via @@expire_logs_days
+	//   3. Both queries error (warn-only, doctor proceeds)
+	tests := []struct {
+		name              string
+		modern            sql8Response // first query — @@binlog_expire_logs_seconds
+		legacy            sql8Response // second query — @@expire_logs_days (only invoked when modern errors)
+		wantStatus        checkStatus
+		wantDetailFrag    string // substring assertion on detail
+		wantRemediation   bool   // must remediation be present?
+	}{
+		// 1. MySQL 8.0+ branches.
+		{name: "modern: at threshold", modern: row("172800"), wantStatus: statusPass, wantDetailFrag: "48h"},
+		{name: "modern: above threshold", modern: row("259200"), wantStatus: statusPass, wantDetailFrag: "72h"},
+		{name: "modern: below threshold", modern: row("3600"), wantStatus: statusWarn, wantDetailFrag: "1h", wantRemediation: true},
+		{name: "modern: zero (never expire)", modern: row("0"), wantStatus: statusWarn, wantDetailFrag: "no automatic expiration"},
+		{name: "modern: unparseable", modern: row("not-an-int"), wantStatus: statusWarn, wantDetailFrag: "could not parse"},
+		// 2. Legacy fallback when modern errors.
+		{name: "legacy: 7 days", modern: errResp("unknown variable"), legacy: row("7"), wantStatus: statusPass, wantDetailFrag: "7 days"},
+		{name: "legacy: 1 day", modern: errResp("unknown variable"), legacy: row("1"), wantStatus: statusWarn, wantDetailFrag: "expire_logs_days=1", wantRemediation: true},
+		{name: "legacy: unparseable", modern: errResp("unknown variable"), legacy: row("garbage"), wantStatus: statusWarn, wantDetailFrag: "could not parse"},
+		// 3. Both error → warn-only (no remediation; doctor proceeds with degraded info).
+		{name: "both error", modern: errResp("conn lost"), legacy: errResp("conn lost"), wantStatus: statusWarn, wantDetailFrag: "could not read"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+
+			expect := mock.ExpectQuery("SELECT @@binlog_expire_logs_seconds")
+			tt.modern.apply(expect, "@@binlog_expire_logs_seconds")
+			if tt.modern.err != nil {
+				lexpect := mock.ExpectQuery("SELECT @@expire_logs_days")
+				tt.legacy.apply(lexpect, "@@expire_logs_days")
+			}
+
+			got := checkBinlogRetention(db)
+			if got.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q (detail=%q)", got.Status, tt.wantStatus, got.Detail)
+			}
+			if !strings.Contains(got.Detail, tt.wantDetailFrag) {
+				t.Errorf("Detail = %q, want substring %q", got.Detail, tt.wantDetailFrag)
+			}
+			if tt.wantRemediation && got.Remediation == "" {
+				t.Error("expected remediation but got none")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet expectations: %v", err)
+			}
+		})
+	}
+}
+
+// sql8Response is a tiny helper to make the binlog-retention table-driven test
+// readable: each row says "for this query, return either a value or an error."
+type sql8Response struct {
+	value string
+	err   error
+}
+
+func row(v string) sql8Response       { return sql8Response{value: v} }
+func errResp(msg string) sql8Response { return sql8Response{err: errors.New(msg)} }
+
+func (r sql8Response) apply(exp *sqlmock.ExpectedQuery, col string) {
+	if r.err != nil {
+		exp.WillReturnError(r.err)
+		return
+	}
+	exp.WillReturnRows(sqlmock.NewRows([]string{col}).AddRow(r.value))
+}
+
+func TestCheckIndexWriteAccessOn(t *testing.T) {
+	const dbName = "binlog_index"
+
+	// Each subtest sets up the sqlmock expectation chain that mirrors the
+	// branch under test. The probe table name is fixed in checkIndexWriteAccessOn
+	// as `binlog_index`.`_bintrail_doctor_probe`.
+	tests := []struct {
+		name           string
+		setup          func(mock sqlmock.Sqlmock)
+		wantStatus     checkStatus
+		wantDetailFrag string
+	}{
+		{
+			name: "db exists, create+drop OK",
+			setup: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA").
+					WillReturnRows(sqlmock.NewRows([]string{"SCHEMA_NAME"}).AddRow(dbName))
+				m.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+				m.ExpectExec("DROP TABLE").WillReturnResult(sqlmock.NewResult(0, 0))
+			},
+			wantStatus:     statusPass,
+			wantDetailFrag: "CREATE/DROP TABLE OK",
+		},
+		{
+			name: "db missing, create database succeeds, then create+drop OK",
+			setup: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA").
+					WillReturnRows(sqlmock.NewRows([]string{"SCHEMA_NAME"}))
+				m.ExpectExec("CREATE DATABASE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+				m.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+				m.ExpectExec("DROP TABLE").WillReturnResult(sqlmock.NewResult(0, 0))
+			},
+			wantStatus:     statusPass,
+			wantDetailFrag: "CREATE/DROP TABLE OK",
+		},
+		{
+			name: "db missing, create database denied",
+			setup: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA").
+					WillReturnRows(sqlmock.NewRows([]string{"SCHEMA_NAME"}))
+				m.ExpectExec("CREATE DATABASE IF NOT EXISTS").
+					WillReturnError(errors.New("Access denied for user"))
+			},
+			wantStatus:     statusFail,
+			wantDetailFrag: "cannot CREATE DATABASE",
+		},
+		{
+			name: "db exists, create table denied",
+			setup: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA").
+					WillReturnRows(sqlmock.NewRows([]string{"SCHEMA_NAME"}).AddRow(dbName))
+				m.ExpectExec("CREATE TABLE IF NOT EXISTS").
+					WillReturnError(errors.New("CREATE command denied"))
+			},
+			wantStatus:     statusFail,
+			wantDetailFrag: "cannot CREATE TABLE",
+		},
+		{
+			name: "create OK but drop denied — must FAIL (catches partition-rotate bites at runtime)",
+			setup: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA").
+					WillReturnRows(sqlmock.NewRows([]string{"SCHEMA_NAME"}).AddRow(dbName))
+				m.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+				m.ExpectExec("DROP TABLE").WillReturnError(errors.New("DROP command denied"))
+			},
+			wantStatus:     statusFail,
+			wantDetailFrag: "user has CREATE but not DROP",
+		},
+		{
+			name: "schemata query errors",
+			setup: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA").
+					WillReturnError(errors.New("conn lost"))
+			},
+			wantStatus:     statusFail,
+			wantDetailFrag: "conn lost",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+
+			tt.setup(mock)
+
+			got := checkIndexWriteAccessOn(t.Context(), db, dbName)
+			if got.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q (detail=%q)", got.Status, tt.wantStatus, got.Detail)
+			}
+			if !strings.Contains(got.Detail, tt.wantDetailFrag) {
+				t.Errorf("Detail = %q, want substring %q", got.Detail, tt.wantDetailFrag)
+			}
+			// All FAIL outcomes from this check must carry remediation — the user
+			// needs a concrete next action (GRANT statement, manual CREATE DATABASE, etc.).
+			if tt.wantStatus == statusFail && got.Remediation == "" {
+				t.Error("FAIL outcome with no remediation breaks doctor's promise")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet expectations: %v", err)
+			}
+		})
 	}
 }
 

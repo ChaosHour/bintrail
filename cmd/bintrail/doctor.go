@@ -517,8 +517,8 @@ func checkIndexConnection(ctx context.Context, dsn, dbName string) checkResult {
 }
 
 // checkIndexWriteAccess verifies the user can CREATE TABLE in the target index
-// database. We create a temporary table and drop it; if either fails the index
-// command will fail too.
+// database. Opens its own connection; delegates to checkIndexWriteAccessOn for
+// the actual probing so the IO and the logic can be tested independently.
 func checkIndexWriteAccess(ctx context.Context, dsn, dbName string) checkResult {
 	db, err := config.Connect(dsn)
 	if err != nil {
@@ -529,7 +529,12 @@ func checkIndexWriteAccess(ctx context.Context, dsn, dbName string) checkResult 
 		}
 	}
 	defer db.Close()
+	return checkIndexWriteAccessOn(ctx, db, dbName)
+}
 
+// checkIndexWriteAccessOn runs the actual SCHEMATA/CREATE/DROP probe sequence
+// against an already-open *sql.DB. Split out for sqlmock testing.
+func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) checkResult {
 	// First ensure the database exists. If it doesn't, we need CREATE DATABASE privilege.
 	var dbExists string
 	dbErr := db.QueryRowContext(ctx,
@@ -554,6 +559,9 @@ func checkIndexWriteAccess(ctx context.Context, dsn, dbName string) checkResult 
 			Name:   "Index write access",
 			Status: statusFail,
 			Detail: dbErr.Error(),
+			Remediation: "Could not query information_schema.SCHEMATA. Common causes:\n" +
+				"  - User lacks SELECT on information_schema (rare; granted by default)\n" +
+				"  - Connection dropped: retry after verifying network and server health",
 		}
 	}
 

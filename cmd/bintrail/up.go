@@ -113,24 +113,32 @@ func runUpInit(cmd *cobra.Command) error {
 	return runInit(subCmd, nil)
 }
 
-// runUpStream delegates to runStream by populating its flag vars from up's.
-// The snapshot step is handled inside runStream via auto-snapshot when no
-// snapshot exists and --source-dsn is set.
+// runUpStream delegates to runStream after copying every up* flag value into
+// the corresponding strm* package global. The snapshot step is handled inside
+// runStream via auto-snapshot when no snapshot exists and --source-dsn is set.
 func runUpStream(cmd *cobra.Command, args []string) error {
-	strmIndexDSN = upIndexDSN
-	strmSourceDSN = upSourceDSN
-
-	if upServerID == 0 {
+	serverID := upServerID
+	if serverID == 0 {
 		id, err := deriveServerID(upSourceDSN)
 		if err != nil {
 			return fmt.Errorf("cannot auto-derive --server-id from --source-dsn: %w (pass --server-id explicitly to bypass)", err)
 		}
-		strmServerID = id
-		fmt.Fprintf(os.Stderr, "Auto-derived server-id from source DSN: %d\n", strmServerID)
-	} else {
-		strmServerID = upServerID
+		serverID = id
+		fmt.Fprintf(os.Stderr, "Auto-derived server-id from source DSN: %d\n", serverID)
 	}
+	populateStreamFlags(serverID)
+	return runStream(cmd, args)
+}
 
+// populateStreamFlags copies every up* package global into the corresponding
+// strm* global, plus the resolved server-id. Extracted from runUpStream so a
+// unit test can assert the full fan-out without launching the streamer — the
+// "added a new --foo flag to up and forgot to wire it into runStream" footgun
+// is exactly what this catches.
+func populateStreamFlags(serverID uint32) {
+	strmIndexDSN = upIndexDSN
+	strmSourceDSN = upSourceDSN
+	strmServerID = serverID
 	strmStartFile = ""
 	strmStartPos = 4
 	strmStartGTID = ""
@@ -147,8 +155,6 @@ func runUpStream(cmd *cobra.Command, args []string) error {
 	strmReset = false
 	strmNoGapFill = false
 	strmGapTimeout = 30
-
-	return runStream(cmd, args)
 }
 
 // deriveServerID returns a deterministic uint32 server-id by hashing the
