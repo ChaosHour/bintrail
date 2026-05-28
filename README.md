@@ -1,12 +1,14 @@
 # Bintrail
 
-A CLI tool that parses MySQL ROW-format binary logs, indexes every row event into MySQL with full before/after images, and generates reversal SQL for point-in-time recovery — without needing the original binlog files.
+**Point-in-time recovery for MySQL, without locking tables or changing your schema.** Bintrail tails the binary log, keeps every row change with full before/after images in a searchable index, and generates exact reversal SQL when something goes wrong.
+
+> `SELECT * FROM orders WHERE id = 123 AS OF '2026-05-20 14:00:00'` against production MySQL — that's the experience bintrail makes possible.
 
 ## Requirements
 
-- Go 1.24+
-- MySQL 8.0+ (index database)
-- Source MySQL server with `binlog_format = ROW` and `binlog_row_image = FULL`
+- Go 1.24+ (only when building from source)
+- MySQL 8.0+ for the index database
+- Source MySQL with `binlog_format = ROW` and `binlog_row_image = FULL` — `bintrail doctor` will tell you exactly what to fix if your source isn't ready
 
 ## Install
 
@@ -22,30 +24,31 @@ cd bintrail
 go build ./cmd/bintrail
 ```
 
-## Quick start
+## Quick start (2 commands)
 
 ```sh
-# 1. Create index tables (run once)
-bintrail init --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"
-
-# 2. Snapshot schema metadata from the source server
-bintrail snapshot \
+# 1. Verify prerequisites and get copy-pasteable remediation for anything missing
+bintrail doctor \
   --source-dsn "user:pass@tcp(source:3306)/" \
   --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index"
 
-# 3. Index binlog files (requires access to /var/lib/mysql on the source host)
-bintrail index \
-  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
+# 2. Initialize and start streaming (idempotent — safe to re-run)
+bintrail up \
   --source-dsn "user:pass@tcp(source:3306)/" \
-  --binlog-dir /var/lib/mysql \
-  --all
+  --index-dsn  "user:pass@tcp(127.0.0.1:3306)/binlog_index"
+```
 
-# 4. Query the index
+`bintrail up` runs preflight + creates index tables + auto-snapshots + starts streaming, all in one. It resumes from the last checkpoint on restart and auto-derives a unique `server-id` from your source DSN so you don't have to think about replica collisions.
+
+Once it's running, query and recover:
+
+```sh
+# Search the index
 bintrail query \
   --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
   --schema mydb --table orders --pk 12345
 
-# 5. Generate recovery SQL
+# Generate reversal SQL
 bintrail recover \
   --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index" \
   --schema mydb --table orders --event-type DELETE \
@@ -53,14 +56,39 @@ bintrail recover \
   --output recovery.sql
 ```
 
-> **Managed MySQL (RDS, Aurora, Cloud SQL)?** Use `bintrail stream` instead of `bintrail index` — it connects over the replication protocol and requires no access to binlog files on disk. See [Streaming](docs/streaming.md).
+> **Managed MySQL (RDS, Aurora, Cloud SQL)?** `bintrail up` connects over the replication protocol — no disk access to binlogs required. See [Streaming](docs/streaming.md).
+
+> **Want manual control of each step?** See [Step-by-step setup](#step-by-step-setup) below for the underlying `init` / `snapshot` / `stream` commands.
 
 > **New to bintrail?** See the [Practical Guide for DBAs](docs/guide.md) for scenario-based walkthroughs and troubleshooting.
+
+### Step-by-step setup
+
+If you prefer running each phase explicitly (e.g. to deploy init and stream on separate hosts), the underlying commands remain available:
+
+```sh
+# 1. Verify prereqs (same as `bintrail up` Phase 1)
+bintrail doctor --source-dsn "$SRC" --index-dsn "$IDX"
+
+# 2. Create index tables
+bintrail init --index-dsn "$IDX"
+
+# 3. Snapshot schema metadata
+bintrail snapshot --source-dsn "$SRC" --index-dsn "$IDX"
+
+# 4. Either: stream live (recommended)
+bintrail stream --source-dsn "$SRC" --index-dsn "$IDX" --server-id 12345
+
+# Or: index from binlog files on disk
+bintrail index --binlog-dir /var/lib/mysql --source-dsn "$SRC" --index-dsn "$IDX" --all
+```
 
 ## Commands
 
 | Command | Description |
 |---|---|
+| `doctor` | Diagnose source MySQL prerequisites and emit copy-pasteable remediation |
+| `up` | One command: preflight + init + stream (the friction-free quickstart) |
 | `init` | Create index tables in the target MySQL database |
 | `snapshot` | Capture table and column metadata from the source server |
 | `index` | Parse binlog files from disk and write row events to the index |
