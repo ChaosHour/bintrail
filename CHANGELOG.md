@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.13] - 2026-06-01
+
+### Added
+- **Full-table `_snapshot` time-travel queries now reconstruct the complete table at AS OF** (#362). A no-WHERE `SELECT * FROM _snapshot.<table> AS OF '<ts>'` through `bintrail shim` previously returned only rows with binlog activity in the retained window, silently omitting rows that existed at that instant but were never touched. It now merges the `bintrail baseline` snapshot at-or-before AS OF with the post-snapshot binlog deltas across the whole table — never-touched baseline rows pass through, rows updated/inserted after the baseline take their latest image, and rows deleted after it drop out — reusing the same merge engine as the offline `bintrail reconstruct`. When a baseline merge isn't possible (no baseline source configured, an unsupported or unresolvable primary key, or no baseline at-or-before AS OF) it degrades to the binlog-only `_flashback` behaviour instead of failing, emitting a `Warn` so the degradation is visible. Buffered output stays bounded by the existing full-table row cap (`ER_TOO_BIG_SELECT`).
+
+### Fixed
+- **Temporal primary-key baseline lookups no longer silently miss on non-UTC hosts** (#359). Single-row `_snapshot` queries and `bintrail reconstruct --pk` bind the PK value as a string against the typed baseline Parquet column; for `DATETIME`/`TIMESTAMP` PKs (stored UTC-anchored, read back by DuckDB as `TIMESTAMP WITH TIME ZONE`) the string→timestamp cast used the host OS timezone, so on a non-UTC host the row silently failed to match and the lookup fell back to binlog-only. The DuckDB session is now pinned to UTC, making the match deterministic on any host, and `DATETIME`/`TIMESTAMP`/`DATE` PKs are now admitted by the single-row baseline lookup. Also corrects `docs/time-travel-sql.md`, which overclaimed that the no-WHERE form returns "every row that existed at that instant" for both virtual schemas (#356).
+
 ## [0.7.12] - 2026-05-29
 
 ### Added
