@@ -273,32 +273,72 @@ func TestValidateNoFKCascades_otherSchemaIgnored(t *testing.T) {
 	}
 }
 
-// A bt_-prefixed schema is one of bintrail's own internal schemas (the SaaS
-// bt_<prefix> convention; testutil names every test DB bt_<TestName>). When no
-// --schemas filter is given, FK cascades inside such a schema must be ignored —
-// otherwise a second bintrail agent sharing the source MySQL fatal-fails on the
-// first agent's internal cascade (#347). This also exercises the
-// LEFT(CONSTRAINT_SCHEMA, 3) <> 'bt_' prefix match against real MySQL.
-func TestValidateNoFKCascades_internalSchemaIgnoredWhenUnscoped(t *testing.T) {
-	db, dbName := testutil.CreateTestDB(t)
+// The unscoped pre-flight skips a bintrail index schema regardless of its name:
+// it is recognised by its signature tables (binlog_events, schema_snapshots,
+// stream_state), not by a name pattern. Here the index DB has a non-bintrail
+// name (`audit_index`) yet carries the access_rules→profiles cascade — the scan
+// must skip it (the #347 fix, now name-independent, closing the custom-name
+// under-exclusion hole, #365). When the operator names it explicitly, it is
+// still policed.
+func TestValidateNoFKCascades_customNamedIndexSkippedWhenUnscoped(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
 
-	testutil.MustExec(t, db, `CREATE TABLE profiles (id INT PRIMARY KEY)`)
-	testutil.MustExec(t, db, `CREATE TABLE access_rules (
-		id         INT PRIMARY KEY,
-		profile_id INT NOT NULL,
-		CONSTRAINT fk_access_rules_profile FOREIGN KEY (profile_id) REFERENCES profiles(id) ON DELETE CASCADE
-	)`)
+	const idxSchema = "audit_index" // not bt_-prefixed, not the default index name
+	testutil.MustExec(t, db, "DROP DATABASE IF EXISTS `"+idxSchema+"`")
+	testutil.MustExec(t, db, "CREATE DATABASE `"+idxSchema+"`")
+	t.Cleanup(func() { _, _ = db.Exec("DROP DATABASE IF EXISTS `" + idxSchema + "`") })
 
-	// Unscoped: the cascade lives in a bt_-prefixed (bintrail-internal) schema,
-	// so the pre-flight must skip it and pass.
-	if err := validateNoFKCascades(db, nil); err != nil {
-		t.Fatalf("expected nil for FK cascade in bintrail-internal schema %q when unscoped, got: %v", dbName, err)
+	// The signature tables that mark the schema as a bintrail index. binlog_events
+	// is RANGE-partitioned in production, so partition it here too — this confirms
+	// the subquery's TABLE_TYPE = 'BASE TABLE' filter matches a partitioned table.
+	testutil.MustExec(t, db, "CREATE TABLE `"+idxSchema+"`.binlog_events ("+
+		"id INT, event_timestamp DATETIME NOT NULL, PRIMARY KEY (id, event_timestamp)) "+
+		"PARTITION BY RANGE (TO_SECONDS(event_timestamp)) (PARTITION p_future VALUES LESS THAN MAXVALUE)")
+	testutil.MustExec(t, db, "CREATE TABLE `"+idxSchema+"`.schema_snapshots (id INT PRIMARY KEY)")
+	testutil.MustExec(t, db, "CREATE TABLE `"+idxSchema+"`.stream_state (id INT PRIMARY KEY)")
+	// ...plus the access_rules→profiles ON DELETE CASCADE the pre-flight trips on.
+	testutil.MustExec(t, db, "CREATE TABLE `"+idxSchema+"`.profiles (id INT PRIMARY KEY)")
+	testutil.MustExec(t, db, "CREATE TABLE `"+idxSchema+"`.access_rules ("+
+		"id INT PRIMARY KEY, profile_id INT NOT NULL, "+
+		"CONSTRAINT fk_access_rules_profile FOREIGN KEY (profile_id) REFERENCES `"+idxSchema+"`.profiles(id) ON DELETE CASCADE)")
+
+	// Unscoped: skipped because it is structurally a bintrail index, despite the
+	// non-bintrail name. Assert audit_index specifically is absent from the scan
+	// rather than that the whole server-wide scan is clean — that keeps the test
+	// robust to unrelated cascades that may exist on a shared/dev MySQL server.
+	if schemas := unscopedFKCascadeSchemas(t, db); schemas[idxSchema] {
+		t.Fatalf("expected structurally-internal schema %q to be excluded from the unscoped scan, but it was flagged", idxSchema)
 	}
 
-	// But when the operator explicitly names that schema, we still police it.
-	if err := validateNoFKCascades(db, []string{dbName}); err == nil {
-		t.Fatalf("expected error when %q is explicitly targeted despite being bt_-prefixed", dbName)
+	// Explicitly named: still policed.
+	if err := validateNoFKCascades(db, []string{idxSchema}); err == nil {
+		t.Fatalf("expected error when %q is explicitly targeted", idxSchema)
 	}
+}
+
+// unscopedFKCascadeSchemas runs the unscoped FK-cascade query and returns the
+// set of schemas it flags. Lets a test assert that a specific schema is (or is
+// not) excluded without depending on the rest of the server being cascade-free.
+func unscopedFKCascadeSchemas(t *testing.T, db *sql.DB) map[string]bool {
+	t.Helper()
+	q, args := buildFKCascadeQuery(nil)
+	rows, err := db.Query(q, args...)
+	if err != nil {
+		t.Fatalf("unscoped FK-cascade query: %v", err)
+	}
+	defer rows.Close()
+	got := map[string]bool{}
+	for rows.Next() {
+		var schema, name, del, upd string
+		if err := rows.Scan(&schema, &name, &del, &upd); err != nil {
+			t.Fatalf("scan FK-cascade row: %v", err)
+		}
+		got[schema] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate FK-cascade rows: %v", err)
+	}
+	return got
 }
 
 // The inverse of the exclusion, and the load-bearing direction: an unscoped
@@ -321,6 +361,34 @@ func TestValidateNoFKCascades_userSchemaCaughtWhenUnscoped(t *testing.T) {
 
 	if err := validateNoFKCascades(db, nil); err == nil {
 		t.Fatalf("expected unscoped scan to catch the CASCADE FK in non-internal schema %q, got nil", userSchema)
+	}
+}
+
+// A schema with only SOME of the signature tables (here 2 of 3) is NOT a
+// bintrail index — its real CASCADE must still be CAUGHT when unscoped. This
+// pins the exactness of HAVING COUNT(DISTINCT TABLE_NAME) = 3: a regression to
+// >= 1 (or a shorter IN-list) would silently skip this real user cascade,
+// reopening the #347-class silent-skip bug. (The existing "caught" test above
+// uses zero signature tables, so it would not detect such a loosening.)
+func TestValidateNoFKCascades_partialSignatureCaughtWhenUnscoped(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+
+	const userSchema = "fkcascade_partial"
+	testutil.MustExec(t, db, "DROP DATABASE IF EXISTS `"+userSchema+"`")
+	testutil.MustExec(t, db, "CREATE DATABASE `"+userSchema+"`")
+	t.Cleanup(func() { _, _ = db.Exec("DROP DATABASE IF EXISTS `" + userSchema + "`") })
+
+	// Two of the three signature names, but not all three.
+	testutil.MustExec(t, db, "CREATE TABLE `"+userSchema+"`.binlog_events (id INT PRIMARY KEY)")
+	testutil.MustExec(t, db, "CREATE TABLE `"+userSchema+"`.stream_state (id INT PRIMARY KEY)")
+	// ...plus a genuine cascade that must be caught.
+	testutil.MustExec(t, db, "CREATE TABLE `"+userSchema+"`.parents (id INT PRIMARY KEY)")
+	testutil.MustExec(t, db, "CREATE TABLE `"+userSchema+"`.children ("+
+		"id INT PRIMARY KEY, parent_id INT NOT NULL, "+
+		"CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES `"+userSchema+"`.parents(id) ON DELETE CASCADE)")
+
+	if !unscopedFKCascadeSchemas(t, db)[userSchema] {
+		t.Fatalf("expected partial-signature schema %q (2 of 3 signature tables) to be flagged by the unscoped scan, but it was not", userSchema)
 	}
 }
 
