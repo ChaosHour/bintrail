@@ -361,3 +361,46 @@ func TestNullOrStringVal_nonEmpty(t *testing.T) {
 		t.Errorf("expected 'uuid:42', got %v", got)
 	}
 }
+
+// ─── buildFKCascadeQuery ─────────────────────────────────────────────────────
+
+// When schemas are named explicitly, the scan is scoped to exactly those
+// schemas via a parameterized IN list — and the bintrail-internal exclusions
+// are NOT added (an explicitly named internal schema is still policed).
+func TestBuildFKCascadeQuery_withSchemas(t *testing.T) {
+	query, args := buildFKCascadeQuery([]string{"iotcore", "billing"})
+
+	if !strings.Contains(query, "CONSTRAINT_SCHEMA IN (?,?)") {
+		t.Errorf("expected parameterized IN list, got query:\n%s", query)
+	}
+	if strings.Contains(query, "NOT IN") || strings.Contains(query, "LEFT(") {
+		t.Errorf("explicit --schemas must not add internal-schema exclusions, got query:\n%s", query)
+	}
+	if len(args) != 2 || args[0] != "iotcore" || args[1] != "billing" {
+		t.Errorf("expected args [iotcore billing], got %v", args)
+	}
+}
+
+// With no schemas filter the scan excludes MySQL system schemas AND bintrail's
+// own internal schemas (the binlog_index/bintrail_index index DB + the
+// bt_<prefix> convention), so an agent sharing the source MySQL does not
+// fatal-fail on bintrail's internal FK cascades (#347). binlog_index and
+// bintrail_index are both used as the index DB name across docs/deploy tooling,
+// so both must be in the list.
+func TestBuildFKCascadeQuery_noSchemasExcludesInternal(t *testing.T) {
+	query, args := buildFKCascadeQuery(nil)
+
+	if len(args) != 0 {
+		t.Errorf("expected no args for unscoped query, got %v", args)
+	}
+	for _, want := range []string{"'mysql'", "'information_schema'", "'performance_schema'", "'sys'", "'binlog_index'", "'bintrail_index'"} {
+		if !strings.Contains(query, want) {
+			t.Errorf("expected unscoped query to exclude %s, got query:\n%s", want, query)
+		}
+	}
+	// Escape-free prefix match so it is independent of the source's sql_mode
+	// (a backslash LIKE escape is fragile under NO_BACKSLASH_ESCAPES).
+	if !strings.Contains(query, "LEFT(CONSTRAINT_SCHEMA, 3) <> 'bt_'") {
+		t.Errorf("expected unscoped query to exclude the bt_ prefix via LEFT(), got query:\n%s", query)
+	}
+}

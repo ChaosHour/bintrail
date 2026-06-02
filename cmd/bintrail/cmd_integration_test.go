@@ -273,6 +273,57 @@ func TestValidateNoFKCascades_otherSchemaIgnored(t *testing.T) {
 	}
 }
 
+// A bt_-prefixed schema is one of bintrail's own internal schemas (the SaaS
+// bt_<prefix> convention; testutil names every test DB bt_<TestName>). When no
+// --schemas filter is given, FK cascades inside such a schema must be ignored —
+// otherwise a second bintrail agent sharing the source MySQL fatal-fails on the
+// first agent's internal cascade (#347). This also exercises the
+// LEFT(CONSTRAINT_SCHEMA, 3) <> 'bt_' prefix match against real MySQL.
+func TestValidateNoFKCascades_internalSchemaIgnoredWhenUnscoped(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+
+	testutil.MustExec(t, db, `CREATE TABLE profiles (id INT PRIMARY KEY)`)
+	testutil.MustExec(t, db, `CREATE TABLE access_rules (
+		id         INT PRIMARY KEY,
+		profile_id INT NOT NULL,
+		CONSTRAINT fk_access_rules_profile FOREIGN KEY (profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+	)`)
+
+	// Unscoped: the cascade lives in a bt_-prefixed (bintrail-internal) schema,
+	// so the pre-flight must skip it and pass.
+	if err := validateNoFKCascades(db, nil); err != nil {
+		t.Fatalf("expected nil for FK cascade in bintrail-internal schema %q when unscoped, got: %v", dbName, err)
+	}
+
+	// But when the operator explicitly names that schema, we still police it.
+	if err := validateNoFKCascades(db, []string{dbName}); err == nil {
+		t.Fatalf("expected error when %q is explicitly targeted despite being bt_-prefixed", dbName)
+	}
+}
+
+// The inverse of the exclusion, and the load-bearing direction: an unscoped
+// scan must still CATCH a real CASCADE FK in an ordinary user schema (no bt_
+// prefix, not an index-DB name). This guards against a regression that
+// broadens the exclusion until the unscoped branch matches nothing. testutil
+// only makes bt_-prefixed DBs, so the non-internal schema is created by hand.
+func TestValidateNoFKCascades_userSchemaCaughtWhenUnscoped(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+
+	const userSchema = "fkcascade_user"
+	testutil.MustExec(t, db, "DROP DATABASE IF EXISTS `"+userSchema+"`")
+	testutil.MustExec(t, db, "CREATE DATABASE `"+userSchema+"`")
+	t.Cleanup(func() { _, _ = db.Exec("DROP DATABASE IF EXISTS `" + userSchema + "`") })
+
+	testutil.MustExec(t, db, "CREATE TABLE `"+userSchema+"`.parents (id INT PRIMARY KEY)")
+	testutil.MustExec(t, db, "CREATE TABLE `"+userSchema+"`.children ("+
+		"id INT PRIMARY KEY, parent_id INT NOT NULL, "+
+		"CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES `"+userSchema+"`.parents(id) ON DELETE CASCADE)")
+
+	if err := validateNoFKCascades(db, nil); err == nil {
+		t.Fatalf("expected unscoped scan to catch the CASCADE FK in non-internal schema %q, got nil", userSchema)
+	}
+}
+
 // ─── ensureResolver ──────────────────────────────────────────────────────────────────
 
 func TestEnsureResolver_autoSnapshot(t *testing.T) {

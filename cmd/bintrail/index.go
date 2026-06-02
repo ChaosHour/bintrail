@@ -412,11 +412,26 @@ func validateBinlogRowImage(db *sql.DB) error {
 	return nil
 }
 
-// validateNoFKCascades checks that none of the targeted schemas contain foreign
-// key constraints with CASCADE rules. When schemas is empty, all non-system
-// schemas are checked. FK cascades produce invisible side-effect row changes
-// that make reversal SQL unreliable.
-func validateNoFKCascades(db *sql.DB, schemas []string) error {
+// buildFKCascadeQuery returns the REFERENTIAL_CONSTRAINTS query (and its args)
+// used to find CASCADE foreign keys. When schemas is non-empty the scan is
+// scoped to exactly those schemas — the operator explicitly asked us to index
+// them, so we police them as named. When schemas is empty we scan everything
+// except (a) MySQL's own system schemas and (b) bintrail's internal schemas:
+// the index DB (named `binlog_index` or `bintrail_index` across our docs and
+// deploy tooling — the #347 incident itself used `bintrail_index`) and the SaaS
+// `bt_<prefix>` convention. The latter exclusion matters when an agent shares
+// one source MySQL with another agent (or with its own co-located index DB):
+// without it, the pre-flight trips over bintrail's own `access_rules`→`profiles`
+// ON DELETE CASCADE and fatal-fails on a schema it was never asked to index
+// (#347).
+//
+// This is a name-based heuristic, so it has a known hole: a user schema that
+// happens to match these names (e.g. a real `bt_orders`) has its genuine
+// cascades silently skipped here, and a custom-named index DB is not excluded.
+// The robust fix is to recognise a bintrail-internal schema by its signature
+// tables rather than its name — tracked in #365. We keep the heuristic because
+// it covers the reported topologies and the issue endorsed it.
+func buildFKCascadeQuery(schemas []string) (string, []any) {
 	query := `SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, DELETE_RULE, UPDATE_RULE
 		FROM information_schema.REFERENTIAL_CONSTRAINTS
 		WHERE (DELETE_RULE = 'CASCADE' OR UPDATE_RULE = 'CASCADE')`
@@ -429,7 +444,33 @@ func validateNoFKCascades(db *sql.DB, schemas []string) error {
 			args = append(args, s)
 		}
 	} else {
-		query += " AND CONSTRAINT_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys')"
+		// LEFT(...) <> 'bt_' rather than LIKE 'bt\_%': under the
+		// NO_BACKSLASH_ESCAPES sql_mode the `\_` stops being an escaped literal
+		// underscore, so a LIKE pattern silently stops matching bt_-prefixed
+		// schemas. (And the obvious fix — an explicit ESCAPE '\' clause —
+		// syntax-errors under the default mode.) LEFT has no escaping to get
+		// wrong, so it behaves identically under any sql_mode.
+		query += " AND CONSTRAINT_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys','binlog_index','bintrail_index')" +
+			" AND LEFT(CONSTRAINT_SCHEMA, 3) <> 'bt_'"
+	}
+	return query, args
+}
+
+// validateNoFKCascades checks that none of the targeted schemas contain foreign
+// key constraints with CASCADE rules. When schemas is empty, all non-system,
+// non-bintrail-internal schemas are checked (see buildFKCascadeQuery). FK
+// cascades produce invisible side-effect row changes that make reversal SQL
+// unreliable.
+func validateNoFKCascades(db *sql.DB, schemas []string) error {
+	query, args := buildFKCascadeQuery(schemas)
+
+	// The unscoped scan deliberately skips bintrail's own internal schemas by
+	// name (see buildFKCascadeQuery). Unlike the system-schema exclusions, this
+	// is a heuristic that can wrongly skip a user schema sharing those names, so
+	// disclose it: a "no FK cascades" pass below does not cover excluded schemas.
+	if len(schemas) == 0 {
+		slog.Info("FK cascade pre-flight excludes bintrail-internal schemas from the unscoped scan",
+			"excluded", "binlog_index, bintrail_index, bt_*")
 	}
 
 	rows, err := db.Query(query, args...)
@@ -453,11 +494,11 @@ func validateNoFKCascades(db *sql.DB, schemas []string) error {
 
 	if len(found) > 0 {
 		for _, c := range found {
-			slog.Warn("FK cascade constraint found",
-				"schema", c.schema, "constraint", c.name,
+			slog.Warn("FK cascade constraint found on source",
+				"source_schema", c.schema, "constraint", c.name,
 				"delete_rule", c.deleteRule, "update_rule", c.updateRule)
 		}
-		return fmt.Errorf("%d FK cascade constraint(s) found in indexed schemas; reversal SQL from `recover` may not correctly handle cascade side-effects", len(found))
+		return fmt.Errorf("%d FK cascade constraint(s) found on source; reversal SQL from `recover` may not correctly handle cascade side-effects", len(found))
 	}
 	return nil
 }
