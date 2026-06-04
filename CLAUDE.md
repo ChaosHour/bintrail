@@ -26,9 +26,10 @@ internal/
   parser/              # Binlog file parser + StreamParser (go-mysql-org/go-mysql)
   indexer/             # Batch writer to binlog_events
   query/               # Query engine + result formatters (table/json/csv) + archive auto-discovery + merge + planner
-  recovery/            # Reversal SQL generator
+  recovery/            # Reversal SQL generator (delta-only: undoes touched rows from before/after images)
+  reconstruct/         # Full-table & single-row point-in-time reconstruction: merges a baseline Parquet snapshot with binlog deltas (baseline + deltas → full state). fulltable.go does merge-on-read via DuckDB + mydumper-compatible output
   status/              # Shared status types and display
-  baseline/            # mydumper → Parquet converter
+  baseline/            # mydumper → Parquet converter (full table state; consumed by reconstruct, not standalone)
   archive/             # Partition archiver → Parquet via baseline.Writer
   parquetquery/        # DuckDB-backed Parquet query engine
   storage/             # Abstract storage backend interface (Backend) + S3 implementation for BYOS
@@ -54,6 +55,7 @@ Per-command `--format`: most commands accept `text`/`json` (`IsValidOutputFormat
 | `index` | `index.go` | `--index-dsn` (req), `--source-dsn`, `--binlog-dir` (req), `--files`, `--all`, `--batch-size`, `--schemas`, `--tables` |
 | `query` | `query.go` | `--index-dsn` (req), `--schema`, `--table`, `--pk`, `--event-type`, `--gtid`, `--since`, `--until`, `--changed-column`, `--flag`, `--format` (table/json/csv), `--limit`, `--archive-dir`, `--archive-s3`, `--bintrail-id`, `--profile`, `--no-archive` |
 | `recover` | `recover.go` | same filters as query + `--output`, `--dry-run`, `--limit` (default 1000), `--profile`, `--no-archive` |
+| `reconstruct` | `reconstruct.go` | `--index-dsn` (not req with `--baseline-only`/`--sql`), `--schema`, `--table`, `--pk`, `--pk-columns`, `--at` (default now), `--baseline-dir`, `--baseline-s3`, `--baseline-only`, `--history`, `--sql`, `--format` (json/table/csv), `--no-archive`, `--allow-gaps` (default false); full-table mode: `--output-format mydumper`, `--output-dir`, `--tables` (comma-sep `schema.table`), `--chunk-size` (default `256MB`), `--parallelism` (default `NumCPU`) |
 | `rotate` | `rotate.go` | `--index-dsn` (req), `--retain` (e.g. `7d`, `24h`), `--add-future`, `--archive-dir`, `--archive-compression` (default `zstd`) |
 | `status` | `status.go` | `--index-dsn` (req) |
 | `console` | `console.go` | `--index-dsn` (req), `--listen` (default `127.0.0.1:8090`), `--token` (auto-gen for loopback; required for non-loopback), `--no-archive`, `--profile` (forces `--no-archive`); read-only web UI over the index (events/recover/status) — the MCP server with a web face, implemented in `internal/console/` (server/api/auth/dto/assets + `//go:embed` vanilla frontend, zero JS deps). NEVER executes SQL. Open-core boundary: `eventDTO` omits `connection_id` (free `query_explorer` surface, not paid `forensics`). Env `BINTRAIL_CONSOLE_LISTEN`/`BINTRAIL_CONSOLE_TOKEN` are read directly in `runConsole`, NOT via the shared `envBindings` slice (`--listen` collides with `shim`/`init-shim`). Security: token in `Authorization: Bearer` (`subtle.ConstantTimeCompare`), Host-header allowlist (DNS-rebinding defense), no CORS, result caps (events 100/1000, recover 1000/10000), `/api/healthz` unauthenticated. |
@@ -68,7 +70,7 @@ Per-command `--format`: most commands accept `text`/`json` (`IsValidOutputFormat
 | `proxysql-config` | `proxysql_config.go` | `--out` (default `proxysql-setup.sql`, `-` for stdout), `--shim-config` (default `shim.yaml`), `--mysql-port` (default `3306`), `--shim-port` (default `3308`), `--proxysql-mysql-port` (default `6033`), `--force`/`-f` (overwrite existing output), `--backend-auth-plugin` (default `mysql_native_password` → store SHA1; `caching_sha2_password` → store cleartext so ProxySQL can re-handshake against MySQL 8.0+ defaults — **requires TLS to backend or primed SHA2 cache**), `--validate` (opt-in pre-flight: connects to `BINTRAIL_SOURCE_DSN`, probes `mysql.user` for the DSN user's plugin, and warns on mismatch with `--backend-auth-plugin`; warn-only, never blocks SQL generation — #327); reads `BINTRAIL_SOURCE_DSN` and shim.yaml; outputs SQL using hostgroups 990/991 and rule_ids 990001-990004 (the fourth rule matches the `/*+ DBTRAIL_AT='<ts>' */` hint-comment form); generated SQL uses `/* … */` block comments so ProxySQL admin parses it cleanly (#309) |
 | `shim` | `shim.go` | `--listen` (default `127.0.0.1:3308`), `--index-dsn` (req), `--shim-config` (default `shim.yaml`), `--no-archive`, `--allow-gaps` (default false: archive failures/coverage gaps abort the client query with a MySQL error rather than silently returning a partial resultset); in-process MySQL-protocol server for `_flashback`/`_diff`/`_snapshot` virtual schemas, sits behind ProxySQL. **`shim.yaml` requires `mysql_password` (cleartext) per tenant from 0.7.2 on**; `mysql_pass_sha1` is parsed (UnmarshalStrict compat) but rejected with a migration error. The shim validates the cleartext via `mysql_native_password`; `proxysql-config` recomputes the SHA1 for ProxySQL's `mysql_users.password`. |
 
-Flag variable naming: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `rotRetain`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`, `uplSource`, `cfgGlobal`, `agtAPIKey`, `isOut`, `pcOut`, `shListen`).
+Flag variable naming: prefixed by command abbreviation (e.g. `idxIndexDSN`, `qSchema`, `rDryRun`, `recAt` (reconstruct), `rotRetain`, `strmIndexDSN`, `dmpSourceDSN`, `bslInput`, `uplSource`, `cfgGlobal`, `agtAPIKey`, `isOut`, `pcOut`, `shListen`).
 
 ### Environment file loading
 
@@ -179,6 +181,12 @@ Use `mysql.ParseDSN(dsn)` from `github.com/go-sql-driver/mysql`. Do not use `SEL
 - Events reversed with `slices.Reverse(rows)` — most-recent undone first.
 - `pkWhereClause` uses resolver PK columns; falls back to all-columns WHERE when resolver is nil.
 - Two entry points: `GenerateSQL(ctx, opts, w)` fetches events internally; `GenerateSQLFromRows(rows, w)` takes pre-fetched rows (used by CLI/MCP when merging live MySQL + archive results).
+
+### Recovery vs reconstruct (two different capabilities — don't conflate)
+- **`recover` / `internal/recovery`**: **delta-only.** Undoes specific touched rows from stored before/after images. Cannot materialize a full table; it even rejects `EventSnapshot` rows ("baseline rows are read-only"). A row never touched in the indexed window is invisible to it.
+- **`reconstruct` / `internal/reconstruct`**: **baseline + deltas → full state.** Requires a baseline (`bintrail baseline` Parquet snapshot, via `--baseline-dir`/`--baseline-s3`). `ApplyAt` (single-row) and `ReconstructTable`/`mergeBaselineIntoWriter` (full-table, `--output-format mydumper`, issue #187) stream baseline rows via DuckDB `parquet_scan` and apply a `PK → last event` change map (last-write-wins; DELETE→skip, UPDATE/INSERT→`row_after`, no-match→pass-through). The baseline Parquet embeds binlog coordinates (`MetaKeyBinlogFile/Pos/GTIDSet`) marking where deltas start. No baseline ⇒ empty table, not the real prior contents. Sharp edges: requires a PK (no FLOAT/BLOB/BINARY/BIT/JSON PK), PK-changing UPDATEs mishandled (`fulltable.go:55-60`), pre-`MetaKeyCreateTableSQL` baselines need re-dump.
+- **"Merge" is overloaded**: `query.MergeResults` dedups the *same kind of row-events* across live MySQL + Parquet archives (NOT baseline+delta). The archives are archived `binlog_events` partitions, not baselines.
+- **The shim (`_flashback`/`_snapshot`/`_diff`) is binlog-only today** — `_snapshot` is a literal synonym for `_flashback` and does NOT do baseline lookup, so point-in-time queries over the shim return only rows with binlog activity, not complete tables. Full-table PITR (incl. untouched rows) lives only in the offline `bintrail reconstruct`. (Tracked: #355 shim baseline lookup, #356 docs overclaim.)
 
 ### Archive auto-discovery and merge
 - `query.ResolveArchiveSources(ctx, db)` in `internal/query/archive.go` queries `archive_state` for distinct `bintrail_id` paths. Prefers local paths over S3 when the directory exists on disk.
