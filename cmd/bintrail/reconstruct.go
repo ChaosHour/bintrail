@@ -274,11 +274,15 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		ArchiveFetcher: parquetquery.Fetch,
 	})
 	if err != nil {
-		// Surface the --allow-gaps hint only at the CLI layer; the library
-		// type (query.GapError) stays flag-neutral.
+		// Surface CLI hints only at the CLI layer; the library types
+		// (query.GapError, query.SourceEmptyError) stay command-neutral.
 		var gapErr *query.GapError
 		if errors.As(err, &gapErr) {
 			return fmt.Errorf("%w; pass --allow-gaps to proceed with an incomplete reconstruction", err)
+		}
+		var emptyErr *query.SourceEmptyError
+		if errors.As(err, &emptyErr) {
+			return fmt.Errorf("%w; run `bintrail archive reconcile` to re-sync archive_state with storage, or pass --allow-gaps to proceed without that source", err)
 		}
 		return fmt.Errorf("fetch binlog events: %w", err)
 	}
@@ -468,6 +472,13 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 	}
 	reports, err := reconstruct.ReconstructTables(cmd.Context(), cfg)
 	if err != nil {
+		// Same CLI-layer hint as single-row reconstruct (the %w chain
+		// survives ReconstructTables' errors.Join, so errors.As still
+		// unwraps the library type).
+		var emptyErr *query.SourceEmptyError
+		if errors.As(err, &emptyErr) {
+			return fmt.Errorf("full-table reconstruct: %w; run `bintrail archive reconcile` to re-sync archive_state with storage, or pass --allow-gaps to proceed without that source", err)
+		}
 		return fmt.Errorf("full-table reconstruct: %w", err)
 	}
 
