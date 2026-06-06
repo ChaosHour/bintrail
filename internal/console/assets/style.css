@@ -41,8 +41,8 @@ header {
   z-index: 10;
 }
 
-.brand { display: flex; align-items: baseline; gap: 8px; }
-.logo { font-weight: 700; font-size: 18px; letter-spacing: -0.3px; }
+.brand { display: flex; align-items: center; gap: 8px; }
+.logo { height: 26px; display: block; }
 .sub { color: var(--muted); font-size: 13px; }
 .readonly {
   margin-left: 6px;

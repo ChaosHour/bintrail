@@ -6,12 +6,13 @@ import (
 	"net/http"
 )
 
-// assetsFS embeds the static frontend (HTML/CSS/JS). The console ships as a
-// single Go binary with no Node build step — these files are vanilla and
-// dependency-free (see assets/VENDOR.md). Only the three served files are
-// embedded; VENDOR.md stays as source-tree documentation and is not exposed.
+// assetsFS embeds the static frontend (HTML/CSS/JS + brand images). The
+// console ships as a single Go binary with no Node build step — these files
+// are vanilla and dependency-free (see assets/VENDOR.md). Only the served
+// files are embedded; VENDOR.md stays as source-tree documentation and is
+// not exposed.
 //
-//go:embed assets/index.html assets/app.js assets/style.css
+//go:embed assets/index.html assets/app.js assets/style.css assets/logo.png assets/favicon.png
 var assetsFS embed.FS
 
 // assetHandler serves the embedded frontend rooted at the assets/ directory,
