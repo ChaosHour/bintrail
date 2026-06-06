@@ -1,6 +1,6 @@
 <div align="center">
 
-# bintrail
+<img src="docs/img/header.png" alt="bintrail — the open-source time-travel flashback for MySQL. Every change leaves a trail: follow it back." width="100%">
 
 **Point-in-time recovery for MySQL — no locks, no schema changes, no waiting for a restore.**
 
