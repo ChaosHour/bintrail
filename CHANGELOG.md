@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-06-06
+
 ### Changed
 - **`bintrail-appliance` is now `bintrail-demo`.** The single-container evaluation image is renamed: pull `ghcr.io/dbtrail/bintrail-demo` (the repo path moves from `appliance/` to `demo/image/`, the doc from `docs/appliance.md` to `docs/demo.md`, the workflow to `demo-image.yml`). "Appliance" said nothing about what it is; "demo" does. The old `bintrail-appliance` GHCR package keeps serving its already-published tags, but new releases publish only the new name.
 
