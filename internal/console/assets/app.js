@@ -564,6 +564,19 @@ function closeServersModal() {
   document.getElementById("servers-modal").hidden = true;
 }
 
+// isLiveMonitorState: states where the stream goroutine is alive (Stop is the
+// applicable verb). "stalled" and "lost_position" are unhealthy running
+// variants — the supervisor still owns the stream and its advisory lock.
+function isLiveMonitorState(st) {
+  return st === "running" || st === "pending" || st === "stalled" || st === "lost_position";
+}
+
+const MON_STATE_TITLES = {
+  failed: "stream failing — retrying with backoff; press Start for details",
+  stalled: "stream is connected but has made no progress for several minutes",
+  lost_position: "binlogs were purged past the saved position — events in the gap are permanently lost; current changes are still streaming",
+};
+
 async function refreshServersList() {
   const list = document.getElementById("servers-list");
   let servers = [];
@@ -583,7 +596,7 @@ async function refreshServersList() {
       ? `watching ${s.source_user}@${s.source_host}:${s.source_port || "3306"}${s.schemas ? " [" + s.schemas + "]" : ""}`
       : (s.host ? `${s.user}@${s.host}:${s.port || "3306"}/${s.dbname}` : s.dbname || "");
     const monitorable = capsCache.monitor && s.has_source && s.kind !== "ephemeral";
-    const running = s.monitor_state === "running" || s.monitor_state === "pending";
+    const running = isLiveMonitorState(s.monitor_state);
     const row = el("div", { class: "server-row" },
       el("span", { class: "health-dot" + (s.connected ? " ok" : ""), title: s.connected ? "connected" : "not connected yet" }),
       el("span", { class: "srv-name" }, serverLabel(s)),
@@ -591,8 +604,8 @@ async function refreshServersList() {
       s.reconstruct ? el("span", { class: "badge tt", title: "Baseline configured: Time-travel available" }, "TT") : null,
       s.monitor_state ? el("span", {
         class: "badge mon-" + s.monitor_state,
-        title: s.monitor_state === "failed" ? "stream failing — retrying with backoff; press Start for details" : "monitoring " + s.monitor_state,
-      }, s.monitor_state.toUpperCase()) : null,
+        title: MON_STATE_TITLES[s.monitor_state] || ("monitoring " + s.monitor_state),
+      }, s.monitor_state.replace("_", " ").toUpperCase()) : null,
       el("span", { class: "srv-desc" }, desc),
       el("span", { class: "srv-status", id: "srv-status-" + s.id }),
       monitorable ? el("button", {
@@ -641,13 +654,32 @@ async function startMonitorRow(id) {
   await refreshServersList();
   if (!res) return;
   if (res.started) {
-    toast("Monitoring started");
+    if (doctorWarnings(res.doctor)) {
+      // Warnings never block (started already), but they must be SEEN —
+      // e.g. "this looks like a replica of an already-monitored server".
+      // If the editor cannot open (server deleted concurrently), don't
+      // render into a hidden form — degrade to a toast.
+      if (await editServer(id)) {
+        renderDoctor(res.doctor);
+        formMsg("monitoring started — review the warnings below", false);
+      } else {
+        toast("Monitoring started with warnings — edit the server to review them");
+      }
+    } else {
+      toast("Monitoring started");
+    }
   } else {
     // Preflight failed — open the editor so the remediation cards are visible.
-    await editServer(id);
-    renderDoctor(res.doctor);
-    formMsg("preflight failed — fix the items below, Save, and Start again", true);
+    if (await editServer(id)) {
+      renderDoctor(res.doctor);
+      formMsg("preflight failed — fix the items below, Save, and Start again", true);
+    }
   }
+}
+
+// doctorWarnings: does the preflight report carry warn cards worth showing?
+function doctorWarnings(report) {
+  return !!(report && report.warnings > 0);
 }
 
 async function stopMonitorRow(id) {
@@ -701,12 +733,17 @@ function hideServerForm() {
   document.getElementById("server-add-wrap").hidden = false;
 }
 
+// editServer opens the editor form for a server; returns true when the form
+// is actually showing (callers that render into it must not assume success —
+// the server may have been deleted concurrently).
 async function editServer(id) {
   try {
     const s = await api("/api/servers/" + encodeURIComponent(id));
     showServerForm(s);
+    return true;
   } catch (err) {
     toast("failed to load server: " + (err.message || err));
+    return false;
   }
 }
 
@@ -752,13 +789,18 @@ async function saveServer(e) {
   // The zero-terminal flow: a saved server with a source goes straight into
   // doctor → stream (auto-start on green). The form stays open on a failed
   // preflight so the remediation cards are right there.
-  if (capsCache.monitor && saved.has_source && saved.monitor_state !== "running") {
+  if (capsCache.monitor && saved.has_source && !isLiveMonitorState(saved.monitor_state)) {
     formMsg("running preflight checks…", false);
     const res = await startMonitor(saved.id);
     await refreshServersList();
-    if (res && res.started) {
+    if (res && res.started && !doctorWarnings(res.doctor)) {
       hideServerForm();
       toast("Monitoring started — events will appear within a minute");
+    } else if (res && res.started) {
+      // Started, but with warn cards (e.g. replica-of-monitored) — keep the
+      // form open so the operator actually sees them.
+      renderDoctor(res.doctor);
+      formMsg("monitoring started — review the warnings below", false);
     } else if (res) {
       renderDoctor(res.doctor);
       formMsg("preflight failed — fix the items below and Save again", true);

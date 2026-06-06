@@ -41,24 +41,69 @@ type monitorSupervisor struct {
 	// databases are derived from it (same server, same credentials,
 	// different DBName).
 	bootIndexDSN string
+	// registry lists the other monitored entries — Doctor compares a
+	// candidate source against them for replica/duplicate detection. May be
+	// nil (tests); the check is skipped then.
+	registry *console.Registry
+	// streamFn runs one supervised stream; a seam for unit tests, streamOne
+	// in production.
+	streamFn func(ctx context.Context, cfg streamConfig) error
 
 	mu   sync.Mutex
 	jobs map[string]*monitorJob
 	wg   sync.WaitGroup
 }
 
+// Supervisor health thresholds. Vars, not consts, so tests can shrink them.
+var (
+	// monitorStalledAfter: a running stream that has neither saved a
+	// checkpoint nor flushed a batch for this long is reported "stalled".
+	// The checkpoint ticker fires even with zero events, so an idle-but-
+	// healthy source never trips this — only a genuinely wedged loop does.
+	monitorStalledAfter = 5 * time.Minute
+	// monitorGiveUpAfter: a stream that has been crash-looping continuously
+	// for this long (no healthy run in between) stops retrying and reports
+	// a permanent "failed" — the circuit breaker against a misconfigured
+	// source retrying forever. Press Start (or restart the daemon) to re-arm.
+	monitorGiveUpAfter = 6 * time.Hour
+	// Crash-loop backoff: retry delay doubles from base to cap; a run that
+	// survives monitorHealthyReset resets both the attempt counter and the
+	// circuit-breaker clock.
+	monitorBackoffBase  = 15 * time.Second
+	monitorBackoffCap   = 5 * time.Minute
+	monitorHealthyReset = 10 * time.Minute
+)
+
 // monitorJob is one supervised stream.
 type monitorJob struct {
 	cancel context.CancelFunc
 	done   chan struct{}
+	// indexDSN is the entry's per-source index database — set once at job
+	// creation (before the job is published), immutable after. Stop uses it
+	// to clear the durable gap-loss record with its own short-lived
+	// connection (lockDB belongs to the run goroutine; sharing it from Stop
+	// would race Start's provisioning window).
+	indexDSN string
 	// lockDB's single dedicated connection holds the advisory lock for this
-	// entry; closing it releases the lock.
+	// entry; closing it releases the lock. Written by Start before the run
+	// goroutine launches and read only by run's teardown — never from other
+	// goroutines.
 	lockDB *sql.DB
 
 	mu      sync.Mutex
-	state   string // pending|running|failed|stopped
+	state   string // stored: pending|running|failed|stopped
 	lastErr string
 	since   time.Time
+	// lastProgress is when the stream last proved liveness (checkpoint saved
+	// or batch flushed) — feeds the derived "stalled" state.
+	lastProgress time.Time
+	// lostPosition, when non-empty, records that an unfillable binlog gap
+	// forced an auto-advance: events were permanently lost. The fact is
+	// also persisted in stream_state (gap_lost_at/_detail) and re-hydrated
+	// by Start, so it survives daemon restarts; only an explicit Stop (the
+	// operator's acknowledgment) clears it — feeds the derived
+	// "lost_position" state.
+	lostPosition string
 }
 
 func (j *monitorJob) set(state, lastErr string) {
@@ -67,20 +112,78 @@ func (j *monitorJob) set(state, lastErr string) {
 	j.mu.Unlock()
 }
 
+// storedState returns the raw state-machine value (pending|running|failed|
+// stopped) without the derived stalled/lost_position presentation — for
+// callers that need goroutine liveness, not operator-facing health.
+func (j *monitorJob) storedState() string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.state
+}
+
+// progress records stream liveness and performs the pending→running flip:
+// the supervisor reports "pending" from launch until the stream saves its
+// first checkpoint (or flushes its first batch) — before that the goroutine
+// is still connecting/snapshotting and a RUNNING badge would lie (#407).
+func (j *monitorJob) progress() {
+	j.mu.Lock()
+	j.lastProgress = time.Now().UTC()
+	if j.state == "pending" {
+		j.state, j.lastErr, j.since = "running", "", j.lastProgress
+	}
+	j.mu.Unlock()
+}
+
+func (j *monitorJob) markLostPosition(detail string) {
+	j.mu.Lock()
+	j.lostPosition = detail
+	j.mu.Unlock()
+}
+
+// streamHooks wires this job as its stream's liveness observer.
+func (j *monitorJob) streamHooks() *streamHooks {
+	return &streamHooks{
+		OnCheckpoint:     j.progress,
+		OnIndexed:        func(int64) { j.progress() },
+		OnGapAutoAdvance: j.markLostPosition,
+	}
+}
+
+// snapshot reports the job's state, deriving the two "running but not
+// healthy" presentations at read time (the stored state machine stays
+// pending|running|failed|stopped):
+//   - "stalled":       running, but no checkpoint/flush for monitorStalledAfter
+//   - "lost_position": running, but a gap auto-advance lost events
+//
+// A wedged stream beats a historical data-loss note, so stalled wins when
+// both apply.
 func (j *monitorJob) snapshot() console.MonitorStatus {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	st := console.MonitorStatus{State: j.state, LastError: j.lastErr}
+	if j.state == "running" {
+		if idle := time.Since(j.lastProgress); !j.lastProgress.IsZero() && idle > monitorStalledAfter {
+			st.State = "stalled"
+			st.LastError = fmt.Sprintf("no progress for %s: no events indexed and no checkpoint saved — the stream is connected but not advancing", idle.Round(time.Second))
+		} else if j.lostPosition != "" {
+			st.State = "lost_position"
+			st.LastError = j.lostPosition
+		}
+	}
 	if !j.since.IsZero() {
 		st.Since = j.since.Format(time.RFC3339)
 	}
 	return st
 }
 
-func newMonitorSupervisor(baseCtx context.Context, bootIndexDSN string) *monitorSupervisor {
+// newMonitorSupervisor builds the control plane. reg may be nil (tests) —
+// Doctor's replica/duplicate detection is skipped then.
+func newMonitorSupervisor(baseCtx context.Context, bootIndexDSN string, reg *console.Registry) *monitorSupervisor {
 	return &monitorSupervisor{
 		baseCtx:      baseCtx,
 		bootIndexDSN: bootIndexDSN,
+		registry:     reg,
+		streamFn:     streamOne,
 		jobs:         map[string]*monitorJob{},
 	}
 }
@@ -128,6 +231,23 @@ func (m *monitorSupervisor) Doctor(ctx context.Context, e console.ServerEntry) (
 			Remediation: c.Remediation,
 		}
 	}
+
+	// Replica/duplicate detection against the other monitored entries —
+	// warn-only per the approved decision (#402): an amber card, never a
+	// block. Supervisor-only: the standalone `bintrail doctor` has no
+	// registry to compare against.
+	if c := m.replicaOverlapCheck(ctx, e); c != nil {
+		c.Detail = scrubMonitorErrText(c.Detail, e.SourceDSN, e.DSN)
+		out.Checks = append(out.Checks, *c)
+		switch c.Status {
+		case "warn":
+			out.Warnings++
+		case "skip":
+			out.Skipped++
+		default:
+			out.Passed++
+		}
+	}
 	return out, nil
 }
 
@@ -145,8 +265,14 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 
 	m.mu.Lock()
 	if j, ok := m.jobs[e.ID]; ok {
-		st := j.snapshot().State
-		if st == "running" || st == "pending" {
+		// Gate on the STORED state, not the derived presentation: stalled
+		// and lost_position are running variants (the goroutine still holds
+		// the advisory lock; superseding it would deadlock on our own lock —
+		// restart a stalled stream via Stop+Start), and checking the stored
+		// machine means new derived states can never fall through to the
+		// cancel below by omission.
+		switch j.storedState() {
+		case "running", "pending":
 			m.mu.Unlock()
 			return nil // idempotent
 		}
@@ -155,7 +281,7 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 	}
 	// Reserve the slot as pending while provisioning runs outside the lock.
 	jobCtx, cancel := context.WithCancel(m.baseCtx)
-	job := &monitorJob{cancel: cancel, done: make(chan struct{})}
+	job := &monitorJob{cancel: cancel, done: make(chan struct{}), indexDSN: e.DSN}
 	job.set("pending", "")
 	m.jobs[e.ID] = job
 	m.mu.Unlock()
@@ -190,6 +316,23 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 	if err := indexer.EnsureSchema(idxDB); err != nil {
 		idxDB.Close()
 		return fail(fmt.Errorf("schema migration: %w", err))
+	}
+	// Re-hydrate a durable gap-loss record (#402): once the stream persisted
+	// its advanced checkpoint, a restarted daemon sees no gap and the hook
+	// never re-fires — the lost_position state must be restored from
+	// stream_state or the data loss silently un-surfaces. Cleared only by an
+	// explicit Stop (the operator's acknowledgment). ErrNoRows is the normal
+	// fresh-start case; any other error means a recorded loss may go
+	// un-surfaced this run, which deserves a breadcrumb.
+	var gapDetail sql.NullString
+	err = idxDB.QueryRowContext(ctx,
+		`SELECT gap_lost_detail FROM stream_state WHERE id = 1`).Scan(&gapDetail)
+	switch {
+	case err == nil && gapDetail.Valid && gapDetail.String != "":
+		job.markLostPosition(gapDetail.String)
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		slog.Warn("could not re-hydrate gap-loss record; a recorded data loss may not be re-surfaced this run",
+			"entry", e.ID, "error", scrubMonitorErr(err, e.SourceDSN, e.DSN))
 	}
 	idxDB.Close()
 
@@ -228,15 +371,20 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 		}
 	}
 	cfg := streamConfig{
-		IndexDSN:   e.DSN,
-		SourceDSN:  e.SourceDSN,
-		ServerID:   serverID,
-		BatchSize:  1000,
-		Schemas:    e.Schemas,
-		Checkpoint: 10,
-		SSLMode:    "preferred",
-		Format:     "text",
-		GapTimeout: 30,
+		IndexDSN:  e.DSN,
+		SourceDSN: e.SourceDSN,
+		ServerID:  serverID,
+		BatchSize: 1000,
+		Schemas:   e.Schemas,
+		// MetricsSource keys this stream's Prometheus series; MetricsAddr
+		// stays empty on purpose — the daemon serves ONE /metrics endpoint
+		// for all supervised streams (per-stream binds would conflict).
+		MetricsSource: e.ID,
+		Checkpoint:    10,
+		SSLMode:       "preferred",
+		Format:        "text",
+		GapTimeout:    30,
+		Hooks:         job.streamHooks(),
 	}
 
 	m.wg.Add(1)
@@ -247,7 +395,12 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 // run supervises one stream with crash-loop backoff: a stream that errors is
 // restarted (15s doubling to a 5m cap, counter reset after 10 healthy
 // minutes); the job reports "failed" with the scrubbed error between
-// attempts. Cancellation (stop verb / daemon shutdown) exits cleanly.
+// attempts. The job stays "pending" from launch until the stream's first
+// checkpoint/flush flips it to "running" via the liveness hooks. A stream
+// that crash-loops continuously for monitorGiveUpAfter trips the circuit
+// breaker: permanent "failed", no more retries, advisory lock released —
+// Start (or a daemon restart) re-arms it. Cancellation (stop verb / daemon
+// shutdown) exits cleanly.
 func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.ServerEntry, cfg streamConfig) {
 	defer m.wg.Done()
 	defer close(job.done)
@@ -257,26 +410,33 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 		}
 	}()
 
-	const (
-		backoffBase  = 15 * time.Second
-		backoffCap   = 5 * time.Minute
-		healthyReset = 10 * time.Minute
-	)
 	attempt := 0
+	var crashLoopSince time.Time // first failure of the current loop; zero = healthy
 	for {
-		job.set("running", "")
+		job.set("pending", "")
 		started := time.Now()
-		err := streamOne(ctx, cfg)
+		err := m.streamFn(ctx, cfg)
 		if ctx.Err() != nil || err == nil {
 			job.set("stopped", "")
 			return
 		}
-		if time.Since(started) > healthyReset {
+		if time.Since(started) > monitorHealthyReset {
 			attempt = 0
+			crashLoopSince = time.Time{}
 		}
-		delay := min(backoffBase<<attempt, backoffCap)
-		attempt++
+		if crashLoopSince.IsZero() {
+			crashLoopSince = started
+		}
 		scrubbed := scrubMonitorErr(err, e.SourceDSN, e.DSN)
+		if looping := time.Since(crashLoopSince); looping > monitorGiveUpAfter {
+			slog.Error("monitored stream crash-looped past the give-up threshold; not retrying",
+				"server", e.Name, "entry", e.ID, "looping_for", looping.Round(time.Minute), "error", scrubbed)
+			job.set("failed", fmt.Sprintf("%s (gave up after %s of crash-looping — fix the issue, then press Start to retry)",
+				scrubbed, looping.Round(time.Minute)))
+			return
+		}
+		delay := min(monitorBackoffBase<<attempt, monitorBackoffCap)
+		attempt++
 		slog.Warn("monitored stream failed; retrying with backoff",
 			"server", e.Name, "entry", e.ID, "delay", delay, "error", scrubbed)
 		job.set("failed", scrubbed+" (retrying)")
@@ -290,7 +450,11 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 }
 
 // Stop implements console.MonitorController. Idempotent; waits briefly for
-// the stream to flush its final checkpoint.
+// the stream to flush its final checkpoint. An explicit Stop is also the
+// operator's acknowledgment of a recorded data loss: it clears the durable
+// gap-loss record so the next Start begins clean. Daemon shutdown does NOT
+// come through here (Shutdown cancels jobs directly), so a restart preserves
+// the record.
 func (m *monitorSupervisor) Stop(ctx context.Context, entryID string) error {
 	m.mu.Lock()
 	job, ok := m.jobs[entryID]
@@ -300,6 +464,22 @@ func (m *monitorSupervisor) Stop(ctx context.Context, entryID string) error {
 	m.mu.Unlock()
 	if !ok {
 		return nil
+	}
+	// Clear with a short-lived connection of our own: lockDB belongs to the
+	// run goroutine (reading it here would race Start's provisioning window,
+	// and it is already closed when the stream gave up or exited). On
+	// failure the record survives — the next Start re-raises lost_position,
+	// which fails safe: a real past loss is re-surfaced, never dropped.
+	if job.indexDSN != "" {
+		if db, err := config.Connect(job.indexDSN); err != nil {
+			slog.Warn("could not clear gap-loss record on stop", "entry", entryID, "error", scrubMonitorErrText(err.Error(), job.indexDSN))
+		} else {
+			if _, err := db.ExecContext(ctx, `UPDATE stream_state
+				SET gap_lost_at = NULL, gap_lost_detail = NULL WHERE id = 1`); err != nil {
+				slog.Warn("could not clear gap-loss record on stop", "entry", entryID, "error", scrubMonitorErrText(err.Error(), job.indexDSN))
+			}
+			db.Close()
+		}
 	}
 	job.cancel()
 	select {

@@ -30,12 +30,27 @@ type DoctorReport struct {
 
 // MonitorStatus is the supervisor's view of one entry's stream.
 type MonitorStatus struct {
-	// State: "stopped" | "pending" | "running" | "failed".
-	// "failed" carries LastError and the supervisor keeps retrying with
-	// backoff — it is "unhealthy, recovering", not terminal.
+	// State: "stopped" | "pending" | "running" | "stalled" | "lost_position"
+	// | "failed".
+	//   - "pending" covers launch through the stream's first checkpoint —
+	//     connecting, snapshotting, discovering the start position. Only a
+	//     saved checkpoint (or indexed batch) flips it to "running" (#407).
+	//   - "stalled" and "lost_position" are running variants derived at read
+	//     time: the stream goroutine is alive, but it has made no progress
+	//     for several minutes (stalled) or an unfillable binlog gap forced
+	//     it to skip permanently lost events (lost_position — durable,
+	//     persisted in stream_state, re-hydrated on Start, cleared only by
+	//     an explicit Stop).
+	//   - "failed" carries LastError; the supervisor keeps retrying with
+	//     backoff — "unhealthy, recovering", not terminal — unless the
+	//     circuit breaker gave up after hours of continuous crash-looping
+	//     (the message says so; Start re-arms it).
 	State     string `json:"state"`
 	LastError string `json:"last_error,omitempty"`
-	// Since is when the state was entered (RFC3339), empty for stopped.
+	// Since is when the underlying STORED state was entered (RFC3339), empty
+	// for stopped. For the derived stalled/lost_position presentations it
+	// still reflects the running transition, not when the stream stalled or
+	// lost its position.
 	Since string `json:"since,omitempty"`
 }
 
