@@ -32,10 +32,13 @@ UPDATE" from a restore-from-backup incident into a two-minute fix:
 It also ships an [MCP server](docs/mcp-server.md), so Claude (or any MCP
 client) can search your change history and draft recoveries.
 
-Works with self-managed MySQL and with RDS / Aurora / Cloud SQL (replication
-protocol — no binlog file access needed). Requires MySQL 8.0+ with
-`binlog_format=ROW` and `binlog_row_image=FULL` — `bintrail doctor` checks
-both and prints the exact fix for anything missing.
+Works with **MySQL**, **Percona Server for MySQL**, **Amazon RDS for
+MySQL**, **Amazon Aurora MySQL**, and **Google Cloud SQL for MySQL** —
+bintrail connects over the replication protocol, so it never needs access
+to the binlog files on disk (that's what makes managed cloud databases
+work). Requires MySQL 8.0+ with `binlog_format=ROW` and
+`binlog_row_image=FULL` — `bintrail doctor` checks both and prints the
+exact fix for anything missing.
 
 ## Get started
 
@@ -60,18 +63,21 @@ Watching events within the minute, and the terminal is already behind you.
 The console binds to your machine only (`127.0.0.1`) and every request
 requires the token from the URL.
 
-> The bundled index MySQL is **evaluation-grade** (volume loss = re-index).
-> For production, point `INDEX_DSN` in `.env` at a MySQL you operate —
-> bintrail installs only its schema, never a database server. Boundary:
-> [SUPPORT.md](SUPPORT.md).
+> The compose stack ships with its own small MySQL container, which
+> bintrail uses to store the index. That's fine for **trying bintrail out**,
+> but don't rely on it in production: if its Docker volume is lost, the
+> index is gone and you have to re-index from scratch. For production, set
+> `INDEX_DSN` in `.env` to a MySQL server **you** run and back up. bintrail
+> creates its tables there and nothing more — it never installs or operates
+> the database server itself. What's supported on each side is spelled out
+> in [SUPPORT.md](SUPPORT.md).
 >
 > **Other ways to install** — plain Docker, `.deb`/`.rpm`, `go install`,
 > source builds, and the binary quickstart: see **[docs/install.md](docs/install.md)**.
 >
 > **Just curious?** One container, zero setup, time-travel SQL in 30 seconds:
 > `docker run --rm -p 6033:6033 ghcr.io/dbtrail/bintrail-demo` — see
-> [the demo image](docs/demo.md). (amd64 image; on Apple Silicon it runs
-> under emulation — the main bintrail image above is multi-arch.)
+> [the demo image](docs/demo.md).
 
 ## How it works
 
@@ -80,9 +86,10 @@ requires the token from the URL.
 </div>
 
 The index is self-contained: recovery never needs the original binlog files,
-and old partitions rotate out to Parquet (queried transparently, locally or
-from S3). Time-travel SQL (`AS OF`) is served by a MySQL-protocol shim behind
-ProxySQL — your clients keep speaking plain MySQL.
+and old partitions rotate out to Parquet files — on local disk or in any
+S3-compatible bucket (S3, MinIO, …); no cloud account needed. Queries read
+them transparently either way. Time-travel SQL (`AS OF`) is served by a
+MySQL-protocol shim behind ProxySQL — your clients keep speaking plain MySQL.
 
 ## Documentation
 
