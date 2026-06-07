@@ -410,6 +410,23 @@ bintrail recover
 
 ---
 
+## Built-in Rotation in `bintrail up`
+
+`bintrail up` runs a built-in rotation loop **by default**: every hour it drops index partitions older than 30 days and keeps 3 future hourly partitions ready. It covers the boot index database *and* every per-source database the console control plane provisions (`bintrail_idx_<entry>`), so an unattended quickstart can never grow until the disk fills. The settings are announced loudly at boot.
+
+```sh
+bintrail up ... --rotate-retain 90d        # keep more history
+bintrail up ... --rotate-retain off        # disable entirely
+BINTRAIL_ROTATE_RETAIN=7d bintrail up ...  # env form (also _INTERVAL, _ADD_FUTURE)
+```
+
+**Safety guards** (two, independent):
+
+1. **Upgrade guard** — if you never set `--rotate-retain` (running on the implicit default) and the index already holds history extending beyond *twice* the window (>60d on the 30d default), the loop refuses to drop it: that depth of history means a deployment that predates built-in rotation, and an operator who never chose a retention must not lose months of forensic record to a binary upgrade. It logs an Error each cycle until you choose: `--rotate-retain 30d` to confirm the default, a larger window to keep more, or `off`. Fresh installs never trip this guard.
+2. **Archive guard** — the built-in rotation never archives, so it defers to any archiving flow it detects. If `archive_state` shows the index has *ever* been archived (e.g. your own `rotate --archive-dir` cron), the built-in loop only drops partitions that are already archived — partitions past retention but not yet archived are left for your cron, with a warning logged. An index with no archiving history rotates unconditionally (the bounded-volume quickstart behavior).
+
+If rotation makes no progress it should have — failing, deferring partitions to a stalled archiving flow, or any mix of the two — for 3 consecutive cycles, the loop escalates to an explicit Error in the logs: the index is growing unbounded and needs attention. The explicit `bintrail rotate` command is unaffected by all of the above: it keeps its unguarded, operator-asked-for-it semantics.
+
 ## Automating Rotation
 
 In production, run `bintrail rotate` from an hourly cron job or systemd timer. A typical setup:

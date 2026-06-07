@@ -66,6 +66,10 @@ var (
 	upConsoleBaselineDir string
 	upConsoleBaselineS3  string
 	upConsoleServersFile string
+
+	upRotateRetain    string
+	upRotateInterval  string
+	upRotateAddFuture int
 )
 
 func init() {
@@ -86,6 +90,9 @@ func init() {
 	upCmd.Flags().StringVar(&upConsoleBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots; enables the console's point-in-time Reconstruct surface when --console is set")
 	upCmd.Flags().StringVar(&upConsoleBaselineS3, "baseline-s3", "", "S3 prefix of baseline Parquet snapshots (s3://bucket/prefix/); enables Reconstruct when --console is set")
 	upCmd.Flags().StringVar(&upConsoleServersFile, "console-servers-file", "", "Path to the console server registry YAML when --console is set (default ~/.config/bintrail/console-servers.yaml)")
+	upCmd.Flags().StringVar(&upRotateRetain, "rotate-retain", "30d", "Built-in rotation: drop index partitions older than this (Nd/Nh; \"off\" disables)")
+	upCmd.Flags().StringVar(&upRotateInterval, "rotate-interval", "1h", "Built-in rotation: how often to run a rotation cycle")
+	upCmd.Flags().IntVar(&upRotateAddFuture, "rotate-add-future", 3, "Built-in rotation: keep at least N future hourly partitions ready")
 	// --source-dsn is validated in runUp instead of MarkFlagRequired: with
 	// --console the daemon may start source-less (zero-config install) and
 	// sources are added from the UI.
@@ -97,6 +104,16 @@ func init() {
 func runUp(cmd *cobra.Command, args []string) error {
 	if !cliutil.IsValidOutputFormat(upFormat) {
 		return fmt.Errorf("invalid --format %q; must be text or json", upFormat)
+	}
+	// Validate the built-in rotation settings up front so a typo fails fast,
+	// before any phase runs. The loop itself starts with phase 3. The Changed
+	// check covers flag and env alike (bindCommandEnv marks env-set flags
+	// Changed); an explicitly-chosen retention disables the upgrade guard.
+	var err error
+	upRotationCfg, err = parseUpRotation(upRotateRetain, upRotateInterval, upRotateAddFuture,
+		cmd.Flags().Changed("rotate-retain"))
+	if err != nil {
+		return err
 	}
 	// --source-dsn is required for the classic single-stream `up`, but with
 	// --console the daemon can start with NO source at all: it serves the
@@ -220,6 +237,13 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry)
 	cfg.MonitorCtrl = supervisor
 
+	// Built-in rotation covers the boot index plus every per-source database
+	// the control plane provisions — the unattended quickstart's real data
+	// lives in the latter.
+	startUpRotation(ctx, upRotationCfg, func() []string {
+		return append([]string{upIndexDSN}, supervisor.ActiveIndexDSNs()...)
+	})
+
 	srv, err := console.New(cfg)
 	if err != nil {
 		return err
@@ -283,6 +307,16 @@ func runUpStream(cmd *cobra.Command, args []string) error {
 	populateStreamFlags(serverID)
 
 	if !upConsole {
+		// Classic single-stream up: rotate the boot index only. The loop gets
+		// its own signal-bound context (cmd's root context is never cancelled
+		// by SIGINT — runStream installs its handler on a derived child), so
+		// rotation stops when the stream starts draining, same as the console
+		// paths.
+		rotCtx, rotStop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+		defer rotStop()
+		startUpRotation(rotCtx, upRotationCfg, func() []string {
+			return []string{upIndexDSN}
+		})
 		return runStream(cmd, args)
 	}
 	return runUpStreamWithConsole(cmd, args)
@@ -339,6 +373,12 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// the HTTP requests that start them.
 	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry)
 	cfg.MonitorCtrl = supervisor
+
+	// Built-in rotation: boot index + every per-source database the control
+	// plane provisions, on the daemon lifecycle.
+	startUpRotation(ctx, upRotationCfg, func() []string {
+		return append([]string{upIndexDSN}, supervisor.ActiveIndexDSNs()...)
+	})
 
 	// With the console comes the multi-stream control plane, so /metrics is
 	// served once at the daemon level (per-source "source" labels keep the
