@@ -150,21 +150,13 @@ Run the index database on a separate MySQL instance from the source. This provid
 
 ### Sizing
 
-Event storage baseline: ~500 bytes/event (varies with row width and JSON column content).
+Expect roughly **1.2–1.6 KB per indexed event** for a typical ~15-column OLTP row (INSERT/DELETE ≈ 1.2 KB, UPDATE ≈ 1.6 KB — an UPDATE stores both the before and after row images), measured with all indexes included. Narrow rows run ~0.9 KB; wide or update-heavy workloads run several times higher.
 
 ```
-required_storage_GB = daily_events × retention_days × avg_event_bytes / 1e9
+required_storage_GB = daily_events × retain_days × avg_event_bytes / 1e9
 ```
 
-Example: 1 million events/day × 30 days × 800 bytes = ~24 GB
-
-Add 30% overhead for InnoDB page structure, indexes, and partition metadata.
-
-Monitor `information_schema.PARTITIONS` (the `TABLE_ROWS` estimate) and disk usage with:
-
-```bash
-bintrail status --index-dsn "$INDEX_DSN"
-```
+For the full model — measured per-event-type sizes, worked examples, retention and Parquet-tiering math, multi-source sizing, and monitoring — see [Capacity Planning](./capacity.md).
 
 ### InnoDB tuning
 

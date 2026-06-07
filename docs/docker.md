@@ -164,7 +164,8 @@ backups — volume loss = re-index). For production, set `INDEX_DSN` in
 `.env` to a MySQL 8.0+ you operate and remove the `index-mysql` service
 from the compose file. Bintrail installs only its schema there; the
 server's sizing, backups, and upgrades are yours — see
-[deployment.md](./deployment.md) and [SUPPORT.md](../SUPPORT.md).
+[Capacity Planning](./capacity.md), [deployment.md](./deployment.md), and
+[SUPPORT.md](../SUPPORT.md).
 
 ## Environment variables
 

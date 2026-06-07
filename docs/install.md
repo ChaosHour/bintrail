@@ -54,8 +54,8 @@ re-indexing. It exists so the four lines above need zero prerequisites.
 afterthought): set `INDEX_DSN` in `.env` to a MySQL 8.0+ you operate, and
 remove the bundled `index-mysql` service. The index becomes your system of
 record: sizing, InnoDB tuning, and backups are yours to run — see
-[deployment.md §3](./deployment.md) and the support boundary in
-[SUPPORT.md](../SUPPORT.md). Bintrail installs and migrates only its schema
+[Capacity Planning](./capacity.md), [deployment.md §3](./deployment.md),
+and the support boundary in [SUPPORT.md](../SUPPORT.md). Bintrail installs and migrates only its schema
 on whatever server you point it at.
 
 All the optional knobs (pinned console token, schema filter, image tag)

@@ -283,6 +283,7 @@ bintrail status        ← check at any time
 | Use RDS, Aurora, or Cloud SQL | [Streaming](./streaming.md) |
 | Understand the query and recovery options in depth | [Query and Recovery](./query-and-recovery.md) |
 | Archive old events to S3 before dropping | [Rotation and Status](./rotation-and-status.md#archiving-partitions-to-parquet) |
+| Plan disk space for the index MySQL | [Capacity Planning](./capacity.md) |
 | Use AI (Claude) to investigate changes | [MCP Server](./mcp-server.md) |
 | Set up cron, systemd, Docker | [Guide](./guide.md) |
 | Understand server identity and access flags | [Server Identity](./server-identity.md) |

@@ -344,7 +344,7 @@ S3 uploaded:    168 partitions
 
 This section is loaded best-effort — if the `archive_state` table does not exist (older index databases created before the archiving feature), the section is silently omitted.
 
-The row counts in the partitions section are **estimates** from `information_schema.PARTITIONS.TABLE_ROWS`. InnoDB doesn't maintain exact row counts, so these are good approximations for capacity planning but not for exact totals.
+The row counts in the partitions section are **estimates** from `information_schema.PARTITIONS.TABLE_ROWS`. InnoDB doesn't maintain exact row counts, so these are good approximations for capacity planning but not for exact totals. For turning these estimates into a disk forecast, see [Capacity Planning](./capacity.md).
 
 ---
 

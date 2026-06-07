@@ -32,8 +32,9 @@ architectural and permanent.
 The **operation of the index MySQL server** is the operator's responsibility
 in the free core — all of it:
 
-- Sizing, InnoDB tuning, and capacity planning (see
-  [deployment.md §3](docs/deployment.md)).
+- Sizing, InnoDB tuning, and capacity planning — the math is documented
+  in [Capacity Planning](docs/capacity.md); running the numbers and the
+  disk is yours.
 - Backups and restore of the index server, and replication of the index
   itself.
 - Disk-full conditions, corruption, and crash recovery of the server.
