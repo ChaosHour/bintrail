@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-06-07
+
+### Fixed
+- **Compressed transactions (`binlog_transaction_compression=ON`) are now indexed — previously every compressed transaction was silently skipped** (#414). MySQL 8.0.20+ wraps each transaction's events (BEGIN + table map + rows + commit) in a single zstd-compressed `Transaction_payload` event, with only the GTID event outside the wrapper — so bintrail saw the GTID, advanced the checkpoint, and indexed **zero rows**, with healthy-looking metrics over an empty index. All modes were affected equally (`index`, `stream`, `up`, `agent`). Both parser switches now recurse into the payload's pre-decoded inner events; indexed rows carry the payload event's file coordinates (inner headers have no usable positions — MySQL zeroes them, and deriving start_pos from them would underflow). Verified end-to-end against MySQL 8.0.46, where *every* transaction shape gets wrapped when compression is ON — even tiny or incompressible ones — so a compression-enabled source previously yielded nothing at all. If you enable compression: 1GB of binlog now represents ~2.5-4x more logical row-changes, so expect index partitions to scale accordingly (`performance_schema.binary_log_transaction_compression_stats` reports your actual ratio). Known edge: NONE-typed payload wrappers (never observed on 8.0.46) would fail loudly at parse, not silently.
+
 ## [0.8.5] - 2026-06-06
 
 ### Added
