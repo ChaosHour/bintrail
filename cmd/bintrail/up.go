@@ -143,8 +143,23 @@ func runUp(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(os.Stderr)
 	} else if !upSkipDoctor {
 		fmt.Fprintln(os.Stderr, "=== Phase 1/3: Preflight checks ===")
-		if err := runDoctorTo(cmd.Context(), os.Stderr, "text", upSourceDSN, upIndexDSN, upSchemas); err != nil {
-			return fmt.Errorf("preflight failed (use --skip-doctor to bypass at your own risk): %w", err)
+		// The capacity projection uses up's actual rotation window (0 when
+		// built-in rotation is disabled → it reports unbounded growth). Its
+		// FAIL is ADVISORY here: blocking the stream over a disk forecast
+		// would manufacture the very forensic gap it warns about (an
+		// unattended reboot would crash-loop instead of capturing while
+		// there is still room). Standalone `doctor` keeps full FAIL
+		// semantics for CI.
+		preflight := buildDoctorReport(cmd.Context(), upSourceDSN, upIndexDSN, upSchemas, upRotationCfg.retain)
+		if err := preflight.Write(os.Stderr, "text"); err != nil {
+			return fmt.Errorf("write preflight report: %w", err)
+		}
+		fatal, warnCapacity := upPreflightOutcome(preflight)
+		if fatal != nil {
+			return fmt.Errorf("preflight failed (use --skip-doctor to bypass at your own risk): %w", fatal)
+		}
+		if warnCapacity {
+			fmt.Fprintln(os.Stderr, "WARNING: the index disk capacity check FAILED — starting anyway (capturing beats not capturing), but act on its remediation before the volume fills.")
 		}
 		fmt.Fprintln(os.Stderr)
 	}
@@ -163,6 +178,19 @@ func runUp(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Fprintln(os.Stderr, "=== Phase 3/3: Streaming ===")
 	return runUpStream(cmd, args)
+}
+
+// upPreflightOutcome maps the preflight report to up's boot decision: fatal
+// is non-nil for any non-advisory failure (boot refused); warnCapacity is
+// true when the capacity projection was the ONLY failure — boot proceeds,
+// but the operator must hear about it (the caller prints the WARNING).
+// Extracted so the advisory semantics are unit-testable: losing either half
+// would silently change what blocks `up` or swallow the disk-full signal.
+func upPreflightOutcome(r *doctorReport) (fatal error, warnCapacity bool) {
+	if err := r.ErrExcluding(capacityCheckName); err != nil {
+		return err, false
+	}
+	return nil, r.Err() != nil
 }
 
 // waitForIndexMySQL retries a server-level connection (database name
