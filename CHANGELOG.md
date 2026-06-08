@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-06-08
+
 ### Added
 - **`doctor` now projects index disk capacity** (#419): a new "Index disk capacity" check measures the index's real write rate from the last 24 hours of partition statistics (events/day × bytes/event — the docs/capacity.md formula with live numbers) and projects the steady-state footprint over the retention window (`--retain`, default `30d`; `off` if you don't rotate). When the index MySQL is on the same host (loopback/socket DSN), it also probes the datadir's free space: FAIL when the projection exceeds it (with the emergency-rotate remediation), WARN above 70%. With rotation disabled it warns that the index grows unbounded at the measured rate, including days-until-full when free space is measurable. Runs in `bintrail up`'s preflight with the configured `--rotate-retain` — the compose default gets the sizing preflight on every boot. Fresh indexes with under a few hours of history SKIP rather than guess.
 
