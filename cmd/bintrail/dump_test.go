@@ -117,10 +117,10 @@ func TestBuildMydumperArgs_lockAndTrx_unsupported(t *testing.T) {
 
 func TestParseMydumperVersion(t *testing.T) {
 	cases := []struct {
-		name                                string
-		output                              string
+		name                            string
+		output                          string
 		wantMajor, wantMinor, wantPatch int
-		wantErr                             bool
+		wantErr                         bool
 	}{
 		{
 			name:      "standard_0.10.0",
@@ -501,7 +501,7 @@ func TestRunDump_invalidSourceDSN(t *testing.T) {
 	})
 
 	dumpCmd.Flags().Set("mydumper-path", fakeBin)
-	dmpSourceDSN = "root@unix(/var/run/mysqld.sock)/" // unix socket → rejected by parseSourceDSN
+	dmpSourceDSN = "root@unix(/var/run/mysqld.sock)/" // unix socket → rejected by config.ParseSourceDSN
 
 	err := runDump(dumpCmd, nil)
 	if err == nil {
