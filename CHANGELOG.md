@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-09
+
+### Changed
+- **BREAKING — the web console is now its own binary, `bintrail-console`; the core `bintrail` CLI is UI-free** (#442, #445, #446). `bintrail console` → **`bintrail-console serve`** (same flags, same env vars) and `bintrail up --console` → **`bintrail-console watch`** (the combined preflight + init + stream + console + multi-server control-plane daemon; same `--console-*`, `--baseline-*`, and `--rotate-*` flags and `BINTRAIL_*` env vars). Core `bintrail up` is the classic stream-only quickstart again — every `--console*` flag is gone. Why: dbtrail (the SaaS) runs the bintrail executable and has its own UI, so the core carrying an embedded web console was dead weight and attack surface; the split follows the existing `bintrail-mcp` multi-binary pattern, and a structural test now guarantees the core binary never links the console again. The control-plane supervisor, its states (`pending`/`stalled`/`lost_position`), the circuit breaker, replica detection, and per-source rotation coverage all move to `watch` unchanged.
+  - **Docker Compose users**: the quickstart now runs `bintrail-console watch` from the new `ghcr.io/dbtrail/bintrail-console` image. An OLD `docker-compose.yml` crash-loops after pulling this release (`unknown flag: --console`) — re-download the compose file; your `.env` and all data volumes (index data/secret, saved console servers) carry over unchanged.
+- `bintrail config init` no longer advertises the `BINTRAIL_CONSOLE_*` variables — they belong to the `bintrail-console` binary, which reads the same `.bintrail.env`/`config.env` files.
+
+### Added
+- **`bintrail-console` ships as its own artifacts** (#446): a `ghcr.io/dbtrail/bintrail-console` Docker image (multi-arch, cosign-signed, entrypoint `bintrail-console`), a separate `bintrail-console` deb/rpm package (the `bintrail` package stays UI-free), and the binary in every release archive. Build from source with `make build-console` or `docker build -f Dockerfile.bintrail-console .`.
+
 ## [0.8.7] - 2026-06-08
 
 ### Added
