@@ -1,5 +1,12 @@
 version: 2
 
+# Pinned: without this, GoReleaser infers the project name from the repository,
+# and renaming the repo (dbtrail/bintrail → dbtrail/dbtrail) would silently
+# rename every release artifact. The `bintrail_<version>_<os>_<arch>.tar.gz`
+# naming is a contract: the dbtrail SaaS deploy pipeline and published install
+# instructions download tarballs by this exact pattern.
+project_name: bintrail
+
 builds:
   - id: bintrail
     binary: bintrail

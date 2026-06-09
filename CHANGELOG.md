@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-06-09
+
+### Changed
+- **The project is moving to `github.com/dbtrail/dbtrail`** — the bintrail brand is retired in favor of dbtrail open source. This is the final release under the `github.com/dbtrail/bintrail` module path; its `go.mod` now carries the Go module deprecation notice pointing at the new path, so `go install github.com/dbtrail/bintrail/...@latest` keeps working but prints the redirect. Nothing else changes in this release: binary names, package names, Docker image names, `BINTRAIL_*` environment variables, config paths, and all on-disk/data identifiers are untouched. GitHub serves permanent redirects from the old repository URLs (clone, releases, raw).
+- GoReleaser `project_name` is pinned to `bintrail` so release artifact names (`bintrail_<version>_<os>_<arch>.tar.gz`, deb/rpm) stay stable across the repository rename instead of silently following the new repo name.
+
 ## [0.9.0] - 2026-06-09
 
 ### Changed
