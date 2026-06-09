@@ -210,8 +210,8 @@ func TestLoadPartitionStats(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
 	// Create table with 3 daily partitions + p_future.
-	if err := createBinlogEventsTable(db, 3, false); err != nil {
-		t.Fatalf("createBinlogEventsTable failed: %v", err)
+	if err := indexer.CreateIndexTables(context.Background(), db, 3, false, nil); err != nil {
+		t.Fatalf("indexer.CreateIndexTables failed: %v", err)
 	}
 
 	stats, err := status.LoadPartitionStats(context.Background(), db, dbName)
@@ -234,7 +234,7 @@ func TestLoadPartitionStats(t *testing.T) {
 	}
 }
 
-// ─── ensureDatabase ────────────────────────────────────────────────────────────────
+// ─── indexer.EnsureDatabase ────────────────────────────────────────────────────────────────
 
 func TestEnsureDatabase(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
@@ -254,8 +254,8 @@ func TestEnsureDatabase(t *testing.T) {
 		rootDB.Exec("DROP DATABASE IF EXISTS `" + dbName + "`")
 	})
 
-	if err := ensureDatabase(cfg, dbName); err != nil {
-		t.Fatalf("ensureDatabase failed: %v", err)
+	if err := indexer.EnsureDatabase(cfg, dbName, nil); err != nil {
+		t.Fatalf("indexer.EnsureDatabase failed: %v", err)
 	}
 
 	// Verify database exists.
@@ -265,30 +265,8 @@ func TestEnsureDatabase(t *testing.T) {
 	}
 
 	// Calling again should succeed (idempotent).
-	if err := ensureDatabase(cfg, dbName); err != nil {
+	if err := indexer.EnsureDatabase(cfg, dbName, nil); err != nil {
 		t.Fatalf("second ensureDatabase call failed: %v", err)
-	}
-}
-
-// ─── createBinlogEventsTable ─────────────────────────────────────────────────────────────
-
-func TestCreateBinlogEventsTable(t *testing.T) {
-	db, dbName := testutil.CreateTestDB(t)
-
-	if err := createBinlogEventsTable(db, 3, false); err != nil {
-		t.Fatalf("createBinlogEventsTable failed: %v", err)
-	}
-
-	// Verify the table has 4 partitions (3 hourly + p_future).
-	var count int
-	if err := db.QueryRow(`
-		SELECT COUNT(*) FROM information_schema.PARTITIONS
-		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'binlog_events'`,
-		dbName).Scan(&count); err != nil {
-		t.Fatalf("query partitions failed: %v", err)
-	}
-	if count != 4 {
-		t.Errorf("expected 4 partitions, got %d", count)
 	}
 }
 
@@ -297,8 +275,8 @@ func TestCreateBinlogEventsTable(t *testing.T) {
 func TestListPartitions(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
-	if err := createBinlogEventsTable(db, 3, false); err != nil {
-		t.Fatalf("createBinlogEventsTable failed: %v", err)
+	if err := indexer.CreateIndexTables(context.Background(), db, 3, false, nil); err != nil {
+		t.Fatalf("indexer.CreateIndexTables failed: %v", err)
 	}
 
 	parts, err := listPartitions(context.Background(), db, dbName)
@@ -328,8 +306,8 @@ func TestListPartitions(t *testing.T) {
 func TestDropPartitions(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 
-	if err := createBinlogEventsTable(db, 5, false); err != nil {
-		t.Fatalf("createBinlogEventsTable failed: %v", err)
+	if err := indexer.CreateIndexTables(context.Background(), db, 5, false, nil); err != nil {
+		t.Fatalf("indexer.CreateIndexTables failed: %v", err)
 	}
 
 	// List the first partition to drop.
@@ -514,8 +492,8 @@ func TestArchivePartition_empty(t *testing.T) {
 // initServerTables creates bintrail_servers and bintrail_server_changes in db.
 func initServerTables(t *testing.T, db *sql.DB) {
 	t.Helper()
-	testutil.MustExec(t, db, ddlBintrailServers)
-	testutil.MustExec(t, db, ddlBintrailServerChanges)
+	testutil.MustExec(t, db, serverid.DDLBintrailServers)
+	testutil.MustExec(t, db, serverid.DDLBintrailServerChanges)
 }
 
 // countChanges returns the number of rows in bintrail_server_changes for the given bintrail_id.
