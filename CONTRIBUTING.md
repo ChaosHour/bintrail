@@ -11,8 +11,8 @@ Thank you for your interest in contributing. This document covers how to get set
 ## Getting started
 
 ```sh
-git clone https://github.com/dbtrail/bintrail
-cd bintrail
+git clone https://github.com/dbtrail/dbtrail
+cd dbtrail
 go mod download
 go build ./...
 go test ./...

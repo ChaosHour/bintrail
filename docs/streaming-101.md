@@ -29,8 +29,8 @@ Source MySQL ──replication──► bintrail stream ──► Index MySQL (b
 ### Install bintrail
 
 ```bash
-git clone https://github.com/dbtrail/bintrail
-cd bintrail
+git clone https://github.com/dbtrail/dbtrail
+cd dbtrail
 make all
 sudo cp bintrail /usr/local/bin/
 sudo cp bintrail-mcp /usr/local/bin/
