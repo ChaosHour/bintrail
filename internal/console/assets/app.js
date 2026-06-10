@@ -1,4 +1,4 @@
-// bintrail console — vanilla-JS SPA over the read-only JSON API.
+// dbtrail console — vanilla-JS SPA over the read-only JSON API.
 //
 // No frameworks, no bundler, no third-party code (see assets/VENDOR.md). The
 // design system lives in style.css; this file renders the sidebar-shell UI into
@@ -641,12 +641,12 @@ function csvCell(v) {
   return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 function downloadEventsJSON(events) {
-  downloadBlob("bintrail-events.json", JSON.stringify(events || [], null, 2), "application/json");
+  downloadBlob("dbtrail-events.json", JSON.stringify(events || [], null, 2), "application/json");
 }
 function downloadEventsCSV(events) {
   const lines = [EVENT_CSV_COLUMNS.join(",")];
   (events || []).forEach((ev) => lines.push(EVENT_CSV_COLUMNS.map((c) => csvCell(ev[c])).join(",")));
-  downloadBlob("bintrail-events.csv", lines.join("\r\n"), "text/csv");
+  downloadBlob("dbtrail-events.csv", lines.join("\r\n"), "text/csv");
 }
 
 // ── Recover ────────────────────────────────────────────────────────────────
@@ -794,7 +794,7 @@ function codePanel(sql, metaLabel) {
 function copySQL() {
   navigator.clipboard.writeText(lastSQL).then(() => toast("SQL copied to clipboard"), () => toast("copy failed"));
 }
-function downloadSQL() { downloadBlob("bintrail-undo.sql", lastSQL, "application/sql"); }
+function downloadSQL() { downloadBlob("dbtrail-undo.sql", lastSQL, "application/sql"); }
 
 // Bridge: an event → Recover, scoped to that row up to the event's timestamp.
 function undoEvent(e) {
@@ -1127,10 +1127,10 @@ function buildServersModal() {
   const head = el("div", { class: "modal-head" });
   head.append(el("h2", { class: "modal-title", text: "Servers" }));
   const desc = el("p", { class: "modal-desc" },
-    "Named connections to bintrail index databases, stored in a local file on the console host. ");
+    "Named connections to dbtrail index databases, stored in a local file on the console host. ");
   desc.append(el("span", { "data-capability": "monitor" },
     "This process can also ", el("b", { text: "monitor" }),
-    " a source MySQL: add one below and bintrail runs the preflight checks, provisions an index for it, and starts streaming — no terminal needed."));
+    " a source MySQL: add one below and dbtrail runs the preflight checks, provisions an index for it, and starts streaming — no terminal needed."));
   head.append(desc);
   head.append(el("button", { class: "modal-x", type: "button", text: "✕", onclick: closeServersModal }));
   modal.append(head);
@@ -1218,7 +1218,7 @@ function buildServerForm() {
 
   const mon = el("fieldset", { class: "form-section", "data-capability": "monitor" });
   mon.append(el("legend", { class: "form-legend", text: "Monitor a source MySQL" }));
-  mon.append(el("p", { class: "form-hint", text: "Paste the server to watch — bintrail runs the preflight checks, provisions an index for it, and starts streaming. Leave the index section empty; it is created automatically." }));
+  mon.append(el("p", { class: "form-hint", text: "Paste the server to watch — dbtrail runs the preflight checks, provisions an index for it, and starts streaming. Leave the index section empty; it is created automatically." }));
   const monGrid = el("div", { class: "form-grid" });
   monGrid.append(srvField("Source host", "source_host", { placeholder: "db.example.com" }));
   monGrid.append(srvField("Source port", "source_port", { placeholder: "3306" }));
@@ -1354,7 +1354,7 @@ function testResultText(res) {
   if (res.server_version) s += " · MySQL " + res.server_version;
   // has_index/schema_current are tri-state: absent = the metadata lookup itself
   // failed (unknown) — never render that as the confident negative.
-  if (res.has_index === false) s += " · no binlog_events table (not a bintrail index?)";
+  if (res.has_index === false) s += " · no binlog_events table (not a dbtrail index?)";
   else if (res.has_index === undefined || res.schema_current === undefined) s += " · index metadata unavailable";
   else if (res.schema_current === false) s += " · index schema outdated (run bintrail index/stream once)";
   return s;

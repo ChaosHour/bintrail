@@ -1,16 +1,16 @@
 # Support scope
 
-This document is the canonical statement of what the bintrail project does
+This document is the canonical statement of what the dbtrail project does
 and does not support. Issue triage links here; reports outside this scope
 are closed with a pointer to this file.
 
 ## The contract
 
-Bintrail's contract with your infrastructure is one line:
+dbtrail's contract with your infrastructure is one line:
 
 > **A reachable MySQL 8.0+ via `--index-dsn`.**
 
-Bintrail installs and versions **its own schema** on that server — databases
+dbtrail installs and versions **its own schema** on that server — databases
 (`CREATE DATABASE IF NOT EXISTS`), tables, and idempotent migrations, via
 `init`, `up`, and the console control plane. The **bintrail binary** never
 installs, supervises, or operates a mysqld **on the host** (no apt/yum
@@ -27,7 +27,7 @@ ship-vs-operate boundary below.
 - The bintrail binaries and their commands, flags, and documented behavior.
 - The index **schema**: its tables, migrations, and data correctness
   (every row event, full before/after images).
-- Bintrail's own tooling for operating the index *data*: `rotate`, `status`,
+- dbtrail's own tooling for operating the index *data*: `rotate`, `status`,
   `doctor`, `archive reconcile`, Parquet archives and their queries.
 - The web console, the MCP server, the time-travel shim.
 - The Docker images we publish, **including the pinned MySQL 8.4 index image
@@ -59,7 +59,8 @@ builds and the schema/migrations on them; the *operation* of whatever server
 you actually run — BYO or bundled — is not part of our defect matrix.
 
 > Want the index **operated** for you — sized, backed up, upgraded, kept
-> alive on-call? That is exactly what [dbtrail](https://dbtrail.com) is.
+> alive on-call? That is exactly what the managed service at
+> [dbtrail.com](https://dbtrail.com) is for.
 
 ## The bundled MySQL 8.4 index: we ship it, you operate it
 
@@ -76,15 +77,15 @@ The boundary triage cites:
 - **You operate it.** The running instance is yours: disk and disk-full,
   backups and restore, corruption and crash recovery, and *executing* the
   upgrades we document. **Volume loss = re-index** (back up the
-  `bintrail-index-data` + `bintrail-index-secret` volumes together). dbtrail
-  operates it for you in the paid tier.
+  `bintrail-index-data` + `bintrail-index-secret` volumes together). The
+  managed tier at [dbtrail.com](https://dbtrail.com) operates it for you.
 - **BYO stays co-equal.** Set `INDEX_DSN` in `.env` to a MySQL 8.0+ you run
   and remove the bundled `index-init` + `index-mysql` services (see
   [docker.md](docs/docker.md)) — same ship-vs-operate split, your server.
 
 ## Reporting issues
 
-Bugs in bintrail's binaries, schema, tooling, console, or docs: please open
+Bugs in dbtrail's binaries, schema, tooling, console, or docs: please open
 an issue with reproduction steps — those are always in scope. If your report
 is about the index MySQL server's own operation (disk, backups, upgrades,
 corruption), see the list above first.
