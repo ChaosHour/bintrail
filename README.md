@@ -14,7 +14,7 @@ SELECT * FROM orders WHERE id = 123 AS OF '2026-05-20 14:00:00'
 
 *— against production MySQL. That's the experience dbtrail makes possible.*
 
-<img src="docs/img/console-events.png" alt="dbtrail console: every row change with before/after diffs" width="850">
+<img src="docs/img/console-overview.png" alt="dbtrail console: what changed recently and where — every row change indexed, deletes surfaced first" width="850">
 
 </div>
 
