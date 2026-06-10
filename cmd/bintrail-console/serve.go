@@ -29,9 +29,12 @@ console NEVER executes SQL; recover produces a script you review and apply
 yourself.
 
 Security:
-  - Binds to loopback (127.0.0.1) by default and requires an access token.
-  - A token is auto-generated for loopback binds and printed in the URL.
-  - Binding to a non-loopback address REQUIRES an explicit --token.
+  - Binds to loopback (127.0.0.1) by default. Username+password login is the
+    primary credential: on a fresh loopback console the first visit creates
+    the password in the browser (or set it up front with 'user set-password').
+  - A non-loopback bind needs a credential: a configured password, an explicit
+    --token (opt-in automation), or --allow-setup (assert the bind is
+    access-controlled) — otherwise it is refused.
 
 Example:
   bintrail-console serve --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"`,
@@ -51,12 +54,13 @@ var (
 	conAuthFile     string
 	conTLSCert      string
 	conTLSKey       string
+	conAllowSetup   bool
 )
 
 func init() {
 	serveCmd.Flags().StringVar(&conIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required unless the server registry has entries)")
 	serveCmd.Flags().StringVar(&conListen, "listen", "127.0.0.1:8090", "Address to listen on (host:port)")
-	serveCmd.Flags().StringVar(&conToken, "token", "", "Access token (auto-generated for loopback binds when empty)")
+	serveCmd.Flags().StringVar(&conToken, "token", "", "Opt-in static token for API automation (never generated; humans use the console password)")
 	serveCmd.Flags().BoolVar(&conNoArchive, "no-archive", false, "Disable Parquet archive auto-discovery (MySQL-only)")
 	serveCmd.Flags().StringVar(&conProfile, "profile", "", "RBAC profile: deny tables / redact columns; forces --no-archive")
 	serveCmd.Flags().StringSliceVar(&conAllowedHosts, "allowed-hosts", nil, "Extra hostnames allowed in the Host header (for reverse-proxy setups; IP literals and localhost are always allowed)")
@@ -66,6 +70,7 @@ func init() {
 	serveCmd.Flags().StringVar(&conAuthFile, "auth-file", "", "Path to the console auth file enabling password login (default ~/.config/bintrail/console-auth.yaml; created with `bintrail-console user set-password`)")
 	serveCmd.Flags().StringVar(&conTLSCert, "tls-cert", "", "TLS certificate file (PEM); serve the console over HTTPS (requires --tls-key)")
 	serveCmd.Flags().StringVar(&conTLSKey, "tls-key", "", "TLS private key file (PEM; requires --tls-cert)")
+	serveCmd.Flags().BoolVar(&conAllowSetup, "allow-setup", false, "Allow browser first-run password setup on a non-loopback bind (assert the bind is access-controlled, e.g. published only on the host loopback)")
 	rootCmd.AddCommand(serveCmd)
 }
 
@@ -127,6 +132,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if !cmd.Flags().Changed("allowed-hosts") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_ALLOWED_HOSTS"); v != "" {
 			conAllowedHosts = strings.Split(v, ",")
+		}
+	}
+	if !cmd.Flags().Changed("allow-setup") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_ALLOW_SETUP"); v == "1" || v == "true" {
+			conAllowSetup = true
 		}
 	}
 
@@ -214,6 +224,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		AuthPath:      conAuthFile,
 		TLSCert:       conTLSCert,
 		TLSKey:        conTLSKey,
+		AllowSetup:    conAllowSetup,
 		// MonitorCtrl is intentionally left nil: bintrail-console serve is the
 		// read-only standalone console. A write-capable control-plane daemon
 		// wires a supervisor here instead; with nil, /api/capabilities reports
@@ -235,14 +246,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// printConsoleBanner prints the startup URL. In password mode the URL carries
-// no ?token= (URL() already omits it — a live credential does not belong in
-// logs or shell history) and the sign-in hint is printed instead; an
-// explicitly configured token stays valid for automation but its value is
-// never echoed.
+// printConsoleBanner prints the startup URL plus a credential hint keyed to
+// the console's mode. The URL never carries a ?token= unless an explicit token
+// is the only credential (URL() handles that); a live credential does not
+// belong in logs or shell history.
 func printConsoleBanner(srv *console.Server, headline string) {
 	fmt.Fprintf(os.Stderr, "\n%s\n\n    %s\n\n", headline, srv.URL())
-	if srv.PasswordLogin() {
+	switch {
+	case srv.NeedsSetup():
+		// First run, loopback, no credential: the browser creates the password.
+		fmt.Fprintf(os.Stderr, "First run — open the URL and create your console username and password.\n\n")
+	case srv.PasswordLogin():
 		fmt.Fprintf(os.Stderr, "Sign in with your console username and password.\n")
 		if srv.Token() != "" {
 			fmt.Fprintf(os.Stderr, "(The configured access token also remains valid, for API automation.)\n")

@@ -72,6 +72,7 @@ var (
 	upConsoleTLSCert     string
 	upConsoleTLSKey      string
 	upConsoleAllowedHost []string
+	upConsoleAllowSetup  bool
 
 	upRotateRetain    string
 	upRotateInterval  string
@@ -140,7 +141,7 @@ func init() {
 	watchCmd.Flags().BoolVar(&upSkipDoctor, "skip-doctor", false, "Skip the preflight checks (useful when you've already verified with `bintrail doctor`)")
 	watchCmd.Flags().StringVar(&upFormat, "format", "text", "Output format: text or json")
 	watchCmd.Flags().StringVar(&upConsoleListen, "console-listen", "127.0.0.1:8090", "Console bind address")
-	watchCmd.Flags().StringVar(&upConsoleToken, "console-token", "", "Console access token (auto-generated for loopback binds when empty)")
+	watchCmd.Flags().StringVar(&upConsoleToken, "console-token", "", "Opt-in static token for API automation (never generated; humans use the console password)")
 	watchCmd.Flags().StringVar(&upConsoleBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots; enables the console's point-in-time Reconstruct surface")
 	watchCmd.Flags().StringVar(&upConsoleBaselineS3, "baseline-s3", "", "S3 prefix of baseline Parquet snapshots (s3://bucket/prefix/); enables Reconstruct")
 	watchCmd.Flags().StringVar(&upConsoleServersFile, "console-servers-file", "", "Path to the console server registry YAML (default ~/.config/bintrail/console-servers.yaml)")
@@ -148,6 +149,7 @@ func init() {
 	watchCmd.Flags().StringVar(&upConsoleTLSCert, "console-tls-cert", "", "TLS certificate file (PEM); serve the console over HTTPS (requires --console-tls-key)")
 	watchCmd.Flags().StringVar(&upConsoleTLSKey, "console-tls-key", "", "TLS private key file (PEM; requires --console-tls-cert)")
 	watchCmd.Flags().StringSliceVar(&upConsoleAllowedHost, "console-allowed-hosts", nil, "Extra hostnames allowed in the Host header (for a TLS-terminating reverse proxy); IP literals and localhost are always allowed")
+	watchCmd.Flags().BoolVar(&upConsoleAllowSetup, "console-allow-setup", false, "Allow browser first-run password setup on a non-loopback bind (assert the bind is access-controlled, e.g. published only on the host loopback)")
 	watchCmd.Flags().StringVar(&upRotateRetain, "rotate-retain", "30d", "Built-in rotation: drop index partitions older than this (Nd/Nh; \"off\" disables)")
 	watchCmd.Flags().StringVar(&upRotateInterval, "rotate-interval", "1h", "Built-in rotation: how often to run a rotation cycle")
 	watchCmd.Flags().IntVar(&upRotateAddFuture, "rotate-add-future", 3, "Built-in rotation: keep at least N future hourly partitions ready")
@@ -570,6 +572,11 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 			upConsoleAllowedHost = strings.Split(v, ",")
 		}
 	}
+	if !cmd.Flags().Changed("console-allow-setup") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_ALLOW_SETUP"); v == "1" || v == "true" {
+			upConsoleAllowSetup = true
+		}
+	}
 }
 
 // consoleOpts carries watch's console-surface settings into upConsoleConfig —
@@ -584,6 +591,7 @@ type consoleOpts struct {
 	TLSCert      string
 	TLSKey       string
 	AllowedHosts []string
+	AllowSetup   bool
 }
 
 // upConsoleOpts snapshots the resolved upConsole* globals.
@@ -597,6 +605,7 @@ func upConsoleOpts() consoleOpts {
 		TLSCert:      upConsoleTLSCert,
 		TLSKey:       upConsoleTLSKey,
 		AllowedHosts: upConsoleAllowedHost,
+		AllowSetup:   upConsoleAllowSetup,
 	}
 }
 
@@ -627,6 +636,7 @@ func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Con
 		TLSCert:      opts.TLSCert,
 		TLSKey:       opts.TLSKey,
 		AllowedHosts: opts.AllowedHosts,
+		AllowSetup:   opts.AllowSetup,
 		// MonitorCtrl (the control-plane supervisor) is wired by the caller —
 		// runUpStreamWithConsole / runUpConsoleOnly — because it needs the
 		// registry and the daemon lifecycle context, which this config builder
