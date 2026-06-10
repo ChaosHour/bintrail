@@ -96,6 +96,51 @@ func TestMuxServesAssets(t *testing.T) {
 	}
 }
 
+func TestMuxSPAFallback(t *testing.T) {
+	srv := newTestServer(t)
+	// pushState routes must reload/deep-link to the shell, not 404. The
+	// trailing-slash form rides on path.Clean — a URL shape users produce.
+	for _, p := range []string{"/overview", "/events", "/timetravel", "/recover", "/status", "/events/", "/events?q=pk:1"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "http://127.0.0.1:8090"+p, nil)
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Errorf("%s code = %d, want 200", p, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "dbtrail console") {
+			t.Errorf("%s did not serve the index.html shell", p)
+		}
+	}
+	// Real assets still resolve as themselves, not as the shell.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://127.0.0.1:8090/app.js", nil)
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 || strings.Contains(rec.Body.String(), "<!DOCTYPE html") {
+		t.Errorf("/app.js code = %d, shell = %v; want the JS file itself", rec.Code, strings.Contains(rec.Body.String(), "<!DOCTYPE html"))
+	}
+	// Missing files with an extension stay 404 — the fallback must not mask
+	// broken asset references by serving them HTML.
+	for _, p := range []string{"/favicon.ico", "/app.js.map", "/missing/deep.css"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "http://127.0.0.1:8090"+p, nil)
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != 404 {
+			t.Errorf("%s code = %d, want 404", p, rec.Code)
+		}
+	}
+	// An unknown /api/* path must NEVER receive the shell: today the API
+	// lives on its own inner mux registered ahead of "/", but a refactor
+	// that flattens the muxes (or makes the fallback a NotFound handler)
+	// would turn every API 404 into 200 text/html and break API consumers.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "http://127.0.0.1:8090/api/nonexistent", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != 404 || strings.Contains(rec.Body.String(), "<!DOCTYPE html") {
+		t.Errorf("/api/nonexistent code = %d, shell = %v; want 404 without HTML", rec.Code, strings.Contains(rec.Body.String(), "<!DOCTYPE html"))
+	}
+}
+
 func TestMuxRejectsForeignHost(t *testing.T) {
 	srv := newTestServer(t)
 	rec := httptest.NewRecorder()
