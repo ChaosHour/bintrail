@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The console sign-in overlay no longer renders with its text clipped** (#452). The login gate and password dialog (new in 0.11.0) appended their content directly to a panel whose padding lived on sub-elements they didn't use, so the text jammed against the edges and `overflow: hidden` clipped it. The panel now carries its own padding, and a 401 in token mode reads "This access token is no longer valid." instead of the session-flavored "Session expired — sign in again" (token mode has no session).
+
 ## [0.11.0] - 2026-06-10
 
 ### Added
