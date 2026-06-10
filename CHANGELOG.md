@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-10
+
+### Added
+- **Optional username + password login for `bintrail-console`** (#451), layered on top of the existing access token — set one with `bintrail-console user set-password` (also `remove`/`status`) and a sign-in form replaces the `?token=` URL for humans. The credential is a single bcrypt (cost 12) hash in a `0600` YAML file (`~/.config/bintrail/console-auth.yaml`, override with `--auth-file`/`BINTRAIL_CONSOLE_AUTH`); the password is never accepted via flag or environment variable (it would leak through `docker inspect`/`ps`/`/proc`), only interactively or `--password-stdin`. A successful login mints an in-memory session (24 h absolute / 8 h idle, revoked on logout, password change, and restart) the browser uses as its bearer credential — nothing session-shaped is written to disk. **The static `--token` keeps working unchanged** as the automation credential; password auth is additive, single-user (multi-user/SSO stays in dbtrail). Login and password-change are bcrypt-verified in constant time with brute-force throttling (per-IP and global windows, `Retry-After`, no lockout) and no username enumeration. Rotate from the console (⌘K → "Change console password", which revokes every other session) or re-run `user set-password`. The same surface is available under `bintrail-console watch` via the `--console-auth-file` flag.
+- **TLS for `bintrail-console`** (#451): `--tls-cert`/`--tls-key` (and `--console-tls-cert`/`--console-tls-key` on `watch`, or `BINTRAIL_CONSOLE_TLS_CERT`/`_KEY`) serve the console over HTTPS. Static certificate files only — rotation is a restart, no ACME. A password configured on a non-loopback bind over plain HTTP now warns loudly at startup; terminate TLS here or at a reverse proxy. `watch` also gains `--console-allowed-hosts` (`BINTRAIL_CONSOLE_ALLOWED_HOSTS`) so the reverse-proxy topology works there too, not only on `serve`.
+
+### Changed
+- **The Docker Compose console token now persists across restarts** (#451). The quickstart's auto-generated token is stored once in the `bintrail-state` volume instead of being regenerated on every container start, so bookmarked `?token=` URLs and token-based automation survive redeploys. Pinning your own `CONSOLE_TOKEN` in `.env` still wins. To expose the console beyond loopback, set a console password (`docker compose exec -it bintrail bintrail-console user set-password`, ideally behind TLS) or a stable token.
+- Three new static security response headers on every console response — `Referrer-Policy: no-referrer` (keeps the bootstrap `?token=` out of `Referer`), `X-Content-Type-Options: nosniff`, and `X-Frame-Options: DENY`. Login additionally requires `Content-Type: application/json`, which a cross-site HTML form cannot send — closing login-CSRF without cookies or CORS.
+
+### Fixed
+- **The console SPA no longer 404s on reload or a deep link** (#449). The redesigned console routes with the History API (`/events`, `/recover`, …); reloading or opening one of those paths directly returned a bare `404 page not found`. The server now serves the app shell for extensionless non-asset paths and the frontend restores the view, while missing real assets still 404.
+- **The add-server form no longer looks like it requires index-connection details** (#450). The always-optional "Index connection" section (it is auto-provisioned for a monitored source) is collapsed behind an "Advanced — bring your own index" toggle, and the required Name field moved out of it; the zero-terminal "+ Add server" path is now just a name plus the source.
+
 ## [0.10.1] - 2026-06-09
 
 ### Changed
