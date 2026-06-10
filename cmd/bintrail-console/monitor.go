@@ -503,22 +503,29 @@ func (m *monitorSupervisor) Stop(ctx context.Context, entryID string) error {
 	return nil
 }
 
-// ActiveIndexDSNs returns the per-source index DSNs of every supervised job.
-// The built-in `up` rotation uses it to cover the databases the control plane
-// provisions (bintrail_idx_<entry>) in addition to the boot index DB. Jobs in
-// every state are included: a crash-looping stream's database still ages past
-// retention, and a DSN whose database is mid-provisioning logs one transient
-// rotation warning and self-heals next tick. A job whose provisioning failed
-// TERMINALLY (bad perms, DDL error) keeps producing a per-cycle rotation
-// warning until superseded or stopped — deliberate: the broken entry should
-// stay loud, and Stop() removes it from the map.
-func (m *monitorSupervisor) ActiveIndexDSNs() []string {
+// ActiveJob pairs a supervised entry's id with its per-source index DSN, so the
+// rotation provider can look the entry up in the registry (for its ArchiveS3)
+// and read its resolved bintrail_id.
+type ActiveJob struct {
+	EntryID  string
+	IndexDSN string
+}
+
+// ActiveJobs returns one ActiveJob per supervised job with a known index DSN —
+// the per-source databases the built-in rotation covers alongside the boot
+// index. Jobs in every state are included: a crash-looping stream's database
+// still ages past retention, and a DSN whose database is mid-provisioning logs
+// one transient rotation warning and self-heals next tick. A job whose
+// provisioning failed TERMINALLY (bad perms, DDL error) keeps producing a
+// per-cycle rotation warning until superseded or stopped — deliberate: the
+// broken entry should stay loud, and Stop() removes it from the map.
+func (m *monitorSupervisor) ActiveJobs() []ActiveJob {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]string, 0, len(m.jobs))
-	for _, j := range m.jobs {
+	out := make([]ActiveJob, 0, len(m.jobs))
+	for id, j := range m.jobs {
 		if j.indexDSN != "" {
-			out = append(out, j.indexDSN)
+			out = append(out, ActiveJob{EntryID: id, IndexDSN: j.indexDSN})
 		}
 	}
 	return out

@@ -18,10 +18,14 @@ import (
 	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
-// Result is one rotation cycle's outcome. deferred counts partitions
-// past retention that the opts.ProtectUnarchived guard refused to drop (always
-// 0 for the explicit rotate command). A named struct, not a positional tuple:
-// three same-typed ints invite silent misordering at call sites.
+// Result is one rotation cycle's outcome. Deferred counts partitions past
+// retention that this cycle did NOT drop to avoid data loss: the
+// ProtectUnarchived guard refusing an unarchived partition, OR (in the archive
+// path) an S3 upload that failed or is still pending. The built-in loop sums it
+// across targets to drive escalation. The explicit `rotate` command surfaces
+// only Dropped/Added, but can still produce Deferred>0 when its --archive-s3
+// uploads fail. A named struct, not a positional tuple: three same-typed ints
+// invite silent misordering at call sites.
 type Result struct {
 	Dropped, Added, Deferred int
 }
@@ -59,6 +63,13 @@ type Options struct {
 	// built-in rotation must not be the first to destroy data an archiving flow
 	// would preserve. The explicit rotate command leaves this false.
 	ProtectUnarchived bool
+	// PruneLocalAfterUpload removes the local staging Parquet once it has been
+	// uploaded to S3 and the partition dropped. The unattended built-in loop
+	// sets this so a container's staging dir doesn't grow without bound; the
+	// read side falls back to S3 when the local copy is gone. Requires
+	// ArchiveS3 (a local-only archive IS the durable copy — never pruned). The
+	// explicit rotate command leaves this false (operator keeps both copies).
+	PruneLocalAfterUpload bool
 }
 
 // Perform executes one full rotation cycle against an open DB connection,
@@ -67,6 +78,15 @@ type Options struct {
 func Perform(ctx context.Context, db *sql.DB, dbName string, opts Options) (Result, error) {
 	retainDur := opts.RetainDur
 	start := time.Now()
+
+	// An S3 target without a local staging dir is a misconfiguration: archiving
+	// keys off ArchiveDir, so this would silently fall through to the no-archive
+	// bulk-drop branch and drop partitions that were never uploaded. Fail loud
+	// instead — the field invariant (ArchiveS3 requires ArchiveDir) is enforced
+	// here, not just documented on Options.
+	if opts.ArchiveS3 != "" && opts.ArchiveDir == "" {
+		return Result{}, fmt.Errorf("ArchiveS3 set without ArchiveDir: cannot upload to S3 without a local staging path")
+	}
 
 	// ── Load current partition list ─────────────────────────────────────────────
 	partitions, err := listPartitions(ctx, db, dbName)
@@ -213,6 +233,11 @@ func Perform(ctx context.Context, db *sql.DB, dbName string, opts Options) (Resu
 									fmt.Fprintf(os.Stdout, "warning: S3 upload failed for %s: %v\n", name, err)
 									fmt.Fprintf(os.Stdout, "  run 'bintrail rotate --retry --archive-s3 ...' to retry\n")
 								}
+								// Count it deferred so the built-in loop's unhealthy-streak
+								// escalation fires: a persistently failing upload keeps the
+								// index (and staging dir) growing, the exact condition the
+								// streak detector exists to surface above per-cycle warnings.
+								deferredCount++
 								continue
 							}
 							if _, err := db.ExecContext(ctx,
@@ -243,6 +268,9 @@ func Perform(ctx context.Context, db *sql.DB, dbName string, opts Options) (Resu
 							fmt.Fprintf(os.Stdout, "skipped drop for %s (pending S3 upload)\n", name)
 							fmt.Fprintf(os.Stdout, "  run 'bintrail rotate --retry --archive-s3 ...' to retry\n")
 						}
+						// A still-pending upload is an undropped partition too — count it
+						// so the loop escalates rather than reporting a healthy cycle.
+						deferredCount++
 						continue
 					}
 
@@ -254,6 +282,15 @@ func Perform(ctx context.Context, db *sql.DB, dbName string, opts Options) (Resu
 					slog.Info("dropped partition", "partition", name)
 					if opts.Format != "json" {
 						fmt.Fprintf(os.Stdout, "dropped partition %s\n", name)
+					}
+
+					// We only reach the drop once the S3 copy is confirmed (the
+					// pending-upload guard above), so removing the local staging
+					// Parquet is safe — reads fall back to S3. Best-effort.
+					if opts.PruneLocalAfterUpload && opts.ArchiveS3 != "" {
+						if err := os.Remove(outPath); err != nil && !os.IsNotExist(err) {
+							slog.Warn("could not prune local archive after S3 upload", "partition", name, "error", err)
+						}
 					}
 				}
 			} else {

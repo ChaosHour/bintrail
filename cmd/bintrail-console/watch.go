@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -73,6 +75,7 @@ var (
 	upConsoleTLSKey      string
 	upConsoleAllowedHost []string
 	upConsoleAllowSetup  bool
+	upArchiveStageDir    string
 
 	upRotateRetain    string
 	upRotateInterval  string
@@ -150,6 +153,7 @@ func init() {
 	watchCmd.Flags().StringVar(&upConsoleTLSKey, "console-tls-key", "", "TLS private key file (PEM; requires --console-tls-cert)")
 	watchCmd.Flags().StringSliceVar(&upConsoleAllowedHost, "console-allowed-hosts", nil, "Extra hostnames allowed in the Host header (for a TLS-terminating reverse proxy); IP literals and localhost are always allowed")
 	watchCmd.Flags().BoolVar(&upConsoleAllowSetup, "console-allow-setup", false, "Allow browser first-run password setup on a non-loopback bind (assert the bind is access-controlled, e.g. published only on the host loopback)")
+	watchCmd.Flags().StringVar(&upArchiveStageDir, "archive-staging-dir", "", "Local staging directory for S3 archive uploads (default: OS temp dir). Rotated Parquet is written here, uploaded to a source's configured Archive S3 bucket, then pruned.")
 	watchCmd.Flags().StringVar(&upRotateRetain, "rotate-retain", "30d", "Built-in rotation: drop index partitions older than this (Nd/Nh; \"off\" disables)")
 	watchCmd.Flags().StringVar(&upRotateInterval, "rotate-interval", "1h", "Built-in rotation: how often to run a rotation cycle")
 	watchCmd.Flags().IntVar(&upRotateAddFuture, "rotate-add-future", 3, "Built-in rotation: keep at least N future hourly partitions ready")
@@ -345,8 +349,8 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	// Built-in rotation covers the boot index plus every per-source database
 	// the control plane provisions — the unattended quickstart's real data
 	// lives in the latter.
-	rotation.StartLoop(ctx, upRotationCfg, func() []string {
-		return append([]string{upIndexDSN}, supervisor.ActiveIndexDSNs()...)
+	rotation.StartLoop(ctx, upRotationCfg, func() []rotation.RotateTarget {
+		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
 	})
 
 	srv, err := console.New(cfg)
@@ -441,8 +445,8 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 
 	// Built-in rotation: boot index + every per-source database the control
 	// plane provisions, on the daemon lifecycle.
-	rotation.StartLoop(ctx, upRotationCfg, func() []string {
-		return append([]string{upIndexDSN}, supervisor.ActiveIndexDSNs()...)
+	rotation.StartLoop(ctx, upRotationCfg, func() []rotation.RotateTarget {
+		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
 	})
 
 	// With the console comes the multi-stream control plane, so /metrics is
@@ -577,6 +581,11 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 			upConsoleAllowSetup = true
 		}
 	}
+	if !cmd.Flags().Changed("archive-staging-dir") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_ARCHIVE_STAGING"); v != "" {
+			upArchiveStageDir = v
+		}
+	}
 }
 
 // consoleOpts carries watch's console-surface settings into upConsoleConfig —
@@ -642,4 +651,78 @@ func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Con
 		// registry and the daemon lifecycle context, which this config builder
 		// doesn't have.
 	}, nil
+}
+
+// archiveStagingDir resolves the local staging base for S3 archive uploads
+// (--archive-staging-dir / BINTRAIL_CONSOLE_ARCHIVE_STAGING). A lost staging
+// dir self-heals: an un-uploaded partition is never dropped, so the next cycle
+// re-archives it from the still-present partition. Default: a temp subdir.
+func archiveStagingDir() string {
+	if upArchiveStageDir != "" {
+		return upArchiveStageDir
+	}
+	return filepath.Join(os.TempDir(), "bintrail-archive-staging")
+}
+
+// rotateTargets assembles the built-in rotation's per-cycle targets: the boot
+// index (drop-only — the ephemeral default entry has no registry archive
+// config) plus every supervised source. A source whose registry entry carries
+// an Archive S3 bucket archives-then-drops to it, but ONLY once its bintrail_id
+// is resolved (read from stream_state) — until then it rotates drop-only and
+// the engine's protect-unarchived guard keeps it from losing data.
+func rotateTargets(bootDSN string, sup *monitorSupervisor, reg *console.Registry, stagingBase string) []rotation.RotateTarget {
+	targets := []rotation.RotateTarget{{DSN: bootDSN}}
+	for _, j := range sup.ActiveJobs() {
+		t := rotation.RotateTarget{DSN: j.IndexDSN}
+		if entry, ok := reg.Get(j.EntryID); ok && entry.ArchiveS3 != "" {
+			id, err := resolveBintrailIDFunc(j.IndexDSN)
+			switch {
+			case err != nil:
+				// A real DB error reading stream_state must not masquerade as
+				// "identity not yet resolved": that would let a permanently
+				// stalled archive (bad perms, unreachable index) rotate drop-only
+				// forever with only a Debug line. Surface it at Warn so an
+				// operator can tell archiving stalled from archiving being off.
+				slog.Warn("archive-to-S3 configured but reading the source's bintrail_id failed; rotating drop-only this cycle",
+					"entry", j.EntryID, "error", err)
+			case id == "":
+				slog.Debug("archive-to-S3 configured but the source's bintrail_id is not yet resolved; rotating drop-only this cycle", "entry", j.EntryID)
+			default:
+				t.ArchiveS3 = entry.ArchiveS3
+				t.ArchiveDir = filepath.Join(stagingBase, j.EntryID)
+				t.BintrailID = id
+				t.ArchiveCompression = "zstd"
+			}
+		}
+		targets = append(targets, t)
+	}
+	return targets
+}
+
+// resolveBintrailIDFunc is the seam tests stub to avoid a real DB.
+var resolveBintrailIDFunc = resolveBintrailID
+
+// resolveBintrailID reads a source's resolved server identity from its index
+// stream_state — the UUID archives are partitioned under (bintrail_id=<uuid>).
+// Returns ("", nil) when the stream has not resolved its identity yet (no
+// stream_state row, or a NULL/empty bintrail_id) — archiving waits a cycle.
+// Returns ("", err) on a genuine failure (connect or query error) so the caller
+// can distinguish a transient/persistent fault from "not yet resolved" and log
+// it loudly rather than letting a stalled archive look like a normal wait.
+func resolveBintrailID(indexDSN string) (string, error) {
+	db, err := config.Connect(indexDSN)
+	if err != nil {
+		return "", fmt.Errorf("connect: %w", err)
+	}
+	defer db.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var id sql.NullString
+	if err := db.QueryRowContext(ctx, "SELECT bintrail_id FROM stream_state WHERE id = 1").Scan(&id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil // no checkpoint row yet — identity not resolved, not a fault
+		}
+		return "", fmt.Errorf("read stream_state: %w", err)
+	}
+	return id.String, nil
 }
