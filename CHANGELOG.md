@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-06-09
+
+### Changed
+- **New visual identity + brand prose: bintrail → dbtrail** (#448). README and docs now present the project as **dbtrail** with the new DB Trail header art; the web console ships the new app icon (favicon + sidebar mark) and lockup, its title/brand read "dbtrail console", and event/SQL exports download as `dbtrail-*`. **Every technical name is untouched**: binaries (`bintrail`, `bintrail-console`, `bintrail-mcp`), packages, image names, `BINTRAIL_*` env vars, config paths, compose service/volume names, and stored identifiers — existing installs and scripts keep working as-is. A naming note in [docs/install.md](docs/install.md) spells out the project-vs-engine distinction; prose referring to the managed service now says "dbtrail.com" to keep the open-core ship-vs-operate boundary unambiguous.
+
 ## [0.10.0] - 2026-06-09
 
 ### Changed
