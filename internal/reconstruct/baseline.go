@@ -302,6 +302,7 @@ func findBaselineLocal(baselineDir, schema, table string, at time.Time) (string,
 		path string
 	}
 	var candidates []candidate
+	var newestSnap time.Time // newest eligible snapshot, whether or not it has the table
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -309,6 +310,9 @@ func findBaselineLocal(baselineDir, schema, table string, at time.Time) (string,
 		t, ok := parseDirTimestamp(entry.Name())
 		if !ok || t.After(at) {
 			continue
+		}
+		if t.After(newestSnap) {
+			newestSnap = t
 		}
 		p := filepath.Join(baselineDir, entry.Name(), schema, table+".parquet")
 		if _, err := os.Stat(p); err != nil {
@@ -321,11 +325,26 @@ func findBaselineLocal(baselineDir, schema, table string, at time.Time) (string,
 			ErrNoBaseline, schema, table, at.UTC().Format(time.RFC3339), baselineDir)
 	}
 	slices.SortFunc(candidates, func(a, b candidate) int { return b.t.Compare(a.t) })
-	return candidates[0].path, candidates[0].t, nil
+	best := candidates[0]
+	if newestSnap.After(best.t) {
+		// The table dropped out of newer snapshots (dump filter change, lost
+		// SELECT privilege, rename): falling back to an older snapshot is the
+		// designed behavior, but doing it silently means reconstructing from
+		// ever-staler data with no signal anywhere (#461).
+		slog.Warn("baseline: table is absent from the newest snapshot; using an older one — re-dump to refresh it",
+			"schema", schema, "table", table,
+			"using", best.t.UTC().Format(time.RFC3339),
+			"newest_snapshot", newestSnap.UTC().Format(time.RFC3339))
+	}
+	return best.path, best.t, nil
 }
 
 // ─── S3 ───────────────────────────────────────────────────────────────────────
 
+// NOTE(#461): unlike findBaselineLocal, this path CANNOT warn when the table
+// is absent from the newest snapshot — the glob below is table-scoped, so
+// snapshots lacking the table are invisible without a broader (and costlier)
+// listing. S3 lookups therefore still fall back to older snapshots silently.
 func findBaselineS3(ctx context.Context, s3URL, schema, table string, at time.Time) (string, time.Time, error) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {

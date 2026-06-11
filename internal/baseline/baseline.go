@@ -63,14 +63,22 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 	if err != nil {
 		return Stats{}, fmt.Errorf("discover tables: %w", err)
 	}
+	if len(tables) == 0 {
+		// A metadata-only dump is easy to produce with mydumper itself exiting
+		// 0 (a --regex that matches nothing, a dump user lacking SELECT on the
+		// requested schemas). Returning success here converted that into a
+		// missing baseline that surfaces weeks later as ErrNoBaseline — or as
+		// Time-travel silently reconstructing from an older snapshot (#461).
+		return Stats{}, fmt.Errorf("no tables found in %s — the dump contains no table data; check the dump's schema filter and the dump user's SELECT privileges", cfg.InputDir)
+	}
 
 	// Apply table filter.
 	if len(cfg.Tables) > 0 {
+		discovered := len(tables)
 		tables = filterTables(tables, cfg.Tables)
-	}
-
-	if len(tables) == 0 {
-		return Stats{}, nil
+		if len(tables) == 0 {
+			return Stats{}, fmt.Errorf("--tables filter %v matched none of the %d table(s) in the dump", cfg.Tables, discovered)
+		}
 	}
 
 	// Timestamp string for directory name and metadata (colons → dashes for
@@ -181,8 +189,17 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 	}
 	wg.Wait()
 
+	// A cancelled run skipped tables without recording errors (workers just
+	// return on ctx.Err()) — succeeding here would publish a partial snapshot
+	// indistinguishable from a complete one.
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	if len(errs) > 0 {
-		return stats, errs[0] // return first error; others are logged
+		if len(errs) > 1 {
+			return stats, fmt.Errorf("%d of %d tables failed (others logged); first: %w", len(errs), len(tables), errs[0])
+		}
+		return stats, errs[0]
 	}
 	return stats, nil
 }
