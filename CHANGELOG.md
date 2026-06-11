@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-06-11
+
+### Fixed
+- **A fresh install no longer shows a phantom server** (#470). On a source-less `bintrail-console watch` (the compose quickstart), the daemon's own index database appeared in the server switcher and the Servers dialog as `bintrail_index (cli)` — reading as a pre-existing server when nothing had been added yet. That boot entry is internal plumbing there (each added source streams into its own per-source database), so it is now **hidden entirely**: a fresh install shows "no servers yet" in the switcher and an empty Servers dialog, while the views keep rendering (an empty Overview) against the internal index underneath until the first server is added. Because that internal index is not guaranteed empty (e.g. restarting a previously source-ful daemon without its `SOURCE_DSN`), a note under the switcher attributes the data — "Showing the daemon's internal index — add a server to start monitoring" — and disappears once a server exists. The entry remains visible where it actually carries data: `bintrail-console serve`, and `watch` with `--source-dsn`, labeled by its database name and sorted last in the switcher. This supersedes 0.13.1's demotion (which changed only the default selection and kept the entry listed).
+- **The Storage page is scannable** (#470). The paragraph-heavy panels from 0.13.1 are now one-line captions and structured empty states: a status-only Baselines card (`source` / `time-travel`), and a lead line plus two short numbered steps — with the compose one-liner as a copyable code block — instead of prose. Each "how to enable" hint is a single line and appears in exactly one place.
+
 ## [0.13.1] - 2026-06-11
 
 ### Added
