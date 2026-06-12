@@ -39,6 +39,7 @@ import (
 	"time"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/dbtrail/dbtrail/internal/cliutil"
@@ -214,9 +215,49 @@ func main() {
 	}
 
 	if err := newServer().Run(ctx, &mcp.StdioTransport{}); err != nil {
+		if isClientDisconnect(err) {
+			// The client closing stdin is the normal end of an MCP stdio
+			// session, not a failure — exit 0 so supervisors and scripts
+			// checking exit codes don't record an error (#473). The cause
+			// is kept in the log so anything misclassified as a disconnect
+			// (e.g. an SDK bump re-purposing the wire code) stays
+			// diagnosable.
+			slog.Info("MCP client disconnected; shutting down", "cause", err)
+			return
+		}
 		slog.Error("MCP server error", "error", err)
 		os.Exit(1)
 	}
+}
+
+// errCodeServerClosing is the JSON-RPC error code of the SDK's
+// jsonrpc2.ErrServerClosing sentinel. The sentinel lives in the SDK's
+// internal/jsonrpc2 package and the code is NOT re-exported by the
+// public jsonrpc package, so this is a verified-against-v1.3.1 value,
+// not an API promise. If an SDK bump ever renumbers it, the failure
+// mode is benign: clean disconnects revert to the old noisy
+// ERROR + exit 1 — a real fault is never swallowed.
+const errCodeServerClosing = -32004
+
+// isClientDisconnect reports whether a stdio session ended because the
+// client closed the connection — as opposed to a transport fault.
+//
+// On a clean stdin EOF, Run (go-sdk v1.3.1, verified empirically)
+// returns "server is closing: EOF": after the read side hits EOF the
+// SDK rejects the pending response write, storing
+// jsonrpc2.ErrServerClosing (-32004) wrapping the EOF as TEXT — so
+// errors.Is(err, io.EOF) is false. Real faults cannot arrive wearing
+// -32004: Connection.wait returns a non-EOF readErr RAW with priority
+// over that stored wrapper, and a real write fault claims the writeErr
+// slot first (the SDK stores only the first write error) — both still
+// reach the Error + exit-1 path. The one other -32004 construction (a
+// bare "server is closing" from ss.Close) is unreachable because the
+// stdio path uses context.Background() (no signal cancellation) and
+// sets no ServerOptions.KeepAlive — re-verify this classification if
+// either of those changes.
+func isClientDisconnect(err error) bool {
+	var wireErr *jsonrpc.Error
+	return errors.As(err, &wireErr) && wireErr.Code == errCodeServerClosing
 }
 
 // ─── Tool argument types ─────────────────────────────────────────────────────
