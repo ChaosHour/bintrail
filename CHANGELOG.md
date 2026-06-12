@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-06-12
+
+### Added
+- **Time-travel results render ENUM and SET values as labels — everywhere rows are reconstructed** (#472, #475, #476). Binlog ROW images store ENUMs as numeric ordinals and SETs as bitmasks, so a time-travel query answered `3` where the live row says `shipped` — two representations of the same column on the same connection. All reconstruction surfaces now map ordinals back to labels using the schema snapshot **in effect at each event's timestamp**: every shim query shape (`_flashback`/`_snapshot`/`_diff`, bare `AS OF`, the `DBTRAIL_AT` hint), the console Time-travel tab (state and history), `bintrail reconstruct` single-row output, and full-table mydumper output (which now writes labels, like a real dump). Decoding is per-event, so an ENUM reordered between two changes renders each change under its own definition instead of mislabeling older ordinals with the newest one; anything that doesn't match a known ordinal exactly (the definition shrank, unknown SET bits) passes through as the raw number — never a guessed label. The raw event-record surfaces — `bintrail query`, the MCP `query` tool, the console events view — deliberately keep the stored ordinal: it is the forensic ground truth.
+
+### Fixed
+- **`bintrail snapshot` no longer fails outright on tables with realistic ENUM columns** (#474). `schema_snapshots.column_type` was a `VARCHAR(128)`; a mundane 10-member ENUM renders a longer declaration, and under strict mode the resulting "Data too long" error aborted the **entire snapshot transaction** — not one column. The column is now `TEXT`, and existing indexes are widened automatically at startup with stored values preserved.
+- **`bintrail-mcp` no longer reports an error when the client disconnects normally** (#473). Closing stdin is how every MCP stdio session ends, but the server logged `ERROR … server is closing: EOF` and exited 1 — so supervisors and exit-code checks recorded a failure on every normal disconnect. A clean disconnect now logs at INFO and exits 0; real transport faults still log ERROR and exit 1.
+- **Docs caught up with the MCP server's fourth tool** (#471). Every enumeration said three tools (`query`, `recover`, `status`) — `list_schema_changes` (DDL history with full statements and binlog coordinates) existed in the server but appeared nowhere, including the connector-testing checklist whose "you should see three tools" step had become a false failure. Also documented: the `DBTRAIL_AT` hint form and relative time literals (`'5 minutes ago'`, `'now'`) in the time-travel walkthrough's grammar, and how `AS OF` SQL relates to the Docker Compose stack (the console image deliberately ships without the shim).
+
 ## [0.13.2] - 2026-06-11
 
 ### Fixed
