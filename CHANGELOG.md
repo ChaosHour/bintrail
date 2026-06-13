@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.4] - 2026-06-13
+
+### Added
+- **The source MySQL user's required grants are now spelled out where you create the connection** (#479). The console "+ Add server" form shows the exact `CREATE USER` / `GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT` to copy, right under the source fields — and `streaming.md`, `quickstart.md`, and `console.md` document the same, with the per-privilege rationale and a least-privilege (schema-scoped `SELECT`) variant. Previously the required grants appeared in no doc at all, so the very first step of monitoring a source was a guess.
+
+### Fixed
+- **A stopped monitored source's "Test" button no longer reports a scary `Unknown database` error** (#480). A source's per-source index database is created when monitoring *starts*; before that, Test pinged a database that doesn't exist yet and surfaced a raw `Error 1049 (42000): Unknown database 'bintrail_idx_…'` — read as a connection failure when the real state is just "not started." Test now recognises this and shows a neutral, actionable result: *"index database … not provisioned yet — click Start to create it and begin streaming."* A genuinely wrong index DSN on a non-monitored entry is still a hard error.
+- **A failed monitor-start preflight is no longer a silent failure** (#481). Clicking "Start" on a source ran the doctor preflight and, on failure, returned the report only to the browser — the daemon logged nothing, not even under `--log-level debug`. An operator watching `docker logs` saw a source refuse to start with zero diagnostic trail. The start path now logs the request and its outcome: a `WARN` on a failed preflight names each failed check (e.g. `Source MySQL connection: dial tcp …: connection refused`), and the supervisor emits a per-check `DEBUG` line so the full preflight is visible from the host.
+- **Four console monitor/index UX bugs that compounded into a UI that looked broken** (#482). (1) The primary button (Start, + Add server) turned invisible on hover — white text on a light-gray fill, because `.btn:hover` won the background. (2) A selected server whose index was unreachable made `/api/capabilities` fail, which hid the *entire* control plane (the Start button, the "+ Add server" monitor copy) — the process-level monitor capability now survives a broken selection. (3) A missing-index error rendered as a raw red wall; it's now an actionable empty state that clarifies the index database is created when monitoring starts and never lives on the source. (4) Editing a monitored source auto-expanded the optional "bring your own index" section, exposing a per-source index DSN the operator never typed; it now stays collapsed for source entries.
+
 ## [0.13.3] - 2026-06-12
 
 ### Added
