@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-06-14
+
+### Added
+- **One-command install script** (#483). A single `curl … | sh` installer fetches the correct release binary for the host platform with a branded onboarding flow, replacing the "find the right archive on the Releases page" step for first-time setup.
+
+### Fixed
+- **`bintrail baseline` no longer silently drops rows from multi-row mydumper INSERTs** (#495). mydumper ≥ 1.0 emits one row tuple per physical line (`VALUES(r1)` / `,(r2)` / `,(r3);`); the SQL reader only parsed the tuple on the `VALUES` line and skipped every continuation line, so a 1,000,000-row table produced a baseline with one row per `INSERT` *statement* (≈159 rows) while the command reported success. The reader is now stateful across lines and parses every tuple. A dump file that ends mid-statement, or an unexpected token where a tuple/terminator is expected, now fails loudly instead of reporting a short row count. Time-travel / `reconstruct` builds on the baseline, so this was silent data loss in the foundation of the feature.
+- **`bintrail baseline` no longer corrupts binary, BLOB, BIT, and JSON columns** (#504). On default mydumper output, `BINARY`/`VARBINARY`/`BLOB` values (`_binary "…"`) and JSON values (`CONVERT("…" USING …)`) were routed through a quote-blind value reader: a raw `,` or `)` byte inside the value (near-certain for any real blob, e.g. a `BINARY(16)` UUID key) split the row into the wrong columns, and JSON columns stored the literal `CONVERT(…)` wrapper text instead of the document. `REPLACE INTO` dumps (mysqldump `--replace` / mydumper `--replace`) were skipped entirely, dropping every row. Charset introducers and the `CONVERT(…)` wrapper are now decoded through the real string parser, the `\0` and `\Z` (Ctrl-Z) escapes are handled, and `REPLACE INTO` is accepted. Verified byte-exact through `baseline` → Parquet → read-back against real mydumper v1.0.3 output.
+- **Streaming no longer loses a transaction's row events when a checkpoint lands mid-transaction** (#491). The replication checkpoint could advance the stored GTID set in the middle of a transaction; on restart the stream resumed *after* that GTID and skipped the transaction's remaining row events. The GTID checkpoint now advances only at transaction commit boundaries (at-least-once), so an interrupted transaction is re-read in full rather than partially lost.
+- **UNSIGNED integer columns with the high bit set are now indexed as their correct value** (#490). Large `UNSIGNED` values (e.g. a `BIGINT UNSIGNED` above 2^63, or any unsigned column whose top bit is set) were stored as the equivalent negative two's-complement number, so both indexed events and generated recovery SQL carried the wrong value. They are now decoded as unsigned.
+
+### Changed
+- **Documentation rebuilt to be operator-first and open-core-honest** (#484–#489). The README, `quickstart.md` (now UI-first: console then CLI), `guide.md` (refocused as a DBA incident playbook), and `mcp-server.md` were rewritten for the DBA/operator audience, cutting Go-internals and SaaS-only content.
+
 ## [0.13.4] - 2026-06-13
 
 ### Added
