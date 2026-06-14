@@ -101,6 +101,7 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 	defer rows.Close()
 
 	r := &Resolver{snapshotID: snapshotID, tables: make(map[string]*TableMeta)}
+	sawColumnType := false
 
 	for rows.Next() {
 		var schemaName, tableName, columnName, columnKey, dataType, columnType string
@@ -126,6 +127,9 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 			ColumnType:      columnType,
 			IsGenerated:     isGenerated,
 		}
+		if columnType != "" {
+			sawColumnType = true
+		}
 		tm.Columns = append(tm.Columns, col)
 		if col.IsPK {
 			tm.PKColumns = append(tm.PKColumns, columnName)
@@ -134,6 +138,18 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to iterate snapshot rows: %w", err)
+	}
+
+	// Pre-#212 snapshots have no column_type, so coerceUnsigned cannot tell which
+	// integer columns are UNSIGNED and silently indexes them as-is. Warn once (not
+	// per row) so an operator who upgraded for the unsigned fix (#490) isn't misled
+	// into thinking a stale snapshot is corrected.
+	if len(r.tables) > 0 && !sawColumnType {
+		slog.Warn("snapshot predates column_type capture (#212); UNSIGNED integer "+
+			"columns cannot be sign-corrected and are indexed with the wrong value when "+
+			"the high bit is set (unsigned PKs also corrupt pk_hash) — re-run "+
+			"`bintrail snapshot` to enable the fix",
+			"snapshot_id", snapshotID)
 	}
 
 	return r, nil
@@ -199,9 +215,67 @@ func (r *Resolver) MapRow(schema, table string, row []any) (map[string]any, erro
 	}
 	named := make(map[string]any, len(row))
 	for i, col := range tm.Columns {
-		named[col.Name] = row[i]
+		named[col.Name] = coerceUnsigned(row[i], col)
 	}
 	return named, nil
+}
+
+// coerceUnsigned reinterprets an integer value decoded by go-mysql into the
+// correct unsigned value. go-mysql always decodes INT-family columns as SIGNED
+// (int8/int16/int32/int64) — it parses the TABLE_MAP SIGNEDNESS bitmap but never
+// applies it (UnsignedMap is used only in its Dump output). So a column declared
+// UNSIGNED whose value has the high bit set comes back negative (e.g.
+// BIGINT UNSIGNED 18446744073709551615 → int64(-1)). Left uncorrected, the wrong
+// value lands in the index and, for unsigned PKs, corrupts pk_values/pk_hash.
+//
+// Signedness is taken from the snapshot's ColumnType ("... unsigned"), NOT the
+// TABLE_MAP SIGNEDNESS bitmap: coerceUnsigned runs inside MapRow, which works
+// only off the resolver's snapshot and never sees the live TableMapEvent, so the
+// bitmap is not reachable at this layer (and go-mysql would not apply it anyway —
+// see above). ColumnType is always loaded by the resolver, independent of the
+// source's binlog_row_metadata setting. Width is taken from DataType so the
+// reinterpretation masks to the column's real size — MEDIUMINT is 3 bytes but
+// go-mysql returns it as int32, so it must be masked to 24 bits (else
+// MEDIUMINT UNSIGNED -1 would become 2^32-1 instead of 2^24-1).
+//
+// No-op when the column is not unsigned, when ColumnType is empty (pre-#212
+// snapshots can't express signedness — NewResolver warns once in that case), or
+// when the value is not a signed integer (NULL, string, and DECIMAL/FLOAT/DOUBLE
+// UNSIGNED — which go-mysql returns as string/float — are returned unchanged).
+// BIT is intentionally gated out: it is a distinct type, never declared
+// "unsigned". (BIT(64) with the high bit set has the same underlying corruption,
+// since go-mysql decodes BIT as int64, but is tracked separately.)
+func coerceUnsigned(v any, col ColumnMeta) any {
+	if !strings.Contains(strings.ToLower(col.ColumnType), "unsigned") {
+		return v
+	}
+	var signed int64
+	switch x := v.(type) {
+	case int8:
+		signed = int64(x)
+	case int16:
+		signed = int64(x)
+	case int32:
+		signed = int64(x)
+	case int64:
+		signed = x
+	default:
+		return v // not a signed integer (NULL/string/decimal/...) — leave as-is
+	}
+	switch strings.ToLower(col.DataType) {
+	case "tinyint":
+		return uint8(signed)
+	case "smallint":
+		return uint16(signed)
+	case "mediumint":
+		return uint32(signed) & 0xFFFFFF
+	case "int":
+		return uint32(signed)
+	case "bigint":
+		return uint64(signed)
+	default:
+		return v
+	}
 }
 
 // ─── TakeSnapshot ────────────────────────────────────────────────────────────
