@@ -444,6 +444,334 @@ func TestStreamLoop_contextCancel(t *testing.T) {
 
 // TestStreamLoop_tickerCheckpoint verifies that the periodic ticker fires a
 // checkpoint even when the events channel stays open and receives no further events.
+// TestStreamLoop_gtidCheckpointAtCommit verifies #491: in GTID mode the durable
+// gtid_set is advanced ONLY at a transaction commit boundary (EventCommit), never
+// at the leading EventGTID. A checkpoint that fires mid-transaction must not claim
+// the in-flight transaction — otherwise a restart (GTID auto-position) would skip
+// it and lose data. The row itself must still be indexed (at-least-once).
+func TestStreamLoop_gtidCheckpointAtCommit(t *testing.T) {
+	const gtid = "11111111-1111-1111-1111-111111111111:1"
+	const uuid = "11111111-1111-1111-1111-111111111111"
+
+	newGTIDState := func(t *testing.T) *streamState {
+		gs, err := gomysql.ParseMysqlGTIDSet("")
+		if err != nil {
+			t.Fatalf("ParseMysqlGTIDSet: %v", err)
+		}
+		return &streamState{mode: "gtid", serverID: 1, accGTID: gs.(*gomysql.MysqlGTIDSet)}
+	}
+	setupIdx := func(t *testing.T) (*indexer.Indexer, *sql.DB) {
+		db, _ := testutil.CreateTestDB(t)
+		testutil.InitIndexTables(t, db)
+		testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00", "testdb", "orders", "id", 1, "PRI", "int", "NO")
+		testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00", "testdb", "orders", "amount", 2, "", "decimal", "YES")
+		return indexer.New(db, 10), db
+	}
+	insertEvent := parser.Event{
+		BinlogFile: "binlog.000001", StartPos: 100, EndPos: 200,
+		Timestamp: time.Now().UTC(), GTID: gtid,
+		Schema: "testdb", Table: "orders", EventType: parser.EventInsert,
+		PKValues: "1", RowAfter: map[string]any{"id": int64(1), "amount": 9.99},
+	}
+
+	// Scenario A: GTID + row, then checkpoint (channel close) BEFORE the commit.
+	// The GTID must NOT be persisted, but the row must be indexed.
+	t.Run("mid-transaction checkpoint does not claim the GTID", func(t *testing.T) {
+		idx, db := setupIdx(t)
+		events := make(chan parser.Event, 10)
+		events <- parser.Event{BinlogFile: "binlog.000001", EndPos: 100, GTID: gtid, EventType: parser.EventGTID}
+		events <- insertEvent
+		close(events) // → checkpoint() fires mid-transaction
+
+		state := newGTIDState(t)
+		if err := streamLoop(context.Background(), events, idx, db, time.Hour, state, observe.ForSource("test"), nil); err != nil {
+			t.Fatalf("streamLoop: %v", err)
+		}
+
+		loaded, err := loadStreamState(db)
+		if err != nil || loaded == nil {
+			t.Fatalf("loadStreamState err=%v nil=%v", err, loaded == nil)
+		}
+		if strings.Contains(loaded.gtidSet, uuid) {
+			t.Errorf("gtid_set must NOT contain the uncommitted GTID, got %q", loaded.gtidSet)
+		}
+		var count int
+		if err := db.QueryRow("SELECT COUNT(*) FROM binlog_events").Scan(&count); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if count != 1 {
+			t.Errorf("the row must still be indexed (no loss): want 1, got %d", count)
+		}
+	})
+
+	// Scenario B: GTID + row + COMMIT, then checkpoint. The GTID must be persisted.
+	t.Run("committed transaction advances the GTID", func(t *testing.T) {
+		idx, db := setupIdx(t)
+		events := make(chan parser.Event, 10)
+		events <- parser.Event{BinlogFile: "binlog.000001", EndPos: 100, GTID: gtid, EventType: parser.EventGTID}
+		events <- insertEvent
+		events <- parser.Event{BinlogFile: "binlog.000001", EndPos: 250, GTID: gtid, EventType: parser.EventCommit}
+		close(events)
+
+		state := newGTIDState(t)
+		if err := streamLoop(context.Background(), events, idx, db, time.Hour, state, observe.ForSource("test"), nil); err != nil {
+			t.Fatalf("streamLoop: %v", err)
+		}
+
+		loaded, err := loadStreamState(db)
+		if err != nil || loaded == nil {
+			t.Fatalf("loadStreamState err=%v nil=%v", err, loaded == nil)
+		}
+		if !strings.Contains(loaded.gtidSet, uuid) {
+			t.Errorf("gtid_set must contain the committed GTID, got %q", loaded.gtidSet)
+		}
+	})
+
+	// Scenario C: a DDL auto-commits its own GTID (no XID). EventDDL must flush
+	// pending rows AND advance the GTID — the only path that claims a DDL's GTID.
+	t.Run("DDL advances the GTID and flushes prior rows", func(t *testing.T) {
+		idx, db := setupIdx(t)
+		events := make(chan parser.Event, 10)
+		events <- parser.Event{BinlogFile: "binlog.000001", EndPos: 100, GTID: gtid, EventType: parser.EventGTID}
+		events <- insertEvent
+		events <- parser.Event{BinlogFile: "binlog.000001", EndPos: 300, GTID: gtid, EventType: parser.EventDDL,
+			Schema: "testdb", Table: "orders", DDLType: parser.DDLAlterTable, DDLQuery: "ALTER TABLE orders ADD c INT"}
+		close(events)
+
+		state := newGTIDState(t)
+		if err := streamLoop(context.Background(), events, idx, db, time.Hour, state, observe.ForSource("test"), nil); err != nil {
+			t.Fatalf("streamLoop: %v", err)
+		}
+
+		loaded, err := loadStreamState(db)
+		if err != nil || loaded == nil {
+			t.Fatalf("loadStreamState err=%v nil=%v", err, loaded == nil)
+		}
+		if !strings.Contains(loaded.gtidSet, uuid) {
+			t.Errorf("DDL must advance the GTID, got %q", loaded.gtidSet)
+		}
+		var count int
+		if err := db.QueryRow("SELECT COUNT(*) FROM binlog_events").Scan(&count); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if count != 1 {
+			t.Errorf("the pre-DDL row must be flushed before the GTID advances: want 1, got %d", count)
+		}
+	})
+}
+
+// TestStreamLoop_positionModeCommitBoundary verifies that for a GTID-enabled
+// source running in POSITION mode (accGTID nil), EventCommit is a harmless no-op
+// for GTID tracking yet still advances binlogPos to the commit boundary, and the
+// durable gtid_set stays empty (#491 — locks the comment's position-mode claim).
+func TestStreamLoop_positionModeCommitBoundary(t *testing.T) {
+	const gtid = "11111111-1111-1111-1111-111111111111:1"
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00", "testdb", "orders", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00", "testdb", "orders", "amount", 2, "", "decimal", "YES")
+	idx := indexer.New(db, 10)
+
+	events := make(chan parser.Event, 10)
+	events <- parser.Event{BinlogFile: "binlog.000001", EndPos: 100, GTID: gtid, EventType: parser.EventGTID}
+	events <- parser.Event{BinlogFile: "binlog.000001", StartPos: 100, EndPos: 200, Timestamp: time.Now().UTC(),
+		GTID: gtid, Schema: "testdb", Table: "orders", EventType: parser.EventInsert,
+		PKValues: "1", RowAfter: map[string]any{"id": int64(1), "amount": 9.99}}
+	events <- parser.Event{BinlogFile: "binlog.000001", EndPos: 250, GTID: gtid, EventType: parser.EventCommit}
+	close(events)
+
+	state := &streamState{mode: "position", serverID: 1} // accGTID nil
+	if err := streamLoop(context.Background(), events, idx, db, time.Hour, state, observe.ForSource("test"), nil); err != nil {
+		t.Fatalf("streamLoop: %v", err)
+	}
+
+	loaded, err := loadStreamState(db)
+	if err != nil || loaded == nil {
+		t.Fatalf("loadStreamState err=%v nil=%v", err, loaded == nil)
+	}
+	if loaded.gtidSet != "" {
+		t.Errorf("position mode must not persist a gtid_set, got %q", loaded.gtidSet)
+	}
+	if loaded.binlogPos != 250 {
+		t.Errorf("binlogPos must land on the commit boundary (250), got %d", loaded.binlogPos)
+	}
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM binlog_events").Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("the row must be indexed, got %d", count)
+	}
+}
+
+// setGTIDMode transitions @@GLOBAL.gtid_mode through the required permissive
+// steps. Returns an error so callers can skip when privileges/state don't allow.
+func setGTIDMode(db *sql.DB, on bool) error {
+	stmts := []string{
+		"SET @@GLOBAL.enforce_gtid_consistency = ON",
+		"SET @@GLOBAL.gtid_mode = OFF_PERMISSIVE",
+		"SET @@GLOBAL.gtid_mode = ON_PERMISSIVE",
+		"SET @@GLOBAL.gtid_mode = ON",
+	}
+	if !on {
+		stmts = []string{
+			"SET @@GLOBAL.gtid_mode = ON_PERMISSIVE",
+			"SET @@GLOBAL.gtid_mode = OFF_PERMISSIVE",
+			"SET @@GLOBAL.gtid_mode = OFF",
+			"SET @@GLOBAL.enforce_gtid_consistency = OFF",
+		}
+	}
+	for _, s := range stmts {
+		if _, err := db.Exec(s); err != nil {
+			return fmt.Errorf("%s: %w", s, err)
+		}
+	}
+	return nil
+}
+
+// TestStreamLoop_gtidAdvancesOnCommit_live is the end-to-end proof of #491: with
+// a GTID-enabled source, the StreamParser must emit EventCommit at each XID, and
+// streamLoop must advance the durable gtid_set off those commits. It toggles the
+// server's gtid_mode (restored in cleanup) and skips if that isn't possible.
+func TestStreamLoop_gtidAdvancesOnCommit_live(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	// Register restore BEFORE attempting the transition, so a partial enable that
+	// leaves gtid_mode in a permissive state is still undone (a leaked gtid_mode
+	// would silently break every other test on the shared server). Skip the
+	// down-sequence when already OFF (enable never progressed) — OFF→ON_PERMISSIVE
+	// is itself an invalid jump.
+	t.Cleanup(func() {
+		var mode string
+		if err := sourceDB.QueryRow("SELECT @@GLOBAL.gtid_mode").Scan(&mode); err == nil && mode == "OFF" {
+			_, _ = sourceDB.Exec("SET @@GLOBAL.enforce_gtid_consistency = OFF")
+			return
+		}
+		if err := setGTIDMode(sourceDB, false); err != nil {
+			t.Logf("warning: failed to restore gtid_mode=OFF: %v", err)
+		}
+	})
+	if err := setGTIDMode(sourceDB, true); err != nil {
+		t.Skipf("skipping: cannot enable gtid_mode on the test server: %v", err)
+	}
+
+	var serverUUID string
+	if err := sourceDB.QueryRow("SELECT @@server_uuid").Scan(&serverUUID); err != nil {
+		t.Fatalf("server_uuid: %v", err)
+	}
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE orders (
+		id INT PRIMARY KEY AUTO_INCREMENT, amount DECIMAL(10,2) NOT NULL)`)
+	if _, err := metadata.TakeSnapshot(sourceDB, indexDB, []string{sourceName}); err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+
+	binlogFile, binlogPos, err := config.CurrentBinlogPosition(sourceDB)
+	if err != nil {
+		t.Fatalf("CurrentBinlogPosition: %v", err)
+	}
+
+	mc, err := drivermysql.ParseDSN(testutil.IntegrationDSN(sourceName))
+	if err != nil {
+		t.Fatalf("ParseDSN: %v", err)
+	}
+	hostStr, portStr, _ := net.SplitHostPort(mc.Addr)
+	portN, _ := strconv.ParseUint(portStr, 10, 16)
+
+	// Capture the source's executed set at the stream-start position so we can
+	// assert the stream accumulated exactly the transactions that follow.
+	var gtidBefore string
+	if err := sourceDB.QueryRow("SELECT @@GLOBAL.gtid_executed").Scan(&gtidBefore); err != nil {
+		t.Fatalf("gtid_executed (before): %v", err)
+	}
+
+	// Interleave an implicit-commit statement — ANALYZE TABLE logs a GTID + QUERY
+	// with NO XID and is not table DDL — between two autocommit INSERTs (GTID +
+	// BEGIN + row + XID). The ANALYZE's GTID can only land via the next-GTID
+	// fallback, so this is the end-to-end proof that the fallback works against a
+	// real binlog (#491).
+	testutil.MustExec(t, sourceDB, "INSERT INTO orders (amount) VALUES (10.0)")
+	testutil.MustExec(t, sourceDB, "ANALYZE TABLE orders")
+	testutil.MustExec(t, sourceDB, "INSERT INTO orders (amount) VALUES (20.0)")
+
+	var gtidAfter string
+	if err := sourceDB.QueryRow("SELECT @@GLOBAL.gtid_executed").Scan(&gtidAfter); err != nil {
+		t.Fatalf("gtid_executed (after): %v", err)
+	}
+
+	syncer := replication.NewBinlogSyncer(replication.BinlogSyncerConfig{
+		ServerID: 99997, Flavor: "mysql",
+		Host: hostStr, Port: uint16(portN), User: mc.User, Password: mc.Passwd,
+	})
+	defer syncer.Close()
+
+	streamer, syncErr := syncer.StartSync(gomysql.Position{Name: binlogFile, Pos: binlogPos})
+	if syncErr != nil {
+		t.Skipf("skipping: StartSync failed: %v", syncErr)
+	}
+
+	resolver, err := metadata.NewResolver(indexDB, 0)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	sp := parser.NewStreamParser(resolver, parser.Filters{Schemas: map[string]bool{sourceName: true}}, nil)
+	idx := indexer.New(indexDB, 100)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	events := make(chan parser.Event, 100)
+	parseErrCh := make(chan error, 1)
+	go func() {
+		defer close(events)
+		parseErrCh <- sp.Run(ctx, streamer, events)
+	}()
+
+	gs, _ := gomysql.ParseMysqlGTIDSet("")
+	state := &streamState{mode: "gtid", serverID: 99997, accGTID: gs.(*gomysql.MysqlGTIDSet)}
+	if err := streamLoop(ctx, events, idx, indexDB, time.Minute, state, observe.ForSource("test"), nil); err != nil {
+		t.Fatalf("streamLoop: %v", err)
+	}
+	if perr := <-parseErrCh; perr != nil &&
+		!errors.Is(perr, context.DeadlineExceeded) && !errors.Is(perr, context.Canceled) {
+		t.Fatalf("StreamParser error: %v", perr)
+	}
+
+	loaded, err := loadStreamState(indexDB)
+	if err != nil || loaded == nil {
+		t.Fatalf("loadStreamState err=%v nil=%v", err, loaded == nil)
+	}
+	// The streamed checkpoint must cover every transaction the source executed in
+	// the window — INSERT (XID), ANALYZE (next-GTID fallback), INSERT (XID). If the
+	// fallback regressed, the ANALYZE's GTID would be missing and the source's
+	// executed set would NOT be fully covered. (Concurrent transactions on the
+	// shared server only ADD GTIDs to the streamed set, so Contain stays robust.)
+	if !strings.Contains(loaded.gtidSet, serverUUID) {
+		t.Fatalf("gtid_set must contain the source UUID %q, got %q", serverUUID, loaded.gtidSet)
+	}
+	afterSet, err := gomysql.ParseMysqlGTIDSet(NormalizeGTIDSet(gtidAfter))
+	if err != nil {
+		t.Fatalf("parse gtid_executed (after) %q: %v", gtidAfter, err)
+	}
+	parts := make([]string, 0, 2)
+	if gtidBefore != "" {
+		parts = append(parts, gtidBefore)
+	}
+	if loaded.gtidSet != "" {
+		parts = append(parts, loaded.gtidSet)
+	}
+	combined, err := gomysql.ParseMysqlGTIDSet(NormalizeGTIDSet(strings.Join(parts, ",")))
+	if err != nil {
+		t.Fatalf("parse combined set: %v", err)
+	}
+	if !combined.Contain(afterSet) {
+		t.Errorf("fallback regression: the source's executed set is not fully covered by the streamed checkpoint — the ANALYZE's GTID is missing.\n  before=%q\n  after=%q\n  loaded=%q",
+			gtidBefore, gtidAfter, loaded.gtidSet)
+	}
+}
+
 func TestStreamLoop_tickerCheckpoint(t *testing.T) {
 	db, _ := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
@@ -621,22 +949,27 @@ func TestStreamLoop_gtidAccumulation(t *testing.T) {
 	}
 
 	ts := time.Now().UTC()
-	events := make(chan parser.Event, 10)
+	events := make(chan parser.Event, 16)
 
-	// Events carry consecutive GTIDs — the loop should accumulate them.
+	// Three transactions, each GTID start → row → COMMIT. GTIDs accumulate at the
+	// commit boundary (#491), not on the row event — so each EventCommit advances
+	// the set: uuid:1 (seed) + 2,3,4 → uuid:1-4.
 	for i, gno := range []int64{2, 3, 4} {
+		g := fmt.Sprintf("%s:%d", uuid, gno)
+		events <- parser.Event{BinlogFile: "binlog.000001", EndPos: uint64(i*100 + 10), GTID: g, EventType: parser.EventGTID}
 		events <- parser.Event{
 			BinlogFile: "binlog.000001",
 			StartPos:   uint64(i * 100),
 			EndPos:     uint64((i + 1) * 100),
 			Timestamp:  ts,
-			GTID:       fmt.Sprintf("%s:%d", uuid, gno),
+			GTID:       g,
 			Schema:     "testdb",
 			Table:      "orders",
 			EventType:  parser.EventInsert,
 			PKValues:   strconv.Itoa(i + 1),
 			RowAfter:   map[string]any{"id": int64(i + 1)},
 		}
+		events <- parser.Event{BinlogFile: "binlog.000001", EndPos: uint64((i+1)*100 + 10), GTID: g, EventType: parser.EventCommit}
 	}
 	close(events)
 

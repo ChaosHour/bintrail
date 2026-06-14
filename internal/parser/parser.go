@@ -36,6 +36,18 @@ const (
 	// produces this type — it exists so baseline rows can flow through the
 	// same ResultRow pipeline as real binlog events.
 	EventSnapshot EventType = 6
+	// EventCommit marks a transaction commit boundary, emitted by the StreamParser
+	// at an XID_EVENT (InnoDB DML) and — as a catch-all when the next transaction's
+	// GTID_EVENT arrives — for transactions that carry a GTID but emit no XID and
+	// aren't table DDL: implicitly-committed DDL/DCL (GRANT, CREATE DATABASE,
+	// CREATE INDEX, ANALYZE TABLE, ...) and no-XID explicit terminators (XA COMMIT;
+	// a COMMIT of a non-transactional transaction — a normal InnoDB COMMIT ends in
+	// an XID_EVENT instead). It carries no row data, only the committed
+	// transaction's GTID. The consumer advances the durable GTID checkpoint ONLY on
+	// this event (and on EventDDL), never on the leading EventGTID, so a checkpoint
+	// can never claim a half-streamed transaction (#491). The file parser does not
+	// produce it.
+	EventCommit EventType = 7
 )
 
 // Event is a fully resolved binlog row event with column names attached.

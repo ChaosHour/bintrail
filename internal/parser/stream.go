@@ -86,6 +86,33 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 	var currentGTID string
 	var currentConnectionID uint32 // pseudo_thread_id from most recent QueryEvent
 
+	// emitCommit signals a transaction commit boundary so the stream consumer can
+	// advance the durable GTID checkpoint only after the transaction's rows have
+	// been received (#491). It commits the in-flight transaction (currentGTID) and
+	// clears it, so the next-GTID fallback below won't re-commit the same GTID.
+	// No-op for non-GTID sources (currentGTID empty); a GTID-enabled source running
+	// in position mode still emits these, harmlessly — the consumer ignores commit
+	// events when accGTID is nil, and binlogPos lands on the XID boundary.
+	emitCommit := func(hdr *replication.EventHeader) error {
+		if currentGTID == "" {
+			return nil
+		}
+		commitEv := Event{
+			BinlogFile: currentFile,
+			EndPos:     uint64(hdr.LogPos),
+			Timestamp:  time.Unix(int64(hdr.Timestamp), 0).UTC(),
+			GTID:       currentGTID,
+			EventType:  EventCommit,
+		}
+		select {
+		case out <- commitEv:
+			currentGTID = "" // committed; the next-GTID fallback must not re-commit it
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	// handleEvent processes one binlog event. It is recursive: with
 	// binlog_transaction_compression=ON the source wraps each transaction's
 	// events (BEGIN + TABLE_MAP + rows + XID) in a single zstd-compressed
@@ -100,6 +127,26 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			currentFile = string(ev.NextLogName)
 
 		case *replication.GTIDEvent:
+			// A new transaction is starting, so the previous one has terminated. If
+			// it wasn't already committed by its XID or a table DDL, commit it now.
+			// This is the catch-all for transactions that carry a GTID but emit no
+			// XID and aren't table DDL — two families:
+			//   * implicitly-committed DDL/DCL: GRANT/REVOKE, CREATE/DROP DATABASE,
+			//     CREATE/DROP VIEW/TRIGGER/PROCEDURE/FUNCTION, CREATE/DROP INDEX,
+			//     ANALYZE/OPTIMIZE TABLE;
+			//   * explicit terminators logged as a QUERY with no XID: XA COMMIT, or
+			//     a COMMIT of a non-transactional/mixed-engine transaction.
+			// (A normal InnoDB COMMIT does NOT reach here — it ends in an XID_EVENT.)
+			// Without this their GTID would never advance the checkpoint, causing
+			// endless re-streaming and eventually a false data-loss gap alarm (#491).
+			//
+			// Limitation: the fallback fires on the NEXT GTID, so the LAST such
+			// statement before an idle period or shutdown stays uncommitted until
+			// traffic resumes — it is re-streamed on restart (harmless: these carry
+			// no rows). DML is unaffected (it commits immediately at its XID).
+			if err := emitCommit(binlogEv.Header); err != nil {
+				return err
+			}
 			currentGTID = formatGTID(ev.SID, ev.GNO)
 			if currentGTID != "" {
 				ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
@@ -132,6 +179,20 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 				if hook := sp.onDDL.Load(); hook != nil {
 					(*hook)(ddlEv)
 				}
+				// Table DDL auto-commits its own GTID; EventDDL is the commit
+				// boundary the consumer acts on, so clear the in-flight GTID to keep
+				// the next-GTID fallback from re-committing it. Other QueryEvents
+				// (BEGIN, SAVEPOINT, ...) deliberately do NOT commit here — DML
+				// commits at its XID below, and other implicitly-committed statements
+				// commit via the next-GTID fallback (#491).
+				currentGTID = ""
+			}
+
+		case *replication.XIDEvent:
+			// InnoDB transaction commit — the boundary at which it's safe to
+			// advance the durable GTID checkpoint (#491).
+			if err := emitCommit(binlogEv.Header); err != nil {
+				return err
 			}
 
 		case *replication.RowsEvent:
