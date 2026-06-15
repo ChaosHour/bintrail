@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-06-15
+
+### Fixed
+- **Recover and time-travel now preserve integer columns above 2^53** (#496). Row before/after images are stored as JSON; the read path decoded them with the default JSON number handling, which turns every number into a `float64` and silently rounds any integer above 2^53 — so `recover` SQL and `query`/CSV/shim output emitted the wrong value for a `BIGINT UNSIGNED` above 2^63 (or a large signed `BIGINT`) even though storage was exact. Numbers now decode as exact literals (`json.Number`) end-to-end through `recover`, `query`, the archived-Parquet read path, and the time-travel shim. This completes the #490 unsigned fix for `BIGINT` (storage was already correct; the read path was not).
+- **`BIT(64)` columns with the high bit set are now indexed as their correct value** (#497). go-mysql decodes `BIT(N)` as a signed integer, so a `BIT(64)` whose top bit is set was stored as a negative number. BIT is now reinterpreted as unsigned (an identity for `BIT(1..63)`); combined with #496, a `BIT(64)` value above 2^53 survives exactly through recovery.
+
+### Changed
+- **Documented that `binlog_row_image = FULL` is a server-wide source requirement** (#492). The docs now state that `binlog_row_image = FULL` must be set **server-wide** — a per-session `SET SESSION binlog_row_image = MINIMAL`/`NOBLOB` writes partial row images that index as incomplete (`recover` can then emit NULLs / fail to match), which is out of support — and that `binlog_row_value_options` must not include `PARTIAL_JSON`. `SUPPORT.md` gains a "Source server configuration" section so issue triage can cite the boundary.
+
 ## [0.14.0] - 2026-06-14
 
 ### Added
