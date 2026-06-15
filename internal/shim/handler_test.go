@@ -3,6 +3,7 @@ package shim
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +24,154 @@ import (
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
+
+func mustFormatText(t *testing.T, v any) string {
+	t.Helper()
+	b, err := gomysql.FormatTextValue(v)
+	if err != nil {
+		t.Fatalf("FormatTextValue(%#v): %v", v, err)
+	}
+	return string(b)
+}
+
+// parseRowCells parses every RowData in a BuildSimpleTextResultset result into
+// string cells (RowDatas are populated, not Values, so GetString can't be used).
+func parseRowCells(t *testing.T, rs *gomysql.Resultset) [][]string {
+	t.Helper()
+	out := make([][]string, 0, len(rs.RowDatas))
+	for _, rd := range rs.RowDatas {
+		fvs, err := rd.Parse(rs.Fields, false, nil)
+		if err != nil {
+			t.Fatalf("parse row data: %v", err)
+		}
+		cells := make([]string, len(fvs))
+		for i := range fvs {
+			switch v := fvs[i].Value().(type) {
+			case nil:
+				cells[i] = "NULL"
+			case []byte:
+				cells[i] = string(v)
+			default:
+				cells[i] = fmt.Sprintf("%v", v)
+			}
+		}
+		out = append(out, cells)
+	}
+	return out
+}
+
+// TestResultsetValue_jsonNumber locks the json.Number → resultset conversion
+// (#496). BuildSimpleTextResultset rejects json.Number and fixes a column's wire
+// type from its first row, so numbers are pre-rendered to uniform text bytes via
+// FormatTextValue — exact for BIGINT UNSIGNED above 2^63.
+func TestResultsetValue_jsonNumber(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"12345", "12345"},
+		{"-7", "-7"},
+		{"-9223372036854775808", "-9223372036854775808"}, // BIGINT signed min → int64 branch
+		{"9223372036854775807", "9223372036854775807"},   // 2^63-1 → int64 branch
+		{"9223372036854775808", "9223372036854775808"},   // exactly 2^63 → uint64 branch
+		{"18446744073709551615", "18446744073709551615"}, // BIGINT UNSIGNED max → uint64
+		{"3.14", "3.14"},                                 // fractional → float64
+		{"1e1000", "1e1000"},                             // beyond float64 range → literal passthrough
+	}
+	for _, c := range cases {
+		b, ok := resultsetValue(json.Number(c.in)).([]byte)
+		if !ok {
+			t.Errorf("resultsetValue(%q) = %T, want []byte", c.in, resultsetValue(json.Number(c.in)))
+			continue
+		}
+		if string(b) != c.want {
+			t.Errorf("resultsetValue(json.Number(%q)) = %q, want %q", c.in, b, c.want)
+		}
+	}
+	// json.Number renders byte-identically to FormatTextValue of the equivalent
+	// native value — the path baseline-origin cells take, so the two agree.
+	if got := string(resultsetValue(json.Number("18446744073709551615")).([]byte)); got != mustFormatText(t, uint64(18446744073709551615)) {
+		t.Errorf("json.Number vs native uint64 render diverge: %q", got)
+	}
+	// Non-json.Number values pass through unchanged.
+	if got := resultsetValue("hi"); got != "hi" {
+		t.Errorf("string passthrough = %#v, want \"hi\"", got)
+	}
+	if got := resultsetValue(nil); got != nil {
+		t.Errorf("nil passthrough = %#v, want nil", got)
+	}
+}
+
+// TestImagesToResult_jsonNumberMixedAndExact is the regression test for the
+// review-caught crash (#496/#505): a DOUBLE column with an integral value in one
+// row and a fractional in another must NOT trip "row types aren't consistent",
+// and a BIGINT UNSIGNED max must render exactly on the wire.
+func TestImagesToResult_jsonNumberMixedAndExact(t *testing.T) {
+	images := []map[string]any{
+		{"id": json.Number("1"), "score": json.Number("100"), "big": json.Number("18446744073709551615")},
+		{"id": json.Number("2"), "score": json.Number("100.5"), "big": json.Number("0")},
+	}
+	res, err := imagesToResult(images, []string{"id", "score", "big"})
+	if err != nil {
+		t.Fatalf("imagesToResult must not crash on a mixed integral/fractional column: %v", err)
+	}
+	got := parseRowCells(t, res.Resultset)
+	want := [][]string{
+		{"1", "100", "18446744073709551615"},
+		{"2", "100.5", "0"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("rows = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		for j := range want[i] {
+			if got[i][j] != want[i][j] {
+				t.Errorf("cell[%d][%d] = %q, want %q", i, j, got[i][j], want[i][j])
+			}
+		}
+	}
+}
+
+// TestFullTableTextCell_jsonNumberMatchesNative locks the baseline/event
+// consistency the silent-failure review flagged: a json.Number event cell renders
+// byte-identically to FormatTextValue of the equivalent native Go value (the path
+// baseline-origin INT/DOUBLE cells take), including extreme doubles where the raw
+// literal (1e+21) differs from FormatTextValue's decimal form. FLOAT (float32) is
+// the documented exception (separate sub-test below).
+func TestFullTableTextCell_jsonNumberMatchesNative(t *testing.T) {
+	h := NewHandler(nil, nil)
+	cases := []struct {
+		num    json.Number
+		native any
+	}{
+		{"18446744073709551615", uint64(18446744073709551615)},   // BIGINT UNSIGNED max
+		{"100", int64(100)},
+		{"-9223372036854775808", int64(-9223372036854775808)},    // BIGINT signed min
+		{"1e+21", float64(1e21)},                                 // extreme double: "1e+21" vs decimal
+		{"-1e+21", float64(-1e21)},                               // negative extreme double
+		{"0.0000001", float64(1e-7)},
+		{"100.5", float64(100.5)},
+	}
+	for _, c := range cases {
+		event, _ := h.fullTableTextCell("s", "t", "c", c.num).([]byte)
+		baseline, _ := h.fullTableTextCell("s", "t", "c", c.native).([]byte)
+		if string(event) != string(baseline) {
+			t.Errorf("json.Number(%q) → %q, native %T → %q (must be identical)", c.num, event, c.native, baseline)
+		}
+	}
+
+	// Documented KNOWN exception (pre-existing, baseline-side, tracked as a
+	// follow-up): a baseline FLOAT column is scanned by DuckDB as float32, which
+	// FormatTextValue widens — so it does NOT match the event side's shortest
+	// float32 literal. This locks the current behavior so a future baseline
+	// float32 fix has to update it deliberately.
+	eventFloat := string(h.fullTableTextCell("s", "t", "c", json.Number("0.1")).([]byte))
+	baselineFloat := string(h.fullTableTextCell("s", "t", "c", float32(0.1)).([]byte))
+	if eventFloat != "0.1" {
+		t.Errorf("event FLOAT 0.1 = %q, want \"0.1\"", eventFloat)
+	}
+	if eventFloat == baselineFloat {
+		t.Errorf("FLOAT baseline (float32) is expected to DIVERGE from the event side today; "+
+			"event=%q baseline=%q — if a baseline float32 fix made them match, update this test and the comments", eventFloat, baselineFloat)
+	}
+}
 
 // TestHandlerHandshakeNoise verifies the small allow-list for queries
 // MySQL clients send during connection setup — these shouldn't be

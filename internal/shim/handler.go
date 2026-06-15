@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -498,7 +499,7 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 func imageToResultVerbatim(image map[string]any, cols []string) (*mysql.Result, error) {
 	row := make([]any, len(cols))
 	for i, c := range cols {
-		row[i] = image[c] // nil for missing key → NULL on wire
+		row[i] = resultsetValue(image[c]) // nil for missing key → NULL on wire
 	}
 	rs, err := mysql.BuildSimpleTextResultset(cols, [][]any{row})
 	if err != nil {
@@ -706,7 +707,7 @@ func imagesToResult(images []map[string]any, ddlOrder []string) (*mysql.Result, 
 	for i, img := range images {
 		row := make([]any, len(cols))
 		for j, c := range cols {
-			row[j] = img[c]
+			row[j] = resultsetValue(img[c])
 		}
 		values[i] = row
 	}
@@ -1171,6 +1172,48 @@ func marshalImageOrdered(image map[string]any, ddlOrder []string) string {
 	return sb.String()
 }
 
+// numberToText renders a JSON-decoded numeric row-image value (#496) to the
+// SAME wire bytes go-mysql's FormatTextValue produces for the equivalent native
+// value. Two reasons it must pre-render to []byte rather than return a numeric:
+//   - BuildSimpleTextResultset fixes a column's wire type from its first row and
+//     rejects later rows of a different Go type ("row types aren't consistent").
+//     Returning int64 for an integral DOUBLE and float64 for a fractional one in
+//     the same column would crash the whole _flashback full-table query. A
+//     uniform []byte makes every such column VAR_STRING.
+//   - In the full-table _snapshot merge, baseline-origin INT/DOUBLE cells
+//     (DuckDB-native, rendered via FormatTextValue) and event-origin cells emit
+//     identical bytes because both route through FormatTextValue (a raw
+//     json.Number literal would diverge, e.g. "1e+21" vs "1000…0"). FLOAT(32-bit)
+//     is the known exception — see runSnapshotFullTable.
+// The exact numeric type is recovered first so a BIGINT UNSIGNED > 2^63 stays
+// exact (int64 → uint64 → float64), falling back to the literal text.
+func numberToText(n json.Number) []byte {
+	var v any
+	if i, err := n.Int64(); err == nil {
+		v = i
+	} else if u, err := strconv.ParseUint(n.String(), 10, 64); err == nil {
+		v = u
+	} else if f, err := n.Float64(); err == nil {
+		v = f
+	} else {
+		return []byte(n.String())
+	}
+	if b, err := mysql.FormatTextValue(v); err == nil {
+		return b
+	}
+	return []byte(n.String())
+}
+
+// resultsetValue normalizes a row-image cell for BuildSimpleTextResultset. A
+// json.Number (#496) is pre-rendered to uniform text bytes via numberToText;
+// every other value passes through unchanged.
+func resultsetValue(v any) any {
+	if n, ok := v.(json.Number); ok {
+		return numberToText(n)
+	}
+	return v
+}
+
 // imageToResult turns a single-row JSON object into a mysql.Result
 // shaped for the wire protocol. Columns are emitted in ddlOrder
 // (the source table's column ordinal_position from the latest
@@ -1190,7 +1233,7 @@ func imageToResult(image map[string]any, ddlOrder []string) (*mysql.Result, erro
 	cols := orderColumns(image, ddlOrder)
 	row := make([]any, len(cols))
 	for i, c := range cols {
-		row[i] = image[c]
+		row[i] = resultsetValue(image[c])
 	}
 
 	rs, err := mysql.BuildSimpleTextResultset(cols, [][]any{row})

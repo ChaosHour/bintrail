@@ -2,6 +2,7 @@ package shim
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -163,13 +164,19 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 	// Buffer the merged rows, coercing every value to a uniform text cell
 	// (see fullTableTextCell). This is required, not cosmetic: a baseline row
 	// carries DuckDB-native types (an int column is int32 → LONGLONG) while a
-	// post-baseline event image is JSON-decoded (the same column is float64 →
-	// DOUBLE), and BuildSimpleTextResultset rejects a column whose non-NULL
-	// rows disagree on type ("row types aren't consistent"). Rendering every
-	// cell to its text bytes makes each column uniformly VAR_STRING, lossless
-	// for large integers (unlike the event path's float64), and identical on
-	// the wire to per-value formatting. Stop at cap+1 so overflow is
-	// detectable.
+	// post-baseline event image is JSON-decoded (the same column arrives as
+	// json.Number), and BuildSimpleTextResultset rejects a column whose non-NULL
+	// rows disagree on type ("row types aren't consistent"). Rendering every cell
+	// to its text bytes makes each column uniformly VAR_STRING. For INT and DOUBLE
+	// columns the two origins render byte-identically: fullTableTextCell routes
+	// json.Number through numberToText, the same FormatTextValue path the default
+	// branch uses for baseline values; and the #496 read-path fix keeps event-side
+	// integers exact (json.Number, no float64 rounding). Known pre-existing
+	// exceptions, both baseline-side and out of this path's control: FLOAT(32-bit)
+	// columns diverge (DuckDB scans baseline FLOAT as float32, which FormatTextValue
+	// widens — "0.10000000149011612" vs the event side's "0.1"), and a baseline
+	// BIGINT UNSIGNED > 2^63 can't round-trip (baseline stores bigint as signed
+	// Int64). Stop at cap+1 so overflow is detectable.
 	images := make([]map[string]any, 0)
 	err = reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
 		BaselinePath: baselinePath,
@@ -248,6 +255,13 @@ func (h *Handler) fullTableTextCell(schema, table, column string, v any) any {
 		return x
 	case string:
 		return []byte(x)
+	case json.Number:
+		// Post-baseline event images are JSON-decoded as json.Number (#496).
+		// Render through numberToText (FormatTextValue) so event-origin cells emit
+		// the same wire bytes as baseline-origin INT/DOUBLE cells (the default
+		// branch below renders DuckDB-native int64/float64 the same way). Baseline
+		// FLOAT (float32) is the known exception — see runSnapshotFullTable.
+		return numberToText(x)
 	case time.Time:
 		return []byte(x.UTC().Format("2006-01-02 15:04:05"))
 	default:
