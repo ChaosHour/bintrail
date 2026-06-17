@@ -15,7 +15,6 @@ import (
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/metadata"
-	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/recovery"
 )
@@ -90,6 +89,7 @@ func init() {
 	recoverCmd.Flags().StringVar(&rProfile, "profile", "", "Apply RBAC access rules for this profile (table-level deny and column-level redaction)")
 	recoverCmd.Flags().StringVar(&rFormat, "format", "text", "Output format: text or json")
 	recoverCmd.Flags().BoolVar(&rNoArchive, "no-archive", false, "Disable auto-routing to Parquet archives (MySQL-only results)")
+	addDuckDBTuningFlags(recoverCmd)
 	_ = recoverCmd.MarkFlagRequired("index-dsn")
 	bindCommandEnv(recoverCmd)
 
@@ -209,12 +209,16 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		dbName = cfg.DBName
 	}
 
+	duckTuning, err := duckDBTuningFromFlags(cmd)
+	if err != nil {
+		return err
+	}
 	rows, _, err := query.FetchMerged(cmd.Context(), db, engine, query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         dbName,
 		NoArchive:      rNoArchive || rProfile != "",
 		AllowGaps:      true, // preserve recover's warn-and-continue behavior
-		ArchiveFetcher: parquetquery.Fetch,
+		ArchiveFetcher: tunedArchiveFetcher(duckTuning),
 	})
 	if err != nil {
 		return err
