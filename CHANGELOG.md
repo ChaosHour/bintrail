@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-06-17
+
+### Added
+- **`--ultrafast` mode for the offline `query`, `recover`, and `reconstruct` commands** (#509, #510, #511). By default these commands run their internal DuckDB engine under a conservative, container-safe budget — 2 threads and a 4 GB memory limit, spilling to the OS temp directory when exceeded — so bintrail stays alive in small shared containers. On a dedicated host with spare RAM, `--ultrafast` lets DuckDB self-tune to the machine (all CPU cores, ~80% of physical RAM, still spilling before the limit) and reads S3 archives **directly via DuckDB's `httpfs` extension in a single parallel multi-file scan** instead of downloading each file to disk first, removing the double I/O on the S3 path. The bucket region is pinned in the credential secret so cross-region reads avoid a 301 redirect. Because `httpfs` holds each scanned file in memory outside DuckDB's `memory_limit`, the command logs the peak-RAM estimate (largest file × thread count) and `--duckdb-threads N` doubles as a memory-safety bound that caps how many files are scanned at once.
+- **Granular DuckDB tuning flags** `--duckdb-threads` and `--duckdb-memory-limit` (e.g. `16GB`), and the env vars `BINTRAIL_ULTRAFAST`, `BINTRAIL_DUCKDB_THREADS`, `BINTRAIL_DUCKDB_MEMORY_LIMIT`. An explicit flag wins over `--ultrafast`, which wins over the default, so you can tune to your box without the all-or-nothing switch. `--duckdb-memory-limit` is validated up front (a percentage, bare number, zero, or negative value is rejected with a clear error rather than silently mishandled by DuckDB). These flags affect only the offline CLI commands; the long-lived `shim` and `bintrail-console` daemons keep the container-safe default.
+
 ## [0.14.1] - 2026-06-15
 
 ### Fixed
