@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-06-19
+
+### Added
+- **MariaDB as a replication source (alpha)** (#515, #516). bintrail can now stream and index from a **MariaDB** source — pass `--source-flavor mariadb` to `bintrail stream` (or run `bintrail index` over MariaDB binlog files). The index database stays MySQL; only the source changes. The parser handles MariaDB `domain-server-seq` GTIDs and skips MariaDB-only binlog events (`Annotate_rows`, `Gtid_list`, `Binlog_checkpoint`) transparently, and the source flavor is recorded in the checkpoint so a GTID resume re-parses the saved set correctly. Primary target is MariaDB 11.4. A dedicated operator page (`docs/mariadb.md`) covers setup, version support, limitations, and troubleshooting. This is an **alpha** capability with narrower topology coverage than the MySQL path — read the limitations before relying on it.
+- **Real GTID gap detection for MariaDB sources** (#517, #518). MariaDB GTID-mode resume is promoted from degrade-to-warn to real purged-binlog gap detection. MariaDB has no `@@gtid_purged`, so the purge floor is derived from `BINLOG_GTID_POS` over the oldest surviving binlog; on resume a purged-binlog gap now raises the data-loss alarm (or, with `--no-gap-fill`, refuses to start) in **both position and GTID mode**, and multi-domain GTID sets are compared per domain.
+
+### Fixed
+- **An unfillable-gap auto-advance now records the data loss *before* advancing the checkpoint** (#518). The shared auto-advance path (MySQL and MariaDB) stamped `gap_lost_at` *after* advancing the checkpoint and only logged a warning on failure, so a transient index-DB error could leave an advanced checkpoint with no durable record of the loss — a healthy-looking stream that had silently skipped data. The durable record is now written first and fails loud, so the loss record can never desync from an advanced checkpoint.
+
 ## [0.15.0] - 2026-06-17
 
 ### Added
