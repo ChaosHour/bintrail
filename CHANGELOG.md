@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-06-20
+
+### Added
+- **DBA-centric index metrics** (`bintrail_index_*`) (#351). `bintrail stream --metrics-addr` and the `bintrail-console watch` daemon now expose Prometheus gauges describing the **state of the index** a DBA cares about for recovery readiness — alongside the existing live-pipeline `bintrail_stream_*` metrics: oldest/newest event timestamp and retention horizon (how far back recovery reaches), event count, partition counts (`active`/`future`), `gap_hours` (hours rotated out of MySQL but not archived — holes in coverage), and `storage_bytes{location=mysql|parquet}`. A scraper refreshes them from a status snapshot every `--metrics-scrape-interval` seconds (default 60). `bintrail status` (text and JSON) now also surfaces the MySQL index storage size and per-table baseline Parquet size. New `docs/observability.md` documents every metric with PromQL recipes.
+- **Third-party license notices shipped in release artifacts** (#428). Every distribution channel (tarball, `.deb`/`.rpm`, and the Docker images) now bundles a `THIRD-PARTY-NOTICES` file covering the statically-linked dependencies — DuckDB (MIT), `go-sql-driver/mysql` (MPL-2.0), the libduckdb-vendored C/C++ libraries (RE2, utf8proc, fmt, fast_float), and every linked Go module's license/NOTICE. A `make notices` target regenerates it, and a CI check fails if it drifts from the dependency graph.
+
+### Changed
+- **`bintrail index` now requires `--source-dsn`** (or an explicit `--skip-source-validation`) (#493). Previously, omitting `--source-dsn` silently skipped all source-server validation (including the `binlog_row_image = FULL` check). Indexing without a source connection now requires the explicit opt-out flag, under which the per-row partial-image guard (below) still applies. **This changes the behaviour of `bintrail index` invocations that omitted `--source-dsn`.**
+- **`bintrail baseline` now fails loud on an unconvertible value** instead of silently writing NULL (#506, #503). A legal MySQL all-zero date (`0000-00-00` / `0000-00-00 00:00:00`) is mapped to NULL with a per-column warning (not an abort); a genuinely unrepresentable value now aborts the run with a clear error rather than publishing a lossy baseline.
+
+### Fixed
+- **Partial binlog row images are now detected and rejected** (#493). A per-session `SET SESSION binlog_row_image = MINIMAL`/`NOBLOB` (which bypasses the server-global check) writes partial before/after images, so absent columns were indexed as NULL — silently corrupting the images `recover` later trusts. The parser now fails loud on any non-FULL row image, covering both the file-index and live-stream paths (including the no-false-positive case of a `FULL` image with a VIRTUAL generated column).
+- **`bintrail baseline` no longer silently loses `UNSIGNED` integers above the signed maximum** (#506). `BIGINT`/`INT UNSIGNED` values past the signed max failed conversion and were written as NULL; the schema parser now recognises the `unsigned` attribute and the writer round-trips the full unsigned range. The same `connection_id` (`INT UNSIGNED`) over-range loss on the archive and BYOS-buffer write paths is fixed too.
+- **Incomplete baseline snapshots are now flagged and excluded from discovery** (#467). A baseline run that failed or was killed mid-conversion left a partial snapshot byte-indistinguishable from a complete one, which time-travel / `reconstruct` would then serve as the newest. Runs now write a `_SUCCESS`/`_INCOMPLETE` marker — written *before* the workers launch, so even an uncatchable crash (OOM/SIGKILL) leaves the snapshot positively flagged — and discovery skips incomplete snapshots. The S3 upload path is crash-safe (incomplete-marker first, `_SUCCESS` last).
+- **S3 baseline staleness is now surfaced instead of silent** (#466). When an S3 baseline lookup falls back to an older snapshot (the requested table is missing from the newest one), it now logs a warning and the console surfaces a `stale_baseline` warning, rather than silently reconstructing from older data. A transient error on the advisory staleness scan no longer fails an otherwise-successful lookup.
+- **`archive reconcile --deep` no longer silently downgrades to non-deep** (#469). When an S3 Parquet footer probe failed, the deep row-count verification was silently skipped for that object and a dry-run could exit 0 on objects it was asked to verify. Footer-probe failures are now counted, surfaced in the text and JSON report, and make the dry-run exit non-zero — so a scheduled `--deep` monitor can't go green on unverified objects.
+
 ## [0.16.0] - 2026-06-19
 
 ### Added
