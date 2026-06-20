@@ -84,6 +84,12 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			slog.Warn("could not discover baselines", "dir", stBaselineDir, "error", bErr)
 		} else {
 			for _, b := range baselines {
+				var size int64
+				if fi, sErr := os.Stat(b.Path); sErr == nil {
+					size = fi.Size()
+				} else {
+					slog.Warn("could not stat baseline file for size", "path", b.Path, "error", sErr)
+				}
 				data.Baselines = append(data.Baselines, status.BaselineInfo{
 					SnapshotTime: b.SnapshotTime,
 					Database:     b.Database,
@@ -92,6 +98,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 					BinlogPos:    b.BinlogPos,
 					GTIDSet:      b.GTIDSet,
 					Path:         b.Path,
+					Size:         size,
 				})
 			}
 		}
