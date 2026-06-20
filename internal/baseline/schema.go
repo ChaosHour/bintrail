@@ -14,13 +14,20 @@ import (
 type Column struct {
 	Name        string
 	MySQLType   string // raw type token e.g. "int", "varchar", "datetime"
+	Unsigned    bool   // true when the column carries the UNSIGNED attribute
 	ParquetType parquet.Node
 }
 
 // colRe matches a column definition line from mydumper's schema SQL output.
-// Groups: 1=name, 2=type token.
-// Handles backtick-quoted names and covers common MySQL type forms.
-var colRe = regexp.MustCompile("^\\s+`([^`]+)`\\s+(\\w+)")
+// Groups: 1=name, 2=type token, 3="unsigned" iff present.
+// The unsigned attribute is matched only in the tail that immediately follows
+// the type token (plus an optional display width like int(10)), so a column
+// literally named `is_unsigned` or a COMMENT containing "unsigned" never trips
+// it — the name lives in group 1 inside backticks, separate from group 3.
+// The unsigned group is case-insensitive (`(?i:...)` inside a capture group, so
+// group 3 is preserved): mydumper emits lowercase by contract, but an uppercase
+// UNSIGNED from a hand-rolled schema must not silently fall through to signed.
+var colRe = regexp.MustCompile("^\\s+`([^`]+)`\\s+(\\w+)(?:\\s*\\([^)]*\\))?\\s*((?i:unsigned))?")
 
 // ParseSchema reads a mydumper <db>.<table>-schema.sql file and returns the
 // ordered list of columns with their Parquet type mappings.
@@ -50,10 +57,12 @@ func ParseSchema(path string) ([]Column, error) {
 		}
 		name := m[1]
 		typeToken := strings.ToLower(m[2])
+		unsigned := strings.EqualFold(m[3], "unsigned")
 		cols = append(cols, Column{
 			Name:        name,
 			MySQLType:   typeToken,
-			ParquetType: MysqlToParquetNode(typeToken),
+			Unsigned:    unsigned,
+			ParquetType: mysqlToParquetNode(typeToken, unsigned),
 		})
 	}
 	if err := scanner.Err(); err != nil {
@@ -74,13 +83,48 @@ func BuildParquetSchema(cols []Column) *parquet.Schema {
 	return parquet.NewSchema("row", group)
 }
 
-// MysqlToParquetNode maps a MySQL type token to the appropriate parquet-go node.
-// All fields are Optional so NULL values can be represented.
+// MysqlToParquetNode maps a MySQL type token to the appropriate parquet-go node,
+// treating integer types as signed. Callers with an UNSIGNED column should build
+// the column via ParseSchema (which threads the attribute through) or via
+// MysqlToParquetNode2 — this signed-only entry point is preserved for external
+// callers that pass a bare type token (e.g. internal/archive, internal/byos).
 func MysqlToParquetNode(typeToken string) parquet.Node {
+	return mysqlToParquetNode(typeToken, false)
+}
+
+// MysqlToParquetNode2 is the unsigned-aware entry point for callers that hand-
+// build a Column from a bare type token (internal/archive.BinlogEventColumns,
+// internal/byos) rather than going through ParseSchema. It must be used for any
+// column backing an UNSIGNED MySQL type (e.g. connection_id is INT UNSIGNED):
+// the signed-only MysqlToParquetNode would emit an Int(32) column, and a value
+// past int32 (a CONNECTION_ID() above 2147483647) would then fail conversion
+// against that signed column. Passing unsigned=true widens it the same way
+// ParseSchema does (INT UNSIGNED → Int64, BIGINT UNSIGNED → Uint64).
+func MysqlToParquetNode2(typeToken string, unsigned bool) parquet.Node {
+	return mysqlToParquetNode(typeToken, unsigned)
+}
+
+// mysqlToParquetNode maps a MySQL type token (plus its UNSIGNED attribute) to the
+// appropriate parquet-go node. All fields are Optional so NULL values can be
+// represented. UNSIGNED integers are widened so the full unsigned range
+// round-trips without overflow into the signed-NULL fallback (issue #506):
+//   - INT/INTEGER UNSIGNED (max 4294967295) → INT64 (holds it as a positive value)
+//   - BIGINT UNSIGNED (max 18446744073709551615) → UINT64 (logical unsigned)
+//
+// TINYINT/SMALLINT/MEDIUMINT UNSIGNED already fit in int32, so they keep Int(32).
+func mysqlToParquetNode(typeToken string, unsigned bool) parquet.Node {
 	switch typeToken {
-	case "tinyint", "smallint", "mediumint", "int", "integer":
+	case "int", "integer":
+		if unsigned {
+			return parquet.Optional(parquet.Int(64))
+		}
+		return parquet.Optional(parquet.Int(32))
+	case "tinyint", "smallint", "mediumint":
 		return parquet.Optional(parquet.Int(32))
 	case "bigint":
+		if unsigned {
+			return parquet.Optional(parquet.Uint(64))
+		}
 		return parquet.Optional(parquet.Int(64))
 	case "float":
 		return parquet.Optional(parquet.Leaf(parquet.FloatType))
