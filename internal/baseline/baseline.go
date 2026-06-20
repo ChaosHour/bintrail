@@ -95,6 +95,24 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 		compression = "zstd"
 	}
 
+	// Crash-safety (#467): create the snapshot directory and flag it _INCOMPLETE
+	// BEFORE launching the workers. The graceful failure paths below leave this
+	// marker in place; a successful run replaces it with _SUCCESS (which removes
+	// _INCOMPLETE). Writing the marker only after wg.Wait() (the original code)
+	// left a window where an UNCATCHABLE kill (OOM / SIGKILL / power loss)
+	// mid-conversion produced a markerless partial snapshot that SnapshotComplete
+	// trusts as complete-by-default and discovery serves as the newest baseline —
+	// the exact #467 silent loss this marker exists to close. (It also fixes a
+	// latent bug: a context cancelled before any table converted never created
+	// snapDir, so the old post-wait markIncomplete wrote into a non-existent
+	// directory and silently failed.) The per-table output dirs created lazily by
+	// the writers nest under snapDir.
+	snapDir := filepath.Join(cfg.OutputDir, tsDir)
+	if err := os.MkdirAll(snapDir, 0o755); err != nil {
+		return Stats{}, fmt.Errorf("create snapshot directory %s: %w", snapDir, err)
+	}
+	markIncomplete(snapDir)
+
 	// Process tables in parallel with bounded concurrency.
 	concurrency := runtime.NumCPU()
 	if concurrency < 1 {
@@ -189,9 +207,12 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 	}
 	wg.Wait()
 
-	// A cancelled run skipped tables without recording errors (workers just
-	// return on ctx.Err()) — succeeding here would publish a partial snapshot
-	// indistinguishable from a complete one.
+	// snapDir was created and flagged _INCOMPLETE before the workers launched
+	// (see above), so every early return below leaves the snapshot positively
+	// marked incomplete without re-writing the marker. Only full success
+	// replaces it with _SUCCESS. A cancelled run skipped tables without
+	// recording errors (workers return on ctx.Err()), so it too must stay
+	// _INCOMPLETE rather than publish a partial snapshot as complete.
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
@@ -201,7 +222,22 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 		}
 		return stats, errs[0]
 	}
+	if err := WriteSuccessMarker(snapDir); err != nil {
+		// The snapshot is complete on disk but unmarked; without the _SUCCESS
+		// marker (and absent _INCOMPLETE) discovery still treats it as
+		// complete-by-default, so this is a degraded-observability failure, not
+		// a data one. Fail loud so the operator can re-run.
+		return stats, fmt.Errorf("snapshot complete but could not write %s marker: %w", SuccessMarker, err)
+	}
 	return stats, nil
+}
+
+// markIncomplete best-effort flags a partial snapshot directory. A run already
+// failing must not be masked by a marker-write error, so we only log it.
+func markIncomplete(snapDir string) {
+	if err := WriteIncompleteMarker(snapDir); err != nil {
+		slog.Warn("could not write incomplete-snapshot marker", "dir", snapDir, "error", err)
+	}
 }
 
 // processTable converts a single table's mydumper files to Parquet.
