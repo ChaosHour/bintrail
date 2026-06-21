@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-06-20
+
+### Changed
+- **`bintrail rotate` no longer requires `--bintrail-id` when archiving** (#539). It now defaults to the `bintrail_id` already recorded in `stream_state`. Precedence: an explicitly CLI-typed `--bintrail-id` > the `stream_state` id > a global `BINTRAIL_ID` environment value (last resort, with a warning) — so a single global `BINTRAIL_ID` can't silently become the archive write-key for every server.
+
+### Fixed
+- **MariaDB sources now receive a stable, unique `bintrail_id`** (#539). MariaDB has no `@@server_uuid`, so identity resolution previously failed and the source streamed with a NULL `bintrail_id`; two MariaDB servers archived to the same S3 location then collided under an empty `bintrail_id=/` prefix. bintrail now synthesizes a stable identity anchor from the source address (`host:port`), so distinct servers separate into distinct archive prefixes automatically. The MySQL identity path (via `@@server_uuid`) is unchanged.
+- **`bintrail rotate --daemon` now fails loud at startup on an unresolvable archive `bintrail_id`** (#539). Previously a misconfigured archive daemon (no `--bintrail-id`, no `stream_state` id, no `BINTRAIL_ID`) logged an error every cycle but kept running and never rotated — silently filling the index disk. It now exits at startup on this permanent precondition error, while transient errors (e.g. a not-yet-ready index DB) still self-heal on the next tick.
+
 ## [0.16.1] - 2026-06-20
 
 ### Added
