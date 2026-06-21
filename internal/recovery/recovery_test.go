@@ -46,7 +46,7 @@ func TestFormatSQLValue_jsonNumber(t *testing.T) {
 		{"9223372036854775807", "9223372036854775807"},   // BIGINT signed max
 		{"-9223372036854775808", "-9223372036854775808"}, // BIGINT signed min
 		{"1000000000000000007", "1000000000000000007"},   // > 2^53: float64 would round
-		{"3.14", "3.14"},                                 // decimal preserved verbatim
+		{"3.14", "3.14"}, // decimal preserved verbatim
 		{"0", "0"},
 	}
 	for _, c := range cases {
@@ -223,6 +223,39 @@ func TestGenerateUpdate_basic(t *testing.T) {
 	assertSQL(t, stmt, "'pending'")
 	// WHERE clause must use row_after value "shipped" (all-cols fallback)
 	assertSQL(t, stmt, "'shipped'")
+}
+
+func TestGenerateUpdate_pgOriginSchemaVersion0(t *testing.T) {
+	// A PostgreSQL-origin UPDATE recovers correctly through the real recovery path: PG
+	// has no schema_snapshots, so the row carries SchemaVersion 0 and recovery runs
+	// with a nil resolver (all-columns WHERE fallback). It must NOT crash and the SET
+	// must restore the real before value — including the out-of-line TOAST value that
+	// Option B resolved into both images at decode time. (PK-scoped WHERE is deferred
+	// to #533, which adds the offline PG schema metadata recovery would otherwise need.)
+	//
+	// The no-sentinel-in-recovery guarantee is enforced UPSTREAM, not here: the RI-FULL
+	// gate (validateReplicaIdentity + cacheRelation) ensures the before-image is always
+	// complete, so the unchanged-TOAST marker is never produced for a supported source
+	// and so can never reach recovery. The sentinel check below is therefore a cheap
+	// belt-and-suspenders, not the proof of that property.
+	const sentinel = "__bintrail_unchanged_toast__" // == pgcapture.UnchangedToastKey
+	const bigVal = "BIG-OUT-OF-LINE-TOAST-VALUE"
+	g := newGen() // nil resolver → all-cols WHERE fallback, like a PG-origin row
+	row := query.ResultRow{
+		EventID: 7, SchemaName: "public", TableName: "docs",
+		EventType: parser.EventUpdate, SchemaVersion: 0, PKValues: "1",
+		RowBefore: map[string]any{"id": "1", "title": "orig", "body": bigVal},
+		RowAfter:  map[string]any{"id": "1", "title": "changed", "body": bigVal}, // Option B resolved body
+	}
+	stmt, err := g.generateUpdate(row)
+	if err != nil {
+		t.Fatalf("recovery must not fail on a PG-origin (SchemaVersion 0) row: %v", err)
+	}
+	assertSQL(t, stmt, "'orig'") // SET restores the before value
+	assertSQL(t, stmt, bigVal)   // the TOAST value round-trips into recovery SQL
+	if strings.Contains(stmt, sentinel) {
+		t.Errorf("recovery SQL leaked the unchanged-TOAST sentinel into a predicate:\n%s", stmt)
+	}
 }
 
 func TestGenerateUpdate_nilRowBefore(t *testing.T) {
