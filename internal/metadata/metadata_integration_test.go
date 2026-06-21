@@ -4,11 +4,78 @@ package metadata
 
 import (
 	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
+
+// TestTakeSnapshotCapturesFKRules pins cascade-recovery Slice A: a snapshot of
+// a cascade schema records each FK's delete_rule/update_rule in fk_constraints,
+// and CascadeConstraintsInIndex surfaces the CASCADE edge for the source-less
+// recover-time warning.
+func TestTakeSnapshotCapturesFKRules(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE parent (id INT PRIMARY KEY) ENGINE=InnoDB`)
+	testutil.MustExec(t, sourceDB, `CREATE TABLE child (
+		id  INT PRIMARY KEY,
+		pid INT,
+		CONSTRAINT fk_child FOREIGN KEY (pid) REFERENCES parent(id) ON DELETE CASCADE ON UPDATE CASCADE
+	) ENGINE=InnoDB`)
+	// A non-cascade (RESTRICT) child must be EXCLUDED by CascadeConstraintsInIndex —
+	// pins the delete_rule/update_rule = 'CASCADE' filter against being too permissive.
+	testutil.MustExec(t, sourceDB, `CREATE TABLE child_restrict (
+		id  INT PRIMARY KEY,
+		pid INT,
+		CONSTRAINT fk_restrict FOREIGN KEY (pid) REFERENCES parent(id) ON DELETE RESTRICT ON UPDATE RESTRICT
+	) ENGINE=InnoDB`)
+
+	if _, err := TakeSnapshot(sourceDB, indexDB, []string{sourceName}); err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+
+	var del, upd string
+	if err := indexDB.QueryRow(`SELECT delete_rule, update_rule FROM fk_constraints
+		WHERE schema_name = ? AND table_name = 'child' AND column_name = 'pid'`,
+		sourceName).Scan(&del, &upd); err != nil {
+		t.Fatalf("read fk_constraints rule: %v", err)
+	}
+	if del != "CASCADE" {
+		t.Errorf("delete_rule = %q, want CASCADE", del)
+	}
+	if upd != "CASCADE" {
+		t.Errorf("update_rule = %q, want CASCADE", upd)
+	}
+
+	edges, err := CascadeConstraintsInIndex(indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("CascadeConstraintsInIndex: %v", err)
+	}
+	if len(edges) != 1 {
+		t.Fatalf("want exactly 1 cascade edge (RESTRICT child excluded), got %d: %+v", len(edges), edges)
+	}
+	if edges[0].Table != "child" || edges[0].DeleteRule != "CASCADE" || edges[0].ReferencedTable != "parent" {
+		t.Errorf("unexpected cascade edge: %+v", edges[0])
+	}
+	for _, e := range edges {
+		if e.Table == "child_restrict" {
+			t.Errorf("RESTRICT-only child must be excluded, but appeared: %+v", e)
+		}
+	}
+
+	// An unrelated schema yields no cascade edges.
+	none, err := CascadeConstraintsInIndex(indexDB, []string{"nonexistent_schema"})
+	if err != nil {
+		t.Fatalf("CascadeConstraintsInIndex(none): %v", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("want 0 edges for an unrelated schema, got %d", len(none))
+	}
+}
 
 func TestTakeSnapshot_nonInnoDB(t *testing.T) {
 	sourceDB, sourceName := testutil.CreateTestDB(t)
@@ -350,8 +417,14 @@ func TestValidateNoFKCascades_cascade(t *testing.T) {
 		CONSTRAINT fk_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
 	)`)
 
-	if err := ValidateNoFKCascades(db, []string{dbName}); err == nil {
+	err := ValidateNoFKCascades(db, []string{dbName})
+	if err == nil {
 		t.Fatal("expected error for schema with FK cascade, got nil")
+	}
+	// The cascade finding must be wrapped in ErrFKCascadesFound so call sites can
+	// errors.Is it apart from an operational query failure (which must still abort).
+	if !errors.Is(err, ErrFKCascadesFound) {
+		t.Errorf("cascade error must wrap ErrFKCascadesFound, got: %v", err)
 	}
 }
 
