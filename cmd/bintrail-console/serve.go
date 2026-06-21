@@ -82,7 +82,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	envOnce.Do(loadEnvFile)
 
 	// index-dsn falls back to BINTRAIL_INDEX_DSN, the one shared binding the
-	// console uses (core bintrail wires this via bindCommandEnv/envBindings).
+	// console uses (core bintrail wires this via bindCommandEnv/cli.EnvBindings).
 	if !cmd.Flags().Changed("index-dsn") {
 		if v := os.Getenv("BINTRAIL_INDEX_DSN"); v != "" {
 			conIndexDSN = v

@@ -89,8 +89,8 @@ var (
 )
 
 // watchEnvBindings maps watch's flags to their BINTRAIL_ environment
-// variables — the subset of the core CLI's envBindings (cmd/bintrail/
-// envload.go) that exists on this command. Applied by bindWatchEnv with the
+// variables — the subset of the core CLI's cli.EnvBindings (internal/cli/
+// env.go) that exists on this command. Applied by bindWatchEnv with the
 // same semantics: an env-set flag is marked Changed, which both satisfies
 // MarkFlagRequired and keeps rotation.ParseSettings' explicit-retention
 // detection working for env-configured daemons (the compose path).

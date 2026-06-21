@@ -51,7 +51,7 @@ func TestRunUp_explicitRetentionWiring(t *testing.T) {
 	}
 }
 
-// TestUpRotateFlagsRegistered pins the flag names to the envBindings strings:
+// TestUpRotateFlagsRegistered pins the flag names to the cli.EnvBindings strings:
 // bindCommandEnv silently skips bindings whose flag doesn't exist on the
 // command, so a renamed flag would make BINTRAIL_ROTATE_RETAIN=off silently
 // fail to disable rotation.

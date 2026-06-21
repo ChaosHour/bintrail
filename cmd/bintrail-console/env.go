@@ -19,9 +19,11 @@ var envOnce sync.Once
 //  1. .bintrail.env in the current directory
 //  2. ~/.config/bintrail/config.env
 //
-// loadEnvFile/parseAndSetEnv mirror the core bintrail loader in
-// cmd/bintrail/envload.go — replicated rather than shared via internal/ to
-// keep the core binary untouched by the decouple. `serve` reads only
+// loadEnvFile/parseAndSetEnv mirror the core bintrail loader (now in
+// internal/cli/env.go since #529; was cmd/bintrail/envload.go) — the console
+// keeps its own copy. Since #529 placed these helpers in internal/cli, this
+// copy is a consolidation candidate (the "dedup env loader" follow-up).
+// `serve` reads only
 // BINTRAIL_INDEX_DSN / BINTRAIL_CONSOLE_* directly in runServe; `watch`
 // additionally binds the stream/rotation BINTRAIL_* vars to its flags via
 // bindWatchEnv (watch.go), the same role the core's bindCommandEnv plays.
