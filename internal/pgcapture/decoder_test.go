@@ -568,3 +568,63 @@ func assertNoToastMarker(t *testing.T, row map[string]any) {
 func containsToastKey(s string) bool {
 	return strings.Contains(s, pgcapture.UnchangedToastKey)
 }
+
+// ─── identity / generated attrs (#557) ─────────────────────────────────────────
+
+func TestDecode_RelationCarriesIdentityGenerated(t *testing.T) {
+	// The AttrResolver's per-column identity/generated flags must reach the
+	// EventRelation columns (the consumer persists them for #557 recovery).
+	attrs := map[string]pgcapture.ColumnAttrs{
+		"id": {IsIdentityAlways: true},
+		"g":  {IsGenerated: true},
+	}
+	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil,
+		pgcapture.WithAttrResolver(func(_ uint32, _, _ string) (map[string]pgcapture.ColumnAttrs, error) {
+			return attrs, nil
+		}))
+	ev, emit := mustDecode(t, d, relMsg(1, "public", "t", "id", "v", "g"))
+	if !emit {
+		t.Fatal("RelationMessage should emit an EventRelation")
+	}
+	byName := map[string]metadata.PGRelationColumn{}
+	for _, c := range ev.Relation.Columns {
+		byName[c.Name] = c
+	}
+	if !byName["id"].IsIdentityAlways || byName["id"].IsGenerated {
+		t.Errorf("id: want IsIdentityAlways only, got %+v", byName["id"])
+	}
+	if byName["g"].IsIdentityAlways || !byName["g"].IsGenerated {
+		t.Errorf("g: want IsGenerated only, got %+v", byName["g"])
+	}
+	if byName["v"].IsIdentityAlways || byName["v"].IsGenerated {
+		t.Errorf("v: want neither flag, got %+v", byName["v"])
+	}
+}
+
+func TestDecode_AttrResolverErrorFailsLoud(t *testing.T) {
+	// A catalog lookup failure for identity/generated must fail loud, like the PK
+	// lookup — never silently index rows recovery would mis-handle.
+	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil,
+		pgcapture.WithAttrResolver(func(_ uint32, _, _ string) (map[string]pgcapture.ColumnAttrs, error) {
+			return nil, errBoom
+		}))
+	_, _, err := d.Decode(relMsg(1, "public", "t", "id", "v"))
+	if err == nil {
+		t.Fatal("expected a loud error when the AttrResolver fails")
+	}
+	if !strings.Contains(err.Error(), "column-attr lookup") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestDecode_NoAttrResolverDefaultsFalse(t *testing.T) {
+	// Without an AttrResolver (the existing 3-arg NewDecoder calls), the flags default
+	// to false — the safe default for the recovery skip-sets.
+	d := pgcapture.NewDecoder(pkResolver("id"), event.Filters{}, nil)
+	ev, _ := mustDecode(t, d, relMsg(1, "public", "t", "id", "v"))
+	for _, c := range ev.Relation.Columns {
+		if c.IsIdentityAlways || c.IsGenerated {
+			t.Errorf("col %s: flags should default false without an AttrResolver, got %+v", c.Name, c)
+		}
+	}
+}
