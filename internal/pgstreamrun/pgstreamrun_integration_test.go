@@ -383,6 +383,215 @@ func TestOne_MultiTable_PKScopedRecovery(t *testing.T) {
 	}
 }
 
+// TestOne_PGDialect_ReversalExecutesAgainstPostgres is the #533 PG-dialect proof:
+// the reversal SQL bintrail-pg generates for PG-origin rows is valid PostgreSQL — it
+// EXECUTES against the live source and round-trips the values, including the escaping
+// cases the MySQL dialect would break: a single quote (MySQL `\'` → PG syntax error)
+// and a backslash (MySQL `\\` → silently stored doubled). It covers all three reversal
+// shapes — reverse INSERT (VALUES), reverse UPDATE (SET, escaping in the SET clause),
+// reverse DELETE (PK-scoped WHERE) — each executed against PostgreSQL, plus the
+// dialect-selection path (recovery.DialectForIndex on a PG-flavored index).
+//
+// Scope asterisk: this proves validity for tables WITHOUT identity / STORED generated
+// columns. A reverse INSERT into a `GENERATED ALWAYS AS IDENTITY` PK needs OVERRIDING
+// SYSTEM VALUE, and STORED generated columns must be omitted — both capture-side,
+// tracked in #557.
+func TestOne_PGDialect_ReversalExecutesAgainstPostgres(t *testing.T) {
+	pgDSN := testutil.SkipIfNoPostgres(t)
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	indexDB, dbName := testutil.CreateTestDB(t)
+	indexDSN := testutil.BaseDSN() + "/" + dbName
+
+	const slot = "bintrail_pgdialect"
+	const pub = "bintrail_pgdialect_pub"
+	const tbl = "pgdialect_t"
+
+	pg, err := pgx.Connect(ctx, pgDSN)
+	if err != nil {
+		t.Fatalf("connect PG: %v", err)
+	}
+	t.Cleanup(func() { pg.Close(context.Background()) })
+
+	dropAll := func() {
+		bg := context.Background()
+		_, _ = pg.Exec(bg, "DROP PUBLICATION IF EXISTS "+pub)
+		_, _ = pg.Exec(bg, "DROP TABLE IF EXISTS "+tbl)
+		_, _ = pg.Exec(bg, "SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)", slot)
+	}
+	dropAll()
+	t.Cleanup(dropAll)
+
+	mustExec := func(sqlStr string, args ...any) {
+		t.Helper()
+		if _, err := pg.Exec(ctx, sqlStr, args...); err != nil {
+			t.Fatalf("exec %q: %v", sqlStr, err)
+		}
+	}
+	mustExec(fmt.Sprintf(`CREATE TABLE %s (
+		id int PRIMARY KEY, name text, num numeric, frac numeric, bin bytea,
+		uid uuid, doc jsonb, flag boolean, ts timestamptz)`, tbl))
+	mustExec(fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY FULL", tbl))
+	mustExec(fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s", pub, tbl))
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cfg := pgstreamrun.Config{
+		IndexDSN: indexDSN, ReplDSN: replDSN(pgDSN), QueryDSN: pgDSN,
+		SlotName: slot, Publication: pub, ServerID: 44,
+		BatchSize: 100, Checkpoint: 200 * time.Millisecond,
+	}
+	runErr := make(chan error, 1)
+	go func() { runErr <- pgstreamrun.One(runCtx, cfg) }()
+	waitFor(t, 15*time.Second, func() bool {
+		var active bool
+		if err := pg.QueryRow(ctx, "SELECT active FROM pg_replication_slots WHERE slot_name=$1", slot).Scan(&active); err != nil {
+			return false
+		}
+		return active
+	}, "replication slot active")
+
+	// The escaping-critical value: a single quote AND a backslash. With MySQL escaping
+	// the quote would make a statement a syntax error and the backslash would be
+	// silently doubled. numeric > 2^53 guards precision, frac=1.50 guards scale, jsonb
+	// carries an embedded quote too.
+	const trickyName = `O'Brien \ C:\back`
+	const bigNum = "18446744073709551615"
+	selCanonical := fmt.Sprintf("SELECT name, num::text, frac::text, encode(bin,'hex'), uid::text, doc::text, flag::text, ts::text FROM %s WHERE id=1", tbl)
+	type rowText struct{ name, num, frac, bin, uid, doc, flag, ts string }
+	mustExec(fmt.Sprintf("INSERT INTO %s VALUES (1, $1, $2, 1.50, '\\xdeadbeef', '11111111-1111-1111-1111-111111111111', $3, true, '2026-06-22 12:00:00+00')", tbl),
+		trickyName, bigNum, `{"k": "v's"}`)
+	// Capture PostgreSQL's canonical text rendering of the original row (V1, flag=true).
+	var orig rowText
+	if err := pg.QueryRow(ctx, selCanonical).Scan(&orig.name, &orig.num, &orig.frac, &orig.bin, &orig.uid, &orig.doc, &orig.flag, &orig.ts); err != nil {
+		t.Fatalf("capture original canonical text: %v", err)
+	}
+	mustExec(fmt.Sprintf("UPDATE %s SET flag=false WHERE id=1", tbl)) // → V2; reverse-UPDATE must restore the full V1 before-image
+	mustExec(fmt.Sprintf("DELETE FROM %s WHERE id=1", tbl))
+
+	waitFor(t, 15*time.Second, func() bool {
+		var n int
+		if err := indexDB.QueryRow("SELECT COUNT(*) FROM binlog_events WHERE table_name = ?", tbl).Scan(&n); err != nil {
+			return false
+		}
+		return n >= 3 // INSERT + UPDATE + DELETE
+	}, "INSERT+UPDATE+DELETE indexed")
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("One returned error: %v", err)
+	}
+
+	// The dialect SELECTION path `bintrail-pg recover` actually runs: a PG-flavored
+	// index (pgstreamrun stamped stream_state.flavor='postgres') must resolve to
+	// PostgresDialect — not the tautological pure-mapper test.
+	if d := recovery.DialectForIndex(indexDB); d != recovery.PostgresDialect {
+		t.Fatalf("DialectForIndex on a PG-flavored index = %v, want PostgresDialect", d)
+	}
+
+	rows, err := query.New(indexDB).Fetch(ctx, query.Options{Schema: "public", Table: tbl, Order: "ASC"})
+	if err != nil {
+		t.Fatalf("query Fetch: %v", err)
+	}
+	var insRow, updRow, delRow *query.ResultRow
+	for i := range rows {
+		switch rows[i].EventType {
+		case event.EventInsert:
+			insRow = &rows[i]
+		case event.EventUpdate:
+			updRow = &rows[i]
+		case event.EventDelete:
+			delRow = &rows[i]
+		}
+	}
+	if insRow == nil || updRow == nil || delRow == nil {
+		t.Fatalf("expected INSERT+UPDATE+DELETE events, got %d rows", len(rows))
+	}
+
+	resolver, err := metadata.NewResolver(indexDB, 0)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	genPG := func(r query.ResultRow) string {
+		var buf bytes.Buffer
+		if _, err := recovery.NewForDialect(indexDB, resolver, recovery.PostgresDialect).
+			GenerateSQLFromRows([]query.ResultRow{r}, &buf); err != nil {
+			t.Fatalf("GenerateSQLFromRows: %v", err)
+		}
+		return buf.String()
+	}
+
+	// ── Reverse the DELETE → a reverse INSERT (VALUES, all scary types). The row is
+	// gone; executing the reversal against live PostgreSQL must reconstruct the
+	// pre-DELETE row (V2: flag=false). The escaping-critical name comes through VALUES.
+	// A MySQL-dialect reversal would NOT execute here. ──
+	reverseInsert := genPG(*delRow)
+	if strings.Contains(reverseInsert, "`") {
+		t.Errorf("PG reversal contains MySQL backticks:\n%s", reverseInsert)
+	}
+	if !strings.Contains(reverseInsert, "SET LOCAL standard_conforming_strings = on;") {
+		t.Errorf("PG script missing the standard_conforming_strings guard:\n%s", reverseInsert)
+	}
+	if _, err := pg.Exec(ctx, reverseInsert); err != nil {
+		t.Fatalf("PG-dialect reverse INSERT failed to execute against PostgreSQL: %v\nSQL:\n%s", err, reverseInsert)
+	}
+	var afterIns rowText
+	if err := pg.QueryRow(ctx, selCanonical).Scan(&afterIns.name, &afterIns.num, &afterIns.frac, &afterIns.bin, &afterIns.uid, &afterIns.doc, &afterIns.flag, &afterIns.ts); err != nil {
+		t.Fatalf("re-select after reverse INSERT: %v", err)
+	}
+	if afterIns.name != trickyName {
+		t.Errorf("reverse INSERT name = %q, want exactly %q (quote/backslash escaping bug in VALUES)", afterIns.name, trickyName)
+	}
+	if afterIns.flag != "false" {
+		t.Errorf("reverse INSERT reconstructed flag = %q, want \"false\" (the pre-DELETE before-image V2)", afterIns.flag)
+	}
+
+	// ── Reverse the UPDATE → a reverse UPDATE (SET = full V1 before-image, PK-scoped
+	// WHERE). The SET clause carries the escaping-critical name, the >2^53 numeric and
+	// the 1.50 scale; executing it must restore the original row exactly. ──
+	reverseUpdate := genPG(*updRow)
+	if _, err := pg.Exec(ctx, reverseUpdate); err != nil {
+		t.Fatalf("PG-dialect reverse UPDATE failed to execute against PostgreSQL: %v\nSQL:\n%s", err, reverseUpdate)
+	}
+	var afterUpd rowText
+	if err := pg.QueryRow(ctx, selCanonical).Scan(&afterUpd.name, &afterUpd.num, &afterUpd.frac, &afterUpd.bin, &afterUpd.uid, &afterUpd.doc, &afterUpd.flag, &afterUpd.ts); err != nil {
+		t.Fatalf("re-select after reverse UPDATE: %v", err)
+	}
+	if afterUpd != orig {
+		t.Errorf("reverse UPDATE round-trip mismatch:\n got  %+v\n want %+v", afterUpd, orig)
+	}
+	if afterUpd.name != trickyName {
+		t.Errorf("reverse UPDATE SET name = %q, want exactly %q (escaping in the SET clause)", afterUpd.name, trickyName)
+	}
+	if afterUpd.num != bigNum || afterUpd.frac != "1.50" {
+		t.Errorf("reverse UPDATE numeric/scale = (%q,%q), want (%q,\"1.50\")", afterUpd.num, afterUpd.frac, bigNum)
+	}
+	// Typed boolean read: the canonical SELECT renders bool as 't' text on both sides,
+	// so a typed read is what actually proves the restored value (not the text).
+	var flagBool bool
+	if err := pg.QueryRow(ctx, fmt.Sprintf("SELECT flag FROM %s WHERE id=1", tbl)).Scan(&flagBool); err != nil {
+		t.Fatalf("typed bool read: %v", err)
+	}
+	if !flagBool {
+		t.Error("reverse UPDATE restored flag=false, want true (typed read)")
+	}
+
+	// ── Reverse the INSERT → a reverse DELETE (PK-scoped double-quoted WHERE).
+	// Executing it removes the row again — proving the PG WHERE dialect runs. ──
+	reverseDelete := genPG(*insRow)
+	if _, err := pg.Exec(ctx, reverseDelete); err != nil {
+		t.Fatalf("PG-dialect reverse DELETE failed to execute against PostgreSQL: %v\nSQL:\n%s", err, reverseDelete)
+	}
+	var cnt int
+	if err := pg.QueryRow(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE id=1", tbl)).Scan(&cnt); err != nil {
+		t.Fatalf("count after reverse DELETE: %v", err)
+	}
+	if cnt != 0 {
+		t.Errorf("reverse DELETE left %d rows, want 0 (PK-scoped WHERE did not match)", cnt)
+	}
+}
+
 // ── helpers ──
 
 func replDSN(base string) string {

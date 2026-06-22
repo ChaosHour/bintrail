@@ -252,7 +252,11 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Generate recovery SQL ─────────────────────────────────────────────────
-	gen := recovery.New(db, resolver)
+	// Select the SQL dialect from the source flavor recorded in the index
+	// (single-source per stream_state) — PostgreSQL needs double-quoted identifiers
+	// and standard-conforming-string escaping; MySQL/MariaDB keep the default. The
+	// read is best-effort and defaults to MySQL (see recovery.DialectForIndex).
+	gen := recovery.NewForDialect(db, resolver, recovery.DialectForIndex(db))
 
 	if rDryRun {
 		if rFormat == "json" {
