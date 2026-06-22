@@ -3,6 +3,7 @@
 package indexer
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/testutil"
@@ -103,6 +104,59 @@ func TestEnsureSchemaAddsFKRuleColumns(t *testing.T) {
 	}
 	if del != "" || upd != "" {
 		t.Errorf("backfilled rules = (%q,%q), want empty", del, upd)
+	}
+
+	// Idempotent: a second run must not error or re-add.
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema (second run): %v", err)
+	}
+}
+
+// TestEnsureSchemaAddsPGTypeColumns pins the #533 migration: a pre-#533 install must
+// gain schema_snapshots.pg_type_oid/pg_type_mod as NULLABLE (MySQL snapshots leave
+// them NULL; only PostgreSQL's WritePGSnapshot populates them), idempotently and with
+// no data migration of existing rows.
+func TestEnsureSchemaAddsPGTypeColumns(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Simulate a pre-#533 install: drop the columns EnsureSchema re-adds, after seeding
+	// an old-shape MySQL snapshot row that must survive untouched.
+	testutil.MustExec(t, db, `ALTER TABLE schema_snapshots DROP COLUMN pg_type_oid, DROP COLUMN pg_type_mod`)
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+		 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+		VALUES (1, UTC_TIMESTAMP(), 'app', 't', 'id', 1, 'PRI', 'int', 'int', 'NO', 0)`)
+
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	for _, col := range []string{"pg_type_oid", "pg_type_mod"} {
+		var nullable, columnType string
+		if err := db.QueryRow(`SELECT IS_NULLABLE, COLUMN_TYPE FROM information_schema.COLUMNS
+			WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'schema_snapshots' AND COLUMN_NAME = ?`,
+			col).Scan(&nullable, &columnType); err != nil {
+			t.Fatalf("read %s column: %v", col, err)
+		}
+		if nullable != "YES" {
+			t.Errorf("%s IS_NULLABLE = %q, want \"YES\" (MySQL snapshots leave it NULL)", col, nullable)
+		}
+		// pg_type_oid holds a PostgreSQL pg_type OID (uint32); high user-type OIDs
+		// exceed int32, so the column must be UNSIGNED or they'd silently truncate.
+		if col == "pg_type_oid" && !strings.Contains(strings.ToLower(columnType), "unsigned") {
+			t.Errorf("pg_type_oid COLUMN_TYPE = %q, want an UNSIGNED int (PG OIDs are uint32)", columnType)
+		}
+	}
+
+	// The pre-existing MySQL row reads back with NULL type identity (no migration).
+	var oid, mod *int
+	if err := db.QueryRow(`SELECT pg_type_oid, pg_type_mod FROM schema_snapshots WHERE column_name='id'`).
+		Scan(&oid, &mod); err != nil {
+		t.Fatalf("read backfilled row: %v", err)
+	}
+	if oid != nil || mod != nil {
+		t.Errorf("existing MySQL row pg_type_oid/mod = (%v,%v), want NULL/NULL", oid, mod)
 	}
 
 	// Idempotent: a second run must not error or re-add.
