@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-06-23
+
+### Added
+- **Console: source-aware presentation for PostgreSQL** (#595). The shared `bintrail-console` now adapts what it shows to the source family of the selected server (reported per-server via `/api/capabilities`, derived from the index's `stream_state.flavor`) — it stays index-only and never queries the source. For a PostgreSQL source the Status page labels the stream cursor as an **LSN** (instead of binlog file/position/GTID), it surfaces the durable permanent-loss record (an invalidated replication slot — the sibling of a MySQL binlog gap), and the Events page notes that actor attribution (who-changed) is unavailable upstream because `pgoutput` carries no backend connection id. Presentation only — it never hides a surface.
+- **Console: PostgreSQL replication-health panel** (#599). The Status page gains a *Replication health* panel for PostgreSQL sources showing the replication slot's WAL-retention state (`wal_status`, retained WAL, the safe margin before invalidation) and whether every published table is at `REPLICA IDENTITY FULL`. The console stays index-only: the streaming daemon (`bintrail-pg stream` / `watch`) polls the source every ~30s and persists a snapshot to the index (`stream_state.source_health`), which the console renders. Because a snapshot can outlive a stopped daemon, the panel shows how recently it was checked and **degrades a stale snapshot (older than ~90s) to muted/warn** — a frozen reading never reads as live-healthy; a probe that cannot reach the source (e.g. a standby) shows *probe failing* with the reason rather than disappearing. For an on-demand, always-live check, use `bintrail-pg doctor`. Together with #595 this completes the source-aware console presentation tracked toward PostgreSQL GA in #597.
+
 ## [0.20.0] - 2026-06-23
 
 ### Added
