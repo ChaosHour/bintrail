@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-06-23
+
+### Added
+- **Console: Cascade recovery tab** (#580). The web console gains a *Cascade recovery* tab (free `query_explorer` tier) that drives the `POST /api/recover-cascade` endpoint from 0.19.0: pick the parent table whose `ON DELETE CASCADE` / `SET NULL` delete cascaded and it generates the reversal SQL with Copy/Download — never executing it. Coverage is surfaced prominently: a partial recovery is flagged with an `INCOMPLETE` banner listing every caveat (and the caveats are also embedded in the SQL preamble), so it can never read as a full restore. The tab is capability-gated — hidden, with its route redirecting to the overview, whenever `recover-cascade` is unavailable (e.g. under an RBAC redaction profile). Completes the in-console cascade-recovery epic (#577, slices #578/#579/#580).
+
 ## [0.19.0] - 2026-06-22
 
 ### Added
