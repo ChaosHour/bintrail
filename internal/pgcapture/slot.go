@@ -183,6 +183,165 @@ func CheckReplicaIdentity(ctx context.Context, conn *pgx.Conn, publication strin
 	return checkReplicaIdentityTables(ctx, conn, publication)
 }
 
+// listUnloggedCaptureTables returns the "schema.table" of every UNLOGGED base table in
+// the capture scope. UNLOGGED tables generate NO WAL, so logical decoding never sees
+// their changes — they are captured as exactly nothing, silently; an operator may keep
+// ephemeral data UNLOGGED on purpose, so this is surfaced as a WARNING (not the fatal
+// fail of validateReplicaIdentity): a coverage hole the operator should see now rather
+// than discover during a failed recovery. (#555)
+//
+// CRUCIAL: an UNLOGGED table is NEVER in pg_publication_tables, so it must be found
+// against pg_class directly. PostgreSQL refuses to add an UNLOGGED table to a FOR TABLE
+// publication ("cannot add relation ... to publication ... unlogged"), and it EXCLUDES
+// UNLOGGED tables from a FOR ALL TABLES publication's pg_publication_tables view
+// (pg_relation_is_publishable gates on relpersistence). A query over pg_publication_
+// tables therefore can never match an UNLOGGED row — it would be dead code.
+//
+// The dangerous case is FOR ALL TABLES: the operator believes "everything" is captured,
+// but the UNLOGGED tables silently are not. We scan user base tables for relpersistence
+// = 'u' and report the ones in the client filter scope. For a FOR TABLE publication an
+// UNLOGGED table cannot be in the publication at all, and a client --tables naming an
+// unpublished table is already a fatal coverage gap in validatePublication — so there
+// is nothing this guard could uniquely surface and it returns nil. (FOR TABLES IN
+// SCHEMA, PG 15+, is not covered here — a documented limitation, not silent: the doctor
+// still lists the check.)
+func listUnloggedCaptureTables(ctx context.Context, conn *pgx.Conn, publication string, filters event.Filters) ([]string, error) {
+	var allTables bool
+	err := conn.QueryRow(ctx, `SELECT puballtables FROM pg_publication WHERE pubname = $1`, publication).Scan(&allTables)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil // publication absent — validatePublication reports that distinctly
+	}
+	if err != nil {
+		return nil, fmt.Errorf("pgcapture: reading publication %q for the UNLOGGED check: %w", publication, err)
+	}
+	if !allTables {
+		return nil, nil // FOR TABLE: UNLOGGED tables cannot be published (see doc above)
+	}
+
+	rows, err := conn.Query(ctx, `
+		SELECT n.nspname, c.relname
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relkind = 'r' AND c.relpersistence = 'u'
+		  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+		  AND n.nspname NOT LIKE 'pg_temp%'
+		  AND n.nspname NOT LIKE 'pg_toast_temp%'`)
+	if err != nil {
+		return nil, fmt.Errorf("pgcapture: scanning for UNLOGGED tables: %w", err)
+	}
+	defer rows.Close()
+
+	var unlogged []string
+	for rows.Next() {
+		var schema, table string
+		if err := rows.Scan(&schema, &table); err != nil {
+			return nil, fmt.Errorf("pgcapture: scanning UNLOGGED tables: %w", err)
+		}
+		// Under FOR ALL TABLES the captured set is every user table narrowed by the
+		// client schema/table filter (the zero Filters accepts all), so honor it here.
+		if filters.Matches(schema, table) {
+			unlogged = append(unlogged, schema+"."+table)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pgcapture: scanning for UNLOGGED tables: %w", err)
+	}
+	sort.Strings(unlogged)
+	return unlogged, nil
+}
+
+// ListUnloggedCaptureTables is the report-only form of the #555 UNLOGGED guard for
+// bintrail-pg doctor (a pure probe; no mutation). nil/empty means no UNLOGGED tables
+// in the capture scope.
+func ListUnloggedCaptureTables(ctx context.Context, conn *pgx.Conn, publication string, filters event.Filters) ([]string, error) {
+	return listUnloggedCaptureTables(ctx, conn, publication, filters)
+}
+
+// CascadeChild is one foreign-key cascade child whose PARENT the publication captures
+// but the child itself it does NOT — so a delete on the parent fires an ON DELETE
+// CASCADE / SET NULL / SET DEFAULT that rewrites the child, and that change is never
+// captured. (#556)
+type CascadeChild struct {
+	Child  string // "schema.table" of the FK-bearing (child) table
+	Parent string // "schema.table" of the referenced (parent) table
+	Action string // human action, e.g. "ON DELETE CASCADE"
+}
+
+// listUncoveredCascadeChildren returns cascade children whose parent IS in the
+// publication but the child is NOT. On PostgreSQL, FK ON DELETE CASCADE/SET NULL/SET
+// DEFAULT is performed by real per-row WAL ops on the child (unlike MySQL ≤8.x, which
+// does not log them) — so `recover` works directly IF the child is captured. When the
+// parent is published but the child is not, a cascade delete on the parent silently
+// rewrites rows we never indexed → unrecoverable, and invisible. This surfaces that as
+// a WARNING. (#556)
+//
+// A FOR ALL TABLES publication covers every child by construction, so this finds
+// nothing there; the gap is an explicit FOR TABLE publication that lists a parent but
+// forgets its cascade child. A PUBLISHED child is already forced to RI FULL by
+// checkReplicaIdentityTables, so only the not-published case needs surfacing here.
+//
+// Residual (documented, not covered here): a row that was deleted-by-cascade but never
+// existed in our captured history (it predates capture) is recoverable only from a
+// baseline — the PG baseline producer is a separate GA item (#593).
+func listUncoveredCascadeChildren(ctx context.Context, conn *pgx.Conn, publication string) ([]CascadeChild, error) {
+	rows, err := conn.Query(ctx, `
+		SELECT child_ns.nspname, child.relname, parent_ns.nspname, parent.relname, con.confdeltype
+		FROM pg_constraint con
+		JOIN pg_class child ON child.oid = con.conrelid
+		JOIN pg_namespace child_ns ON child_ns.oid = child.relnamespace
+		JOIN pg_class parent ON parent.oid = con.confrelid
+		JOIN pg_namespace parent_ns ON parent_ns.oid = parent.relnamespace
+		WHERE con.contype = 'f' AND con.confdeltype IN ('c', 'n', 'd')
+		  AND EXISTS (SELECT 1 FROM pg_publication_tables pt
+		              WHERE pt.pubname = $1 AND pt.schemaname = parent_ns.nspname AND pt.tablename = parent.relname)
+		  AND NOT EXISTS (SELECT 1 FROM pg_publication_tables pt
+		              WHERE pt.pubname = $1 AND pt.schemaname = child_ns.nspname AND pt.tablename = child.relname)`,
+		publication)
+	if err != nil {
+		return nil, fmt.Errorf("pgcapture: checking FK cascade-child coverage for publication %q: %w", publication, err)
+	}
+	defer rows.Close()
+
+	var out []CascadeChild
+	for rows.Next() {
+		var childSchema, childTable, parentSchema, parentTable, delType string
+		if err := rows.Scan(&childSchema, &childTable, &parentSchema, &parentTable, &delType); err != nil {
+			return nil, fmt.Errorf("pgcapture: scanning FK cascade-child coverage for publication %q: %w", publication, err)
+		}
+		out = append(out, CascadeChild{
+			Child:  childSchema + "." + childTable,
+			Parent: parentSchema + "." + parentTable,
+			Action: cascadeAction(delType),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pgcapture: checking FK cascade-child coverage for publication %q: %w", publication, err)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Child < out[j].Child })
+	return out, nil
+}
+
+// cascadeAction renders a pg_constraint.confdeltype code as its human FK action.
+func cascadeAction(confdeltype string) string {
+	switch confdeltype {
+	case "c":
+		return "ON DELETE CASCADE"
+	case "n":
+		return "ON DELETE SET NULL"
+	case "d":
+		return "ON DELETE SET DEFAULT"
+	default:
+		return "ON DELETE (" + confdeltype + ")"
+	}
+}
+
+// ListUncoveredCascadeChildren is the report-only form of the #556 cascade-coverage
+// guard for bintrail-pg doctor (a pure probe; no mutation). nil/empty means every
+// cascade child of a published parent is itself published.
+func ListUncoveredCascadeChildren(ctx context.Context, conn *pgx.Conn, publication string) ([]CascadeChild, error) {
+	return listUncoveredCascadeChildren(ctx, conn, publication)
+}
+
 // ensureSlot returns the LSN to start replication from, creating the slot on first
 // run. The first-run-vs-resume decision is gated on slot EXISTENCE in
 // pg_replication_slots (NOT on savedLSN==0 — an empty saved checkpoint decodes to

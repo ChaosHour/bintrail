@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -137,6 +138,13 @@ func (c *Capturer) Run(ctx context.Context, out chan<- event.Event) error {
 		return err
 	}
 
+	// Non-fatal capture-coverage warnings (#555 UNLOGGED, #556 FK cascade child): tables
+	// whose changes will be silently ABSENT from the index. Unlike the validate* gates
+	// above, these do NOT abort capture (an operator may keep UNLOGGED data on purpose,
+	// and a missing cascade child may be intentionally out of recovery scope) — but they
+	// must be visible now, not discovered during a failed recovery.
+	c.warnCaptureCoverage(startupCtx, queryConn)
+
 	startLSN, err := ensureSlot(startupCtx, replConn, queryConn, c.cfg.SlotName, c.cfg.StartLSN, c.cfg.ExpectExistingSlot)
 	if err != nil {
 		return err
@@ -180,6 +188,33 @@ func (c *Capturer) Run(ctx context.Context, out chan<- event.Event) error {
 		return nil // graceful shutdown (ctx-cancel surfaced as a receive/emit error)
 	}
 	return err
+}
+
+// warnCaptureCoverage logs the non-fatal coverage gaps (#555 UNLOGGED tables, #556 FK
+// cascade children whose parent is published but the child is not). A probe FAILURE is
+// logged at debug and never blocks the stream — these are advisory, and the same
+// catalog state is also reported by `bintrail-pg doctor`.
+func (c *Capturer) warnCaptureCoverage(ctx context.Context, conn *pgx.Conn) {
+	// A probe FAILURE is itself surfaced as a WARN, not swallowed at Debug: at the
+	// default --log-level=info a Debug line is invisible, so downgrading the failure
+	// would silently disable the very guard this function exists to provide — the exact
+	// silent-failure class #555/#556 close. Visibility matches the doctor side, which
+	// also maps a probe failure to a WARN.
+	if unlogged, err := listUnloggedCaptureTables(ctx, conn, c.cfg.Publication, c.cfg.Filters); err != nil {
+		c.logger.Warn("pgcapture: UNLOGGED-table coverage check failed to run — could NOT determine whether a captured table writes no WAL (a silent recovery hole); run `bintrail-pg doctor` to re-check", "error", err)
+	} else if len(unlogged) > 0 {
+		c.logger.Warn("pgcapture: UNLOGGED table(s) in capture scope produce no WAL — their changes are NOT captured and cannot be recovered (ALTER TABLE <t> SET LOGGED if you need them)",
+			"tables", strings.Join(unlogged, ", "))
+	}
+
+	if children, err := listUncoveredCascadeChildren(ctx, conn, c.cfg.Publication); err != nil {
+		c.logger.Warn("pgcapture: FK cascade-child coverage check failed to run — could NOT determine whether a cascade child is unpublished (cascade deletes would be silently lost); run `bintrail-pg doctor` to re-check", "error", err)
+	} else {
+		for _, ch := range children {
+			c.logger.Warn("pgcapture: FK cascade child is NOT in the publication — cascade deletes from its parent are not captured and cannot be recovered (add it to the publication)",
+				"child", ch.Child, "parent", ch.Parent, "action", ch.Action)
+		}
+	}
 }
 
 // receiveLoop is the single-goroutine replication loop. pgconn is NOT concurrency-
