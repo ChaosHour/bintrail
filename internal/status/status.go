@@ -14,6 +14,8 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 // IndexStateRow holds one row from the index_state table.
@@ -82,6 +84,14 @@ type StreamStateInfo struct {
 	LastCheckpoint time.Time
 	ServerID       uint32
 	BintrailID     sql.NullString
+	// GapLostAt / GapLostDetail record that the stream permanently lost data it could
+	// not recover — an unfillable binlog gap (MySQL) or an invalidated/lost replication
+	// slot (PostgreSQL, #532). When set, the index is valid only up to the gap and
+	// capture must be re-baselined to resume; status surfaces them loudly. GapLostAt is
+	// authoritative (the badge is gated on it alone); GapLostDetail is supplementary
+	// human-readable context and may be absent. Both writers set them atomically.
+	GapLostAt     sql.NullTime
+	GapLostDetail sql.NullString
 }
 
 // CoverageInfo summarizes the restore coverage of the index.
@@ -307,13 +317,20 @@ func LoadStreamState(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) 
 	err := db.QueryRowContext(ctx, `
 		SELECT mode, binlog_file, binlog_position, gtid_set,
 		       events_indexed, last_event_time, last_checkpoint,
-		       server_id, bintrail_id
+		       server_id, bintrail_id, gap_lost_at, gap_lost_detail
 		FROM stream_state
 		WHERE id = 1`).Scan(
 		&s.Mode, &s.BinlogFile, &s.BinlogPosition, &s.GTIDSet,
 		&s.EventsIndexed, &s.LastEventTime, &s.LastCheckpoint,
-		&s.ServerID, &s.BintrailID,
+		&s.ServerID, &s.BintrailID, &s.GapLostAt, &s.GapLostDetail,
 	)
+	// A legacy index predating the gap_lost_* columns (added by the cascade-recovery
+	// work), read before any migrating command (EnsureSchema) ran — the console never
+	// migrates registry DSNs — lacks those columns. Degrade gracefully to the base
+	// columns rather than erroring `status`; such an index simply has no loss record.
+	if isUnknownColumnErr(err) {
+		return loadStreamStateBase(ctx, db)
+	}
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -321,6 +338,37 @@ func LoadStreamState(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) 
 		return nil, err
 	}
 	return &s, nil
+}
+
+// loadStreamStateBase loads the stream_state columns guaranteed by the original CREATE
+// TABLE (no gap_lost_*), for a legacy index that has not been migrated. The gap-loss
+// fields stay zero (no badge).
+func loadStreamStateBase(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) {
+	var s StreamStateInfo
+	err := db.QueryRowContext(ctx, `
+		SELECT mode, binlog_file, binlog_position, gtid_set,
+		       events_indexed, last_event_time, last_checkpoint,
+		       server_id, bintrail_id
+		FROM stream_state
+		WHERE id = 1`).Scan(
+		&s.Mode, &s.BinlogFile, &s.BinlogPosition, &s.GTIDSet,
+		&s.EventsIndexed, &s.LastEventTime, &s.LastCheckpoint,
+		&s.ServerID, &s.BintrailID,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+// isUnknownColumnErr reports whether err is MySQL error 1054 (ER_BAD_FIELD_ERROR,
+// "Unknown column"), i.e. the index schema predates a column this build SELECTs.
+func isUnknownColumnErr(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && me.Number == 1054
 }
 
 // StatusData holds all data sections loaded by CollectStatus.
@@ -473,6 +521,21 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 		fmt.Fprintf(w, "  Last checkpoint: %s\n", stream.LastCheckpoint.Format(TSFmt))
 		fmt.Fprintf(w, "  Server ID:       %d\n", stream.ServerID)
 		fmt.Fprintln(w)
+
+		// Loud, unmissable banner when the stream permanently lost data (an unfillable
+		// binlog gap, or an invalidated/lost PostgreSQL replication slot — #532). This
+		// is the only way index-only `status` can show a lost stream after the capture
+		// process has exited; the index up to the gap is still valid for recovery.
+		if stream.GapLostAt.Valid {
+			fmt.Fprintln(w, "=== ⚠ EVENTS PERMANENTLY LOST ===")
+			fmt.Fprintf(w, "  Detected:  %s\n", stream.GapLostAt.Time.Format(TSFmt))
+			if stream.GapLostDetail.Valid && stream.GapLostDetail.String != "" {
+				fmt.Fprintf(w, "  Detail:    %s\n", stream.GapLostDetail.String)
+			}
+			fmt.Fprintln(w, "  The capture stream lost data it could not recover. The index up to the")
+			fmt.Fprintln(w, "  gap is still valid for recovery, but to resume capture you must re-baseline.")
+			fmt.Fprintln(w)
+		}
 	}
 
 	// ── Section 1: Indexed Files ──────────────────────────────────────────────
@@ -711,16 +774,21 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		CreatedAt        string  `json:"created_at"`
 		DecommissionedAt *string `json:"decommissioned_at"`
 	}
+	type jsonGapLost struct {
+		At     string `json:"at"`
+		Detail string `json:"detail,omitempty"`
+	}
 	type jsonStream struct {
-		BintrailID     *string `json:"bintrail_id"`
-		Mode           string  `json:"mode"`
-		BinlogFile     string  `json:"binlog_file,omitempty"`
-		BinlogPosition uint64  `json:"binlog_position,omitempty"`
-		GTIDSet        *string `json:"gtid_set,omitempty"`
-		EventsIndexed  int64   `json:"events_indexed"`
-		LastEventTime  *string `json:"last_event_time"`
-		LastCheckpoint string  `json:"last_checkpoint"`
-		ServerID       uint32  `json:"server_id"`
+		BintrailID     *string      `json:"bintrail_id"`
+		Mode           string       `json:"mode"`
+		BinlogFile     string       `json:"binlog_file,omitempty"`
+		BinlogPosition uint64       `json:"binlog_position,omitempty"`
+		GTIDSet        *string      `json:"gtid_set,omitempty"`
+		EventsIndexed  int64        `json:"events_indexed"`
+		LastEventTime  *string      `json:"last_event_time"`
+		LastCheckpoint string       `json:"last_checkpoint"`
+		ServerID       uint32       `json:"server_id"`
+		GapLost        *jsonGapLost `json:"gap_lost,omitempty"`
 	}
 	type jsonBaseline struct {
 		SnapshotTime string  `json:"snapshot_time"`
@@ -812,6 +880,9 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		if stream.LastEventTime.Valid {
 			s := stream.LastEventTime.Time.Format(TSFmt)
 			jstr.LastEventTime = &s
+		}
+		if stream.GapLostAt.Valid {
+			jstr.GapLost = &jsonGapLost{At: stream.GapLostAt.Time.Format(TSFmt), Detail: stream.GapLostDetail.String}
 		}
 		out.Stream = jstr
 	}
