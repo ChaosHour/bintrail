@@ -1,11 +1,12 @@
-# PostgreSQL as a source (alpha)
+# PostgreSQL as a source (beta)
 
 bintrail can capture from a **PostgreSQL** server while the index database stays
-MySQL. PostgreSQL capture lives in its own binary, **`bintrail-pg`**. This is an
-**alpha** capability: the happy path is verified end-to-end against real
-PostgreSQL (14–17 in CI), but it has documented limitations (below) and narrower
-coverage than the MySQL path. Read the limitations before pointing it at
-production.
+MySQL. PostgreSQL capture lives in its own binary, **`bintrail-pg`**. This is a
+**beta** capability: the data-safety gates are closed — capture is type-faithful,
+`REPLICA IDENTITY FULL`-enforced, replication-slot/WAL-retention-monitored, and
+DDL-drift-safe, all verified end-to-end against real PostgreSQL (14–17 in CI). It
+still has documented limitations (below) — notably full-table `reconstruct` /
+time-travel, which is GA work — so read them before pointing it at production.
 
 **Scope:** PostgreSQL is supported as a **source** (the database you capture
 changes from). The **index** — where bintrail stores the indexed events — stays
@@ -187,6 +188,17 @@ bintrail-pg doctor --query-dsn "$PG" --slot bintrail_shop --publication bintrail
   retaining. The status progresses `reserved` (PASS) → `extended` / `unreserved`
   (**WARN** — retaining WAL and approaching the limit; doctor still exits 0) →
   `lost` (a loud **FAIL** with the re-baseline recovery path).
+- **No UNLOGGED tables** → WARN if any captured table is `UNLOGGED` (under a
+  `FOR ALL TABLES` publication). UNLOGGED tables write no WAL, so their changes are
+  never captured — `ALTER TABLE <t> SET LOGGED` if you need them, or ignore if the
+  data is intentionally ephemeral.
+- **FK cascade-child coverage** → WARN if a published table has a foreign-key
+  `ON DELETE CASCADE` / `SET NULL` **child** that is *not* in the publication. A
+  delete on the parent would rewrite that child, and the rewrite would not be
+  captured — add the child to the publication (and set its `REPLICA IDENTITY FULL`).
+
+These coverage checks are also emitted as warnings by `bintrail-pg stream` at
+startup, so capture is never silently incomplete even if you skip `doctor`.
 
 A permanently-lost stream is also recorded durably: once a slot is invalidated or
 dropped out from under a running capture, `bintrail status` shows a loud
@@ -388,14 +400,24 @@ your own round-trip.
 - **TimescaleDB hypertables are out of scope.** Logical decoding emits the
   underlying *chunk* tables (`_timescaledb_internal._hyper_*`), not the
   hypertable, so a hypertable is not captured coherently in this release.
+  bintrail-pg detects a chunk relation in the stream and **warns once** (so you
+  are never silently indexing raw chunks under their physical names) — but it does
+  not synthesize the logical hypertable.
 
 ---
 
-## Alpha limitations
+## Beta limitations
 
-- **`UNLOGGED` tables are invisible.** They bypass the WAL by design, so logical
-  decoding never sees them — there is no signal, the changes are simply not
-  captured. Don't rely on bintrail for UNLOGGED data.
+- **`UNLOGGED` tables are not captured.** They bypass the WAL by design, so logical
+  decoding never sees them. bintrail-pg now **warns** when an UNLOGGED table is in
+  capture scope (at `stream` startup and in `bintrail-pg doctor`, under a
+  `FOR ALL TABLES` publication) — but the changes are still not captured, so don't
+  rely on bintrail for UNLOGGED data.
+- **A cascade child must be in the publication.** A foreign-key `ON DELETE CASCADE`
+  / `SET NULL` is captured (PostgreSQL performs it as ordinary row changes) **only
+  if the child table is published**. If a published parent has an unpublished
+  cascade child, the cascade rewrites are not captured — bintrail-pg warns (startup
+  + doctor); add the child to the publication.
 - **`TRUNCATE` is visible but not reversible from the stream.** It is decoded as
   an event but carries no rows, so there is nothing for `recover` to put back.
 - **Sequence cursors are not captured.** The materialized id values in your rows
@@ -416,8 +438,12 @@ your own round-trip.
 - **Not in the console control plane / no BYOS agent.** Capture is the
   `bintrail-pg stream` CLI only in this release.
 
-These are the data-safety items that gate **beta**; they are being worked through
-the same way MariaDB was hardened before its beta.
+The data-safety items that gated **beta** are now closed (type fidelity,
+identity/generated recovery, slot/WAL monitoring, RI-FULL validation, DDL-drift
+handling, and the silent-loss coverage guards above). The remaining limitations —
+full-table `reconstruct` / time-travel via a PostgreSQL baseline, a managed-
+PostgreSQL smoke matrix, and source-aware console presentation — are tracked
+toward **GA** in [#597](https://github.com/dbtrail/dbtrail/issues/597).
 
 ---
 

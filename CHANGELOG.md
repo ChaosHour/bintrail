@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-06-23
+
+### Added
+- **PostgreSQL-as-source is now beta** (#527). The alpha→beta epic is complete — every data-safety gate is closed: type-faithful capture and recovery (#533), identity/generated recovery correctness (#557), replication-slot/WAL-retention monitoring (#532), per-table `REPLICA IDENTITY FULL` validation with primary-key-scoped recovery (#531), the standalone `bintrail-pg` binary across a PostgreSQL 14–17 CI matrix (#534), and DDL-drift handling (a mid-stream `ALTER` re-snapshots the table so post-`ALTER` rows are captured against the new shape). `recover` is the supported recovery surface; capture is type-faithful, `REPLICA IDENTITY FULL`-enforced, slot/WAL-monitored, and DDL-drift-safe — all verified end-to-end against live PostgreSQL. Remaining work (full-table `reconstruct` / time-travel via a PostgreSQL baseline, a managed-PostgreSQL smoke matrix, and source-aware console presentation) is tracked toward GA in #597. Read `docs/postgres.md` for the current limitations.
+- **Capture-coverage preflight guards for PostgreSQL** (#555, #556, #559). `bintrail-pg` now surfaces three silent-loss classes loud instead of letting them slip past — both as warnings at `stream` startup and as `bintrail-pg doctor` checks:
+  - an `UNLOGGED` table in capture scope under a `FOR ALL TABLES` publication (it writes no WAL, so logical decoding never captures it);
+  - a foreign-key `ON DELETE CASCADE` / `SET NULL` **child** table whose parent is published but the child is not (a delete on the parent would rewrite the child, and that rewrite would not be captured);
+  - a TimescaleDB hypertable chunk in the stream (`_timescaledb_internal._hyper_*`, out of scope — warned once per stream).
+
+  Capture is never silently incomplete.
+
 ## [0.19.1] - 2026-06-23
 
 ### Added
