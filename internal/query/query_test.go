@@ -551,6 +551,12 @@ func TestBuildQuery_pkValues_winsOver_pkValuesIn(t *testing.T) {
 	}
 }
 
+// joinSuffix is the late-materialization tail every buildQuery output ends
+// with: the wide-column SELECT joins back to the key subquery on the PK and is
+// NOT followed by an ORDER BY. Asserting HasSuffix on it is the regression
+// guard that no outer filesort over the wide JSON columns can creep back in.
+const joinSuffix = ") AS k ON be.event_id = k.event_id AND be.event_timestamp = k.event_timestamp"
+
 func TestBuildQuery_limitPerPK(t *testing.T) {
 	opts := Options{Schema: "db", Table: "t", PKValuesIn: []string{"1", "2"}, LimitPerPK: 1, Limit: 100}
 	q, args := buildQuery(opts)
@@ -562,12 +568,17 @@ func TestBuildQuery_limitPerPK(t *testing.T) {
 		t.Errorf("expected DESC ordering inside window so latest events are kept: %s", q)
 	}
 	if !strings.Contains(q, "WHERE bt_rn <= ?") {
-		t.Errorf("expected outer WHERE bt_rn <= ?: %s", q)
+		t.Errorf("expected WHERE bt_rn <= ? on the windowed keys: %s", q)
 	}
-	// Outer ORDER BY follows opts.Order (default ASC for backward compat).
-	// Both keys get the same direction so the ordering is total.
-	if !strings.HasSuffix(q, "ORDER BY event_timestamp ASC, event_id ASC LIMIT ?") {
-		t.Errorf("expected outer ORDER BY event_timestamp ASC, event_id ASC LIMIT ?: %s", q)
+	// The narrow key sort + LIMIT lives INSIDE the JOIN subquery (it picks which
+	// N rows survive); it follows opts.Order (default ASC for backward compat),
+	// both keys same direction so the page is total.
+	if !strings.Contains(q, "WHERE bt_rn <= ? ORDER BY event_timestamp ASC, event_id ASC LIMIT ?") {
+		t.Errorf("expected narrow ORDER BY ASC + LIMIT inside the key subquery: %s", q)
+	}
+	// No outer sort over the wide columns: the statement ends at the JOIN.
+	if !strings.HasSuffix(q, joinSuffix) {
+		t.Errorf("query must end at the JOIN (no outer ORDER BY over wide cols): %s", q)
 	}
 	// Args: schema, table, pk1, pk2, limitPerPK, limit
 	wantArgs := []any{"db", "t", "1", "2", 1, 100}
@@ -576,19 +587,20 @@ func TestBuildQuery_limitPerPK(t *testing.T) {
 	}
 }
 
-// TestBuildQuery_orderDESC pins the #1511 fix: when Order="DESC" the outer
-// ORDER BY uses DESC for BOTH sort keys (timestamp + event_id), so that the
-// "DESC LIMIT N" page returns the newest N events — not a wrong page that
-// just happens to be sorted descending in display order. The inner
-// ROW_NUMBER window stays fixed at DESC regardless of caller direction
-// because its semantic is "latest N per PK", not "first N in requested
-// direction".
+// TestBuildQuery_orderDESC pins the #1511 fix: when Order="DESC" the key sort
+// uses DESC for BOTH keys (timestamp + event_id), so the "DESC LIMIT N" page
+// returns the newest N events — not a wrong page that just happens to be sorted
+// descending. The sort now lives on the narrow key subquery (late
+// materialization), never carrying the wide JSON columns through a filesort.
 func TestBuildQuery_orderDESC(t *testing.T) {
 	opts := Options{Schema: "db", Table: "t", Limit: 100, Order: "DESC"}
 	q, _ := buildQuery(opts)
 
-	if !strings.HasSuffix(q, "ORDER BY event_timestamp DESC, event_id DESC LIMIT ?") {
-		t.Errorf("expected ORDER BY event_timestamp DESC, event_id DESC LIMIT ? for Order=DESC, got: %s", q)
+	if !strings.Contains(q, "ORDER BY event_timestamp DESC, event_id DESC LIMIT ?") {
+		t.Errorf("expected key ORDER BY event_timestamp DESC, event_id DESC LIMIT ? for Order=DESC, got: %s", q)
+	}
+	if !strings.HasSuffix(q, joinSuffix) {
+		t.Errorf("query must end at the JOIN (no outer ORDER BY over wide cols): %s", q)
 	}
 }
 
@@ -598,13 +610,16 @@ func TestBuildQuery_orderASC(t *testing.T) {
 	opts := Options{Schema: "db", Table: "t", Limit: 100, Order: "ASC"}
 	q, _ := buildQuery(opts)
 
-	if !strings.HasSuffix(q, "ORDER BY event_timestamp ASC, event_id ASC LIMIT ?") {
-		t.Errorf("expected ORDER BY event_timestamp ASC, event_id ASC LIMIT ? for Order=ASC, got: %s", q)
+	if !strings.Contains(q, "ORDER BY event_timestamp ASC, event_id ASC LIMIT ?") {
+		t.Errorf("expected key ORDER BY event_timestamp ASC, event_id ASC LIMIT ? for Order=ASC, got: %s", q)
+	}
+	if !strings.HasSuffix(q, joinSuffix) {
+		t.Errorf("query must end at the JOIN (no outer ORDER BY over wide cols): %s", q)
 	}
 }
 
 // TestBuildQuery_orderDESC_limitPerPK verifies the per-PK ROW_NUMBER inner
-// ORDER BY stays DESC (semantic: "latest N per PK") while the outer ORDER BY
+// ORDER BY stays DESC (semantic: "latest N per PK") while the narrow key sort
 // follows the requested direction.
 func TestBuildQuery_orderDESC_limitPerPK(t *testing.T) {
 	opts := Options{Schema: "db", Table: "t", PKValuesIn: []string{"1", "2"}, LimitPerPK: 1, Limit: 100, Order: "DESC"}
@@ -613,8 +628,95 @@ func TestBuildQuery_orderDESC_limitPerPK(t *testing.T) {
 	if !strings.Contains(q, "ORDER BY event_timestamp DESC, event_id DESC) AS bt_rn") {
 		t.Errorf("inner ROW_NUMBER ORDER BY must stay DESC (selects latest N per PK), got: %s", q)
 	}
-	if !strings.HasSuffix(q, "ORDER BY event_timestamp DESC, event_id DESC LIMIT ?") {
-		t.Errorf("outer ORDER BY must follow opts.Order=DESC, got: %s", q)
+	if !strings.Contains(q, "WHERE bt_rn <= ? ORDER BY event_timestamp DESC, event_id DESC LIMIT ?") {
+		t.Errorf("narrow key sort must follow opts.Order=DESC, got: %s", q)
+	}
+	if !strings.HasSuffix(q, joinSuffix) {
+		t.Errorf("query must end at the JOIN (no outer ORDER BY over wide cols): %s", q)
+	}
+}
+
+// TestBuildQuery_wideColumnsNeverSorted is the core regression guard for the
+// ER_OUT_OF_SORTMEMORY (1038) class: the row_before/row_after JSON columns must
+// only appear in the outer wide SELECT, never inside the subquery that carries
+// the ORDER BY. If they ever leak into the sorted projection again, a single
+// fat row image (e.g. a WordPress wp_options blob) overflows sort_buffer_size
+// and the query dies. Covers both the plain and per-PK shapes.
+func TestBuildQuery_wideColumnsNeverSorted(t *testing.T) {
+	// Includes the no-Limit shape, and asserts BOTH halves of the invariant so
+	// this guard is self-sufficient (not reliant on HasSuffix in sibling tests):
+	// the wide columns are absent from the sorted key subquery AND there is no
+	// outer ORDER BY after the JOIN — re-appending one over the wide outer
+	// SELECT would re-introduce the filesort without putting row_after in the
+	// key subquery, the exact regression shape this guards against.
+	for _, opts := range []Options{
+		{Schema: "db", Table: "t", Limit: 200, Order: "DESC"},
+		{Schema: "db", Table: "t", Limit: 0, Order: "DESC"},
+		{Schema: "db", Table: "t", PKValuesIn: []string{"1"}, LimitPerPK: 5, Limit: 200, Order: "DESC"},
+		{Schema: "db", Table: "t", PKValuesIn: []string{"1"}, LimitPerPK: 5, Limit: 0, Order: "DESC"},
+	} {
+		q, _ := buildQuery(opts)
+		// The key subquery is everything from the JOIN onward. row_after must not
+		// appear there — only in the outer SELECT list before "FROM".
+		keyPart := q
+		if i := strings.Index(q, " FROM binlog_events AS be JOIN ("); i >= 0 {
+			keyPart = q[i:]
+		}
+		if strings.Contains(keyPart, "row_after") || strings.Contains(keyPart, "row_before") {
+			t.Errorf("wide JSON columns must not appear inside the sorted key subquery: %s", q)
+		}
+		// No outer sort over the wide projection: the statement ends at the JOIN.
+		if !strings.HasSuffix(q, joinSuffix) {
+			t.Errorf("query must end at the JOIN (no outer ORDER BY over wide cols): %s", q)
+		}
+	}
+}
+
+// TestSortResults_orderingAndTieBreak is the version-independent guard for the
+// result ORDERING contract, which moved out of SQL and into Go when buildQuery
+// dropped its outer ORDER BY: the JOIN may hand rows back in any order, so
+// sortResults is now the sole source of truth for output order. Feeds a
+// deliberately shuffled slice with a timestamp tie and asserts the
+// (event_timestamp, event_id) total order for ASC, DESC, and the default
+// (empty Order normalises to ASC via OrderDirection, which Fetch always
+// applies). Runs on every CI invocation — the integration reproducer can't,
+// since the 1038 it needs is MySQL-8.4-specific.
+func TestSortResults_orderingAndTieBreak(t *testing.T) {
+	t0 := time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC)
+	t1 := t0.Add(time.Second)
+	// id 3 and id 1 share t0 — the timestamp tie must break on event_id.
+	in := []ResultRow{
+		{EventID: 3, EventTimestamp: t0},
+		{EventID: 5, EventTimestamp: t1},
+		{EventID: 1, EventTimestamp: t0},
+	}
+	clone := func() []ResultRow { return append([]ResultRow(nil), in...) }
+	ids := func(rows []ResultRow) []uint64 {
+		out := make([]uint64, len(rows))
+		for i, r := range rows {
+			out[i] = r.EventID
+		}
+		return out
+	}
+
+	asc := clone()
+	sortResults(asc, "ASC")
+	if got := ids(asc); got[0] != 1 || got[1] != 3 || got[2] != 5 {
+		t.Errorf("ASC order/tiebreak wrong: got %v want [1 3 5]", got)
+	}
+
+	desc := clone()
+	sortResults(desc, "DESC")
+	if got := ids(desc); got[0] != 5 || got[1] != 3 || got[2] != 1 {
+		t.Errorf("DESC order/tiebreak wrong: got %v want [5 3 1]", got)
+	}
+
+	// Empty/garbage Order must sort ASC — Fetch passes OrderDirection(opts.Order),
+	// and sortResults trusts that upstream normalisation (it checks dir=="DESC").
+	def := clone()
+	sortResults(def, OrderDirection(""))
+	if got := ids(def); got[0] != 1 || got[1] != 3 || got[2] != 5 {
+		t.Errorf("empty Order must sort ASC: got %v want [1 3 5]", got)
 	}
 }
 
