@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-06-24
+
+### Changed
+- **Demo image is now multi-arch (amd64 + arm64)** (#605). `ghcr.io/dbtrail/bintrail-demo` now runs natively on ARM64 hosts (AWS Graviton, etc.) instead of failing with `exec format error`. The single-container demo previously bundled MySQL 8.0 community from Oracle's Debian apt repo, which ships no arm64 packages; it now bundles **Percona Server 8.0** — a drop-in MySQL with arm64 packages, identical `mysqld`/`mysql` binaries and ROW binlog format (the build gates on `mysqld --version` being Percona 8.0). The publish workflow builds each arch on a native runner and merges them into one manifest list (asserting both arches are present before signing), so `docker run` resolves the host's native entry with no QEMU emulation. Evaluation-only demo image; no change to the bintrail/bintrail-console/bintrail-pg binaries, which were already multi-arch.
+
 ## [0.20.1] - 2026-06-23
 
 ### Added
