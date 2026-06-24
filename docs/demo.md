@@ -1,8 +1,9 @@
 # dbtrail demo — 30-second evaluation
 
 `ghcr.io/dbtrail/bintrail-demo` is a **single-container, evaluation-only**
-demo: MySQL 8.0, dbtrail, ProxySQL, and a traffic generator, preconfigured so
-your first Time Travel SQL query is one `docker run` away.
+demo: Percona Server 8.0 (a drop-in MySQL), dbtrail, ProxySQL, and a traffic
+generator, preconfigured so your first Time Travel SQL query is one
+`docker run` away.
 
 ```sh
 docker run --rm -p 6033:6033 ghcr.io/dbtrail/bintrail-demo
@@ -29,9 +30,9 @@ mysql -h 127.0.0.1 -P 6033 -u demo -pdemo demo \
 > deployments see [deployment.md](deployment.md) and
 > [time-travel-sql.md](time-travel-sql.md).
 
-> **amd64-only.** MySQL's apt repo ships no arm64 packages for Debian, so the
-> image is `linux/amd64`; Apple Silicon runs it transparently via Rosetta —
-> fine for an evaluation.
+> **Multi-arch.** The image is published for both `linux/amd64` and
+> `linux/arm64`, so `docker run` works natively on Apple Silicon and ARM64
+> hosts (AWS Graviton, etc.) — no emulation.
 
 ## What's inside
 
@@ -40,7 +41,7 @@ the container exits — a half-working demo never lingers):
 
 | Component | Role |
 |---|---|
-| MySQL 8.0 | Source **and** index in one instance: the `demo` schema takes writes; `bintrail_index` holds the row-event index. Binlog preconfigured (`ROW`, `FULL`, GTID). |
+| Percona Server 8.0 | A drop-in MySQL (arm64-capable). Source **and** index in one instance: the `demo` schema takes writes; `bintrail_index` holds the row-event index. Binlog preconfigured (`ROW`, `FULL`, GTID). |
 | `bintrail up` | Streams the `demo` schema's binlog into `bintrail_index` — the same one-command quickstart you'd run against your own MySQL. |
 | `bintrail shim` | Answers `_flashback`/`_snapshot`/`_diff` time-travel queries over the MySQL wire protocol (loopback `:3308`). |
 | ProxySQL | The front door on `:6033`. Routes time-travel shapes to the shim and everything else straight to MySQL — one connection, both worlds. |

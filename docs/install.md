@@ -100,8 +100,8 @@ docker run --rm -p 6033:6033 ghcr.io/dbtrail/bintrail-demo
 Wait for the banner, give the traffic a minute to build history, then query a
 row "as of" a minute ago over port 6033. The full walkthrough, credentials,
 and more queries are in [demo.md](./demo.md). (Stateless, evaluation-only,
-amd64-only — runs under emulation on Apple Silicon; the main bintrail image is
-multi-arch.)
+multi-arch — runs natively on amd64 and arm64, including Apple Silicon and
+Graviton.)
 
 ## Docker image (without Compose)
 
