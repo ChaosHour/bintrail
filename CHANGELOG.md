@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.3] - 2026-06-24
+
+### Fixed
+- **Console Overview/Events no longer fails with `Error 1038 (Out of sort memory)` on wide rows** (#608). When the events list sorted the most-recent rows, MySQL carried the wide before/after JSON row images through the filesort as packed addon fields; a single fat row image — e.g. a WordPress `wp_options` autoload blob larger than the index MySQL's `sort_buffer_size` (the stock 256K on MySQL 8.x) — overflowed the sort buffer and killed the whole query, so the console landing page rendered only the error. The query engine now sorts and limits the **narrow key columns** (`event_id`, `event_timestamp`) alone, then joins back to fetch the wide columns for just those rows (late materialization) and re-establishes order in Go, so row width can no longer trip the sort. The bundled index MySQL also raises `sort_buffer_size` to 4M as defense-in-depth. An index does not fix this (on the RANGE-partitioned `binlog_events` the cross-partition merge still carries the wide columns); the bug is specific to MySQL 8.4 (the bundled index version — MySQL 8.0 degrades the sort instead of erroring). Affects every read surface (console, MCP, CLI `query`/`recover`).
+
 ## [0.20.2] - 2026-06-24
 
 ### Changed
