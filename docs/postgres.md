@@ -300,10 +300,13 @@ shared daemon for PostgreSQL sources in this release — one process per source
 (systemd unit, container, etc.).
 
 You can **view and recover** PostgreSQL-captured data in the read-only web
-console (`bintrail-console`), which reads the shared index — but the console's
-"+ Add server" / `watch` control plane is MySQL-oriented and does not yet drive
-PostgreSQL capture. Run `bintrail-pg stream` for the capture; use the console (or
-the `query`/`recover` CLI) to browse and recover.
+console (`bintrail-console`), which reads the shared index. The console presents
+PostgreSQL sources natively — LSN/slot vocabulary, a lost-slot badge, a forensics
+note, and a live replication-health panel (slot WAL-retention, lag, RI-FULL); see
+[PostgreSQL sources](console.md#postgresql-sources). What it does **not** drive is
+*capture*: the "+ Add server" / `watch` control plane is MySQL-oriented, so run
+`bintrail-pg stream` for the capture and use the console (or the `query`/`recover`
+CLI) to browse and recover.
 
 ---
 
@@ -440,10 +443,11 @@ your own round-trip.
 
 The data-safety items that gated **beta** are now closed (type fidelity,
 identity/generated recovery, slot/WAL monitoring, RI-FULL validation, DDL-drift
-handling, and the silent-loss coverage guards above). The remaining limitations —
-full-table `reconstruct` / time-travel via a PostgreSQL baseline, a managed-
-PostgreSQL smoke matrix, and source-aware console presentation — are tracked
-toward **GA** in [#597](https://github.com/dbtrail/dbtrail/issues/597).
+handling, and the silent-loss coverage guards above). Source-aware console
+presentation, including the live replication-health panel, shipped in v0.20.1.
+The remaining limitations — full-table `reconstruct` / time-travel via a
+PostgreSQL baseline, and a managed-PostgreSQL smoke matrix — are tracked toward
+**GA** in [#597](https://github.com/dbtrail/dbtrail/issues/597).
 
 ---
 
