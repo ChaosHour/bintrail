@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.4] - 2026-06-24
+
+### Fixed
+- **Console Baselines / S3 time-travel no longer fail with "Can't find the home directory at '/home/bintrail'"** (#610). DuckDB caches its `httpfs`/`aws` extensions under `$HOME/.duckdb`, but the runtime images create the service user with `useradd --no-create-home`, so `$HOME` resolved to a directory that never existed — the first S3 baseline/archive read aborted the whole query (the console Storage → Baselines panel rendered only the error). The DuckDB session helpers now point `$HOME` at a writable directory when it is broken (the env is the only lever that reaches both an explicit `INSTALL` and the autoload a `CREATE SECRET`/`parquet_scan` triggers on its own pooled connection), and all five runtime Dockerfiles create `/home/bintrail`. Affects every DuckDB-over-S3 path: console `ListBaselines`, baseline reads, `query --include-snapshot`, `archive reconcile --deep`, and S3-direct `--ultrafast` reads.
+- **The default baseline dump no longer fails for a least-privilege capture user** (baseline compose profile). `docker compose --profile baseline run --rm baseline` with no `BASELINE_SCHEMAS` dumped every schema including `sys`; a typical replication user (`REPLICATION SLAVE`/`CLIENT` + `SELECT`, no `SHOW VIEW`) cannot read the `sys` views, so mydumper died with `ERROR 1142: SHOW VIEW command denied ... sys.host_summary` and the profile exited 1. The default dump now excludes the system schemas (`mysql`/`sys`/`performance_schema`/`information_schema`) — they are unreadable by a least-privilege user and useless as a baseline anyway.
+
 ## [0.20.3] - 2026-06-24
 
 ### Fixed
