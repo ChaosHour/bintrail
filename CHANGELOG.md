@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-06-25
+
+### Added
+- **Console: create a baseline snapshot from the web UI** (#613). The `bintrail-console watch` daemon gains an opt-in **Create baseline** button on the Storage → Baselines panel that runs the full dump→convert→upload pipeline for a monitored server **in-process** — the console image bundles `mydumper` (pinned to the same `v1.0.3-1` the compose baseline pipeline uses) and runs it as a local subprocess, then converts to Parquet and uploads to the server's S3 baseline prefix by calling `internal/baseline` directly. The console **never mounts the Docker socket**, so a console compromise cannot escalate to host-root, and the source DSN never leaves the process. Off by default — enable with `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1`. The button is gated on the server having both a source and a baseline destination configured, runs one baseline at a time per server, and uses a consistent lock-free dump (`--sync-thread-lock-mode NO_LOCK --trx-tables`) so a least-privilege replication user (no `RELOAD`/`FLUSH_TABLES`) can dump, with the system schemas excluded. Validated end-to-end against a live Percona 8.0 source.
+
+### Fixed
+- **S3 uploads no longer fail with "region was not a valid DNS name" when `AWS_REGION` is unset** (#613). `storage.NewS3Client` relied on the AWS SDK resolving the region from the ambient chain, but the SDK does not fall back to EC2/ECS IMDS for the region — only `AWS_REGION`/`AWS_DEFAULT_REGION` and the shared config. In an IAM-role-only deployment with no `AWS_REGION` set (the bundled console on EC2), the region resolved empty and every S3 request failed. The client now best-effort queries the instance's IMDS region (2s timeout) when nothing else supplies one. Benefits every region-less S3 caller (baseline upload, archive upload, reconcile).
+
 ## [0.20.4] - 2026-06-24
 
 ### Fixed
