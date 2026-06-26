@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-06-25
+
+### Changed
+- **Console: cascade recovery is auto-detected inside Recover, not a separate tab** (#617). The standalone "Cascade recovery" tab is gone — when you generate undo SQL for a `DELETE` on a foreign-key **parent** whose children InnoDB cascade-deleted *below* the binlog (MySQL Bug #32506; MySQL ≤8.x / MariaDB), the console now detects it automatically (one index lookup of the recorded FK graph) and folds the invisible children into the **same** reversal script — re-inserting the parent once, re-creating the cascade-deleted children, and restoring `ON DELETE SET NULL`'d foreign keys, all wrapped in `SET FOREIGN_KEY_CHECKS=0/1`. A *CASCADE detected* banner reports how many children and SET-NULL restores were included, and the `POST /api/recover` response gains `cascade_detected`/`victim_count`/`set_null_count`. Detection is best-effort and degrades safely: a PostgreSQL-sourced index is skipped (logical replication already captures cascade deletes as real events, so there is no blind spot to synthesize), an active RBAC redaction profile keeps synthesis disabled but **warns** that children are not included (never a silent parent-only "full restore"), and any detection/synthesis failure falls back to the plain recover with a visible warning rather than denying it. The scriptable `bintrail recover-cascade` CLI and the standalone `POST /api/recover-cascade` endpoint (with explicit `--lookback`/`--max-depth` knobs) are unchanged.
+
 ## [0.21.0] - 2026-06-25
 
 ### Added
