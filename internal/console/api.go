@@ -76,6 +76,13 @@ type recoverResponse struct {
 	StatementCount int      `json:"statement_count"`
 	RowCount       int      `json:"row_count"`
 	Warnings       []string `json:"warnings,omitempty"`
+	// Cascade fields are set only when the recover target was auto-detected as a
+	// foreign-key parent whose DELETE cascaded below the binlog (the script then
+	// also re-creates the invisible children). Zero/false/empty for a plain
+	// recover, so existing clients are unaffected.
+	CascadeDetected bool `json:"cascade_detected,omitempty"`
+	VictimCount     int  `json:"victim_count,omitempty"`
+	SetNullCount    int  `json:"set_null_count,omitempty"`
 }
 
 type schemasResponse struct {
@@ -249,12 +256,80 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		writeFetchError(w, err)
 		return
 	}
+	warnings := gapWarnings(plan)
+
+	// Per-bundle dialect (the console is multi-server): MySQLDialect covers MySQL +
+	// MariaDB, PostgresDialect a PG-flavored index. Read once and reused below.
+	dialect := recovery.DialectForIndex(b.db)
+
+	// Cascade auto-detection. Undoing a DELETE on a foreign-key parent, the plain
+	// reversal is a strict SUBSET: it re-inserts the parent but not the child rows
+	// InnoDB cascade-deleted below the binlog (MySQL Bug #32506). When the target
+	// is such a parent, synthesize those invisible victims and fold them into ONE
+	// script — the operator never has to know their FK topology or visit a separate
+	// tab. Gated to MySQL/MariaDB: it is a binlog blind-spot fix, and PostgreSQL
+	// logical replication captures cascade deletes as real events (no blind spot to
+	// synthesize — firing here would only surface a misleading "0 victims" banner).
+	// Otherwise only meaningful when a single table is in scope and the matched rows
+	// actually contain a DELETE on it (an INSERT/UPDATE undo never cascades).
+	if dialect == recovery.MySQLDialect && body.Table != "" && rowsContainDeleteOn(rows, body.Table) {
+		isParent, derr := s.cascadeParentDetect(b, body.Schema, body.Table)
+		switch {
+		case derr != nil:
+			// Detection is best-effort: a probe failure must never block a plain
+			// recover — but it must NOT silently downgrade one either. If this table
+			// IS a cascade parent we couldn't tell, so warn that any cascade-deleted
+			// children may be missing (mirrors the RBAC arm below), then fall through
+			// to the plain path.
+			slog.Warn("console: cascade parent detection failed; recover proceeds without cascade synthesis", "error", derr)
+			warnings = append([]string{
+				"Could not check whether this table is a foreign-key parent (detection failed: " + derr.Error() + "). If it is, any cascade-deleted child rows are NOT included in the script below — retry, or use recover-cascade to reconstruct them.",
+			}, warnings...)
+		case isParent && s.rbacActive():
+			// Synthesis can't honor redaction (it would leak denied/redacted child
+			// rows), so it stays disabled under a profile — but SAY so, so a
+			// parent-only script is never silently presented as a full restore.
+			warnings = append([]string{
+				"This table has ON DELETE CASCADE / SET NULL children, but cascade synthesis is disabled while an RBAC redaction profile is active — the script below re-creates the parent only; cascade-deleted child rows are NOT included.",
+			}, warnings...)
+		case isParent:
+			cres, cerr := s.cascadeRecover(r.Context(), b, body, opts, rows)
+			if cerr != nil {
+				// Cascade synthesis is an ENHANCEMENT of the plain recover, not a
+				// precondition — the base rows were already fetched. A synthesis
+				// failure must not deny the recover the operator can still get;
+				// degrade to the plain path with a loud warning rather than 500ing
+				// the whole request (which would block even the parent-only undo).
+				slog.Warn("console: cascade synthesis failed; falling back to plain recover", "error", cerr)
+				warnings = append([]string{
+					"Cascade synthesis failed (" + cerr.Error() + "); the script below re-creates the parent only — cascade-deleted child rows are NOT included.",
+				}, warnings...)
+				break // out of the switch → plain recover below
+			}
+			cw := warnings
+			if len(cres.Caveats) > 0 {
+				cw = append([]string{
+					"Cascade recovery is provably partial — review the caveats below; some cascade-deleted rows may be missing.",
+				}, cres.Caveats...)
+				cw = append(cw, warnings...)
+			}
+			writeJSON(w, http.StatusOK, recoverResponse{
+				SQL:             cres.SQL,
+				StatementCount:  cres.StatementCount,
+				RowCount:        len(rows),
+				Warnings:        cw,
+				CascadeDetected: true,
+				VictimCount:     cres.VictimCount,
+				SetNullCount:    cres.SetNullCount,
+			})
+			return
+		}
+	}
 
 	var buf bytes.Buffer
-	// Per-bundle dialect: the console is multi-server, so select from THIS server's
-	// index flavor (a PG-flavored index → PostgreSQL reversal SQL). DialectForIndex
-	// defaults to MySQL on any read failure (#533/#573).
-	n, err := recovery.NewForDialect(b.db, b.resolver, recovery.DialectForIndex(b.db)).GenerateSQLFromRows(rows, &buf)
+	// Per-bundle dialect (read above): a PG-flavored index → PostgreSQL reversal SQL.
+	// DialectForIndex defaults to MySQL on any read failure (#533/#573).
+	n, err := recovery.NewForDialect(b.db, b.resolver, dialect).GenerateSQLFromRows(rows, &buf)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -263,7 +338,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		SQL:            buf.String(),
 		StatementCount: n,
 		RowCount:       len(rows),
-		Warnings:       gapWarnings(plan),
+		Warnings:       warnings,
 	})
 }
 
