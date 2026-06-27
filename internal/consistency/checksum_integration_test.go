@@ -1,0 +1,341 @@
+//go:build integration
+
+package consistency
+
+import (
+	"context"
+	"testing"
+
+	"github.com/dbtrail/dbtrail/internal/testutil"
+)
+
+func TestConsistentTableChecksum_BasicAndDeterministic(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(64), amount DECIMAL(10,2))")
+	testutil.MustExec(t, db, "INSERT INTO t VALUES (1,'alice',1.50),(2,'bob',2.00),(3,'carol',3.25)")
+
+	ctx := context.Background()
+	c1, err := ConsistentTableChecksum(ctx, db, schema, "t")
+	if err != nil {
+		t.Fatalf("checksum: %v", err)
+	}
+	if c1.RowCount != 3 {
+		t.Errorf("RowCount = %d, want 3", c1.RowCount)
+	}
+	if c1.Digest == "" || c1.Digest == "0000000000000000" {
+		t.Errorf("Digest = %q, want a non-empty non-zero hash", c1.Digest)
+	}
+
+	// Recomputing over identical data yields an identical digest.
+	c2, err := ConsistentTableChecksum(ctx, db, schema, "t")
+	if err != nil {
+		t.Fatalf("checksum (2nd): %v", err)
+	}
+	if c1.Digest != c2.Digest {
+		t.Errorf("digest not deterministic: %s != %s", c1.Digest, c2.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_OrderIndependent(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, name VARCHAR(64))")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, name VARCHAR(64))")
+	// Same rows, inserted in different physical order.
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1,'alice'),(2,'bob'),(3,'carol')")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (3,'carol'),(1,'alice'),(2,'bob')")
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, err := ConsistentTableChecksum(ctx, db, schema, "b")
+	if err != nil {
+		t.Fatalf("checksum b: %v", err)
+	}
+	if ca.Digest != cb.Digest {
+		t.Errorf("digest depends on insertion order: %s != %s", ca.Digest, cb.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_SingleByteChangeDiffers(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, name VARCHAR(64))")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, name VARCHAR(64))")
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1,'alice')")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1,'alicf')") // one byte different
+
+	ctx := context.Background()
+	ca, _ := ConsistentTableChecksum(ctx, db, schema, "a")
+	cb, _ := ConsistentTableChecksum(ctx, db, schema, "b")
+	if ca.Digest == cb.Digest {
+		t.Errorf("single-byte change did not change digest: both %s", ca.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_RepresentationOnlyDiffMatches(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, doc JSON)")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, doc JSON)")
+	// Same logical JSON, different source whitespace/key order; the server
+	// normalizes both to the same canonical text form.
+	testutil.MustExec(t, db, `INSERT INTO a VALUES (1, '{"a": 1, "b": 2}')`)
+	testutil.MustExec(t, db, `INSERT INTO b VALUES (1, '{"b":2,"a":1}')`)
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, err := ConsistentTableChecksum(ctx, db, schema, "b")
+	if err != nil {
+		t.Fatalf("checksum b: %v", err)
+	}
+	if ca.Digest != cb.Digest {
+		t.Errorf("representation-only JSON difference changed digest: %s != %s", ca.Digest, cb.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_GeneratedColumnsExcluded(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	// Table b has an extra STORED generated column derived from base columns.
+	// Since mydumper omits generated columns, the checksum must ignore it, so
+	// a and b must match.
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, price INT, qty INT)")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, price INT, qty INT, total INT AS (price*qty) STORED)")
+	testutil.MustExec(t, db, "INSERT INTO a (id,price,qty) VALUES (1,10,2),(2,5,4)")
+	testutil.MustExec(t, db, "INSERT INTO b (id,price,qty) VALUES (1,10,2),(2,5,4)")
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, err := ConsistentTableChecksum(ctx, db, schema, "b")
+	if err != nil {
+		t.Fatalf("checksum b: %v", err)
+	}
+	if ca.Digest != cb.Digest {
+		t.Errorf("generated column affected digest: %s != %s", ca.Digest, cb.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_DefaultTimestampColumnIncluded(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	// A `DEFAULT CURRENT_TIMESTAMP` column reports EXTRA="DEFAULT_GENERATED" but
+	// is an ordinary, mydumper-dumped data column — it MUST be in the digest.
+	// Tables a and b carry the same id but different timestamp values, so if the
+	// column is included (correct) the digests differ; if it were wrongly
+	// excluded as "generated" the digests would falsely match.
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+	testutil.MustExec(t, db, "INSERT INTO a (id, created_at) VALUES (1, '2021-01-01 00:00:00')")
+	testutil.MustExec(t, db, "INSERT INTO b (id, created_at) VALUES (1, '2022-06-15 12:30:00')")
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, err := ConsistentTableChecksum(ctx, db, schema, "b")
+	if err != nil {
+		t.Fatalf("checksum b: %v", err)
+	}
+	if ca.Digest == cb.Digest {
+		t.Errorf("DEFAULT CURRENT_TIMESTAMP column excluded from digest (false match): both %s", ca.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_UnsignedHighValuesDiffer(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	// Two BIGINT UNSIGNED values above 2^63 that differ by 1 must produce
+	// different digests. This guards the classic UNSIGNED⇒negative corruption
+	// class (#490): a regression to typed/int64 scanning would collapse both to
+	// -1 / a wrapped value and the digests would falsely match. Asserting the
+	// digests DIFFER proves the high value is actually captured, not maxed.
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, big BIGINT UNSIGNED)")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, big BIGINT UNSIGNED)")
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, 18446744073709551615)")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, 18446744073709551614)")
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, err := ConsistentTableChecksum(ctx, db, schema, "b")
+	if err != nil {
+		t.Fatalf("checksum b: %v", err)
+	}
+	if ca.Digest == cb.Digest {
+		t.Errorf("distinct high-unsigned values produced the same digest (UNSIGNED corruption escape): both %s", ca.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_BinaryBytesByteExact(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	// VARBINARY values that differ only in an embedded NUL, a trailing NUL, or a
+	// high byte must produce different digests. sql.RawBytes is byte-exact; a
+	// regression to typed string scanning would truncate at the first 0x00 and
+	// silently collapse these — the project's _binary/\0 data-loss history.
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, v VARBINARY(16))")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, v VARBINARY(16))")
+	// 0x61 0x00 0x62  vs  0x61 0x00 0x63 — identical up to and past an embedded NUL.
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, X'610062')")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, X'610063')")
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, err := ConsistentTableChecksum(ctx, db, schema, "b")
+	if err != nil {
+		t.Fatalf("checksum b: %v", err)
+	}
+	if ca.Digest == cb.Digest {
+		t.Errorf("binary values differing only past an embedded NUL produced the same digest (truncation escape): both %s", ca.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_DatetimeMicrosecondsDiffer(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	// DATETIME(6) values differing only in microseconds must differ — guards
+	// against fractional-precision collapse.
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, ts DATETIME(6))")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, ts DATETIME(6))")
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, '2021-01-01 00:00:00.000001')")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, '2021-01-01 00:00:00.000002')")
+
+	ctx := context.Background()
+	ca, _ := ConsistentTableChecksum(ctx, db, schema, "a")
+	cb, _ := ConsistentTableChecksum(ctx, db, schema, "b")
+	if ca.Digest == cb.Digest {
+		t.Errorf("DATETIME(6) microsecond difference collapsed: both %s", ca.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_DoubleLastDigitDiffersAndStable(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, d DOUBLE)")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, d DOUBLE)")
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, 1.0000000000001)")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, 1.0000000000002)")
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, _ := ConsistentTableChecksum(ctx, db, schema, "b")
+	if ca.Digest == cb.Digest {
+		t.Errorf("DOUBLE last-digit difference collapsed: both %s", ca.Digest)
+	}
+	// Same-server re-read is deterministic despite float text-rendering caveat.
+	ca2, _ := ConsistentTableChecksum(ctx, db, schema, "a")
+	if ca.Digest != ca2.Digest {
+		t.Errorf("DOUBLE digest not stable across reads: %s != %s", ca.Digest, ca2.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_MultibyteStringsDiffer(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	// Documents the charset contract: utf8mb4 multibyte content is captured
+	// byte-exact, so distinct multibyte strings differ and a re-read is stable.
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, s VARCHAR(32)) CHARACTER SET utf8mb4")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, s VARCHAR(32)) CHARACTER SET utf8mb4")
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, '日本語😀')")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, '日本語😁')")
+
+	ctx := context.Background()
+	ca, err := ConsistentTableChecksum(ctx, db, schema, "a")
+	if err != nil {
+		t.Fatalf("checksum a: %v", err)
+	}
+	cb, _ := ConsistentTableChecksum(ctx, db, schema, "b")
+	if ca.Digest == cb.Digest {
+		t.Errorf("distinct multibyte strings produced the same digest: both %s", ca.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_NullDistinctFromEmpty(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE a (id INT PRIMARY KEY, name VARCHAR(64))")
+	testutil.MustExec(t, db, "CREATE TABLE b (id INT PRIMARY KEY, name VARCHAR(64))")
+	testutil.MustExec(t, db, "INSERT INTO a VALUES (1, NULL)")
+	testutil.MustExec(t, db, "INSERT INTO b VALUES (1, '')")
+
+	ctx := context.Background()
+	ca, _ := ConsistentTableChecksum(ctx, db, schema, "a")
+	cb, _ := ConsistentTableChecksum(ctx, db, schema, "b")
+	if ca.Digest == cb.Digest {
+		t.Errorf("NULL and empty string hashed the same: both %s", ca.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_EmptyTable(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(64))")
+
+	ctx := context.Background()
+	c, err := ConsistentTableChecksum(ctx, db, schema, "t")
+	if err != nil {
+		t.Fatalf("checksum: %v", err)
+	}
+	if c.RowCount != 0 {
+		t.Errorf("RowCount = %d, want 0", c.RowCount)
+	}
+	if c.Digest != "v1:0000000000000000" {
+		t.Errorf("Digest = %q, want version-tagged all-zero for empty table", c.Digest)
+	}
+}
+
+func TestConsistentTableChecksum_MissingTableErrors(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	ctx := context.Background()
+	if _, err := ConsistentTableChecksum(ctx, db, schema, "does_not_exist"); err == nil {
+		t.Error("expected error for missing table, got nil")
+	}
+}
+
+func TestConsistentTableChecksum_MariaDBGTIDAbsent(t *testing.T) {
+	testutil.SkipIfNoMariaDB(t)
+	db, schema := testutil.CreateTestMariaDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(64))")
+	testutil.MustExec(t, db, "INSERT INTO t VALUES (1,'alice'),(2,'bob')")
+
+	ctx := context.Background()
+	// MariaDB has no @@global.gtid_executed (error 1193). The checksum must
+	// still succeed with an empty GTID anchor, not fail — a wrong error constant
+	// or non-matching errors.As would break every MariaDB-source checksum.
+	c, err := ConsistentTableChecksum(ctx, db, schema, "t")
+	if err != nil {
+		t.Fatalf("checksum on MariaDB: %v", err)
+	}
+	if c.GTIDSet != "" {
+		t.Errorf("GTIDSet = %q on MariaDB, want empty", c.GTIDSet)
+	}
+	if c.RowCount != 2 {
+		t.Errorf("RowCount = %d, want 2", c.RowCount)
+	}
+}
+
+func TestConsistentTableChecksum_CapturesGTIDWhenEnabled(t *testing.T) {
+	db, schema := testutil.CreateTestDB(t)
+	testutil.MustExec(t, db, "CREATE TABLE t (id INT PRIMARY KEY)")
+	testutil.MustExec(t, db, "INSERT INTO t VALUES (1)")
+
+	var gtidMode string
+	if err := db.QueryRow("SELECT @@gtid_mode").Scan(&gtidMode); err != nil {
+		t.Skipf("cannot read @@gtid_mode: %v", err)
+	}
+
+	ctx := context.Background()
+	c, err := ConsistentTableChecksum(ctx, db, schema, "t")
+	if err != nil {
+		t.Fatalf("checksum: %v", err)
+	}
+	if gtidMode == "ON" && c.GTIDSet == "" {
+		t.Error("gtid_mode=ON but GTIDSet is empty")
+	}
+}
