@@ -16,6 +16,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/console"
@@ -66,17 +67,18 @@ var (
 	upSkipDoctor            bool
 	upFormat                string
 
-	upConsoleListen      string
-	upConsoleToken       string
-	upConsoleBaselineDir string
-	upConsoleBaselineS3  string
-	upConsoleServersFile string
-	upConsoleAuthFile    string
-	upConsoleTLSCert     string
-	upConsoleTLSKey      string
-	upConsoleAllowedHost []string
-	upConsoleAllowSetup  bool
-	upArchiveStageDir    string
+	upConsoleListen         string
+	upConsoleToken          string
+	upConsoleBaselineDir    string
+	upConsoleBaselineS3     string
+	upConsoleBaselineRetain string
+	upConsoleServersFile    string
+	upConsoleAuthFile       string
+	upConsoleTLSCert        string
+	upConsoleTLSKey         string
+	upConsoleAllowedHost    []string
+	upConsoleAllowSetup     bool
+	upArchiveStageDir       string
 	// upConsoleBaselineTrigger opts into in-process baseline creation from the
 	// console (#613). Env-only (BINTRAIL_CONSOLE_BASELINE_TRIGGER=1) — off by
 	// default because it needs mydumper in the image and reaches the source DB.
@@ -157,6 +159,7 @@ func init() {
 	watchCmd.Flags().StringVar(&upConsoleToken, "console-token", "", "Opt-in static token for API automation (never generated; humans use the console password)")
 	watchCmd.Flags().StringVar(&upConsoleBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots; enables the console's point-in-time Reconstruct surface")
 	watchCmd.Flags().StringVar(&upConsoleBaselineS3, "baseline-s3", "", "S3 prefix of baseline Parquet snapshots (s3://bucket/prefix/); enables Reconstruct")
+	watchCmd.Flags().StringVar(&upConsoleBaselineRetain, "baseline-retain", "", "Periodically prune local --baseline-dir snapshots older than this (Nd/Nh) once a durable copy exists in --baseline-s3 (never deletes the only copy or the newest snapshot per table)")
 	watchCmd.Flags().StringVar(&upConsoleServersFile, "console-servers-file", "", "Path to the console server registry YAML (default ~/.config/bintrail/console-servers.yaml)")
 	watchCmd.Flags().StringVar(&upConsoleAuthFile, "console-auth-file", "", "Path to the console auth file enabling password login (default ~/.config/bintrail/console-auth.yaml; created with `bintrail-console user set-password`)")
 	watchCmd.Flags().StringVar(&upConsoleTLSCert, "console-tls-cert", "", "TLS certificate file (PEM); serve the console over HTTPS (requires --console-tls-key)")
@@ -373,6 +376,12 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
 	})
 
+	// Reclaim local baseline snapshots that already have a durable S3 copy (#616):
+	// the global --baseline-dir plus every registry server's per-server dir.
+	if err := startBaselinePruneLoop(ctx, registry, upConsoleBaselineDir, upConsoleBaselineS3, upConsoleBaselineRetain, upRotationCfg.Interval); err != nil {
+		return err
+	}
+
 	srv, err := console.New(cfg)
 	if err != nil {
 		return err
@@ -472,6 +481,12 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	rotation.StartLoop(ctx, rotationSettingsProvider(registry), func() []rotation.RotateTarget {
 		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
 	})
+
+	// Reclaim local baseline snapshots that already have a durable S3 copy (#616):
+	// the global --baseline-dir plus every registry server's per-server dir.
+	if err := startBaselinePruneLoop(ctx, registry, upConsoleBaselineDir, upConsoleBaselineS3, upConsoleBaselineRetain, upRotationCfg.Interval); err != nil {
+		return err
+	}
 
 	// With the console comes the multi-stream control plane, so /metrics is
 	// served once at the daemon level (per-source "source" labels keep the
@@ -580,6 +595,11 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 			upConsoleBaselineS3 = v
 		}
 	}
+	if !cmd.Flags().Changed("baseline-retain") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_RETAIN"); v != "" {
+			upConsoleBaselineRetain = v
+		}
+	}
 	if !cmd.Flags().Changed("console-servers-file") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_SERVERS"); v != "" {
 			upConsoleServersFile = v
@@ -633,6 +653,142 @@ func baselineStagingDir() string {
 		return upBaselineStageDir
 	}
 	return filepath.Join(os.TempDir(), "bintrail-baseline-staging")
+}
+
+// baselinePruneTarget is one (local dir, durable S3) pair the prune loop reclaims.
+type baselinePruneTarget struct {
+	dir string
+	s3  string
+}
+
+// baselinePruneTargets collects every baseline directory the daemon should prune,
+// each paired with the S3 prefix that proves a snapshot is durable (#616):
+//   - the daemon-global --baseline-dir/--baseline-s3 (the compose baseline profile
+//     and the boot index write here), and
+//   - every registry server's BaselineDir/BaselineS3 — the PER-SERVER dirs the
+//     console "Create baseline" trigger (#613/#615) writes into (req.LocalDir =
+//     entry.BaselineDir), which the global flag does NOT cover.
+//
+// A target needs BOTH a dir (to prune) and an S3 prefix (to confirm durability);
+// dir-only or s3-only entries are skipped — a local snapshot with no S3 copy is
+// the only copy and is never deleted. Deduped so a server that reuses the global
+// dir is not pruned twice. Read fresh each cycle so a server added/edited from the
+// console is covered on the next tick without a restart (mirrors rotateTargets).
+func baselinePruneTargets(entries []console.ServerEntry, globalDir, globalS3 string) []baselinePruneTarget {
+	var targets []baselinePruneTarget
+	seen := map[string]bool{}
+	add := func(dir, s3 string) {
+		if dir == "" || s3 == "" {
+			return
+		}
+		key := dir + "\x00" + s3
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		targets = append(targets, baselinePruneTarget{dir: dir, s3: s3})
+	}
+	add(globalDir, globalS3)
+	for _, e := range entries {
+		add(e.BaselineDir, e.BaselineS3)
+	}
+	return targets
+}
+
+// runBaselinePruneCycle prunes each target via pruneFn, one (dir + S3) pair at a
+// time. A failure on one target is logged and the rest still run — one bad dir
+// must not strand the others. pruneFn is injected (baseline.PruneLocal in
+// production) so the per-target iteration is unit-testable without S3.
+func runBaselinePruneCycle(ctx context.Context, targets []baselinePruneTarget, retain time.Duration, pruneFn func(context.Context, baseline.PruneOptions) (baseline.PruneResult, error)) {
+	for _, t := range targets {
+		res, err := pruneFn(ctx, baseline.PruneOptions{
+			LocalDir: t.dir,
+			S3URL:    t.s3,
+			Retain:   retain,
+		})
+		if err != nil {
+			slog.Warn("baseline prune cycle failed", "dir", t.dir, "error", err)
+			continue
+		}
+		if len(res.Pruned) > 0 {
+			slog.Info("baseline prune cycle complete",
+				"dir", t.dir, "pruned", len(res.Pruned), "reclaimed_bytes", res.ReclaimedBytes)
+		}
+	}
+}
+
+// startBaselinePruneLoop launches a periodic prune of local baseline snapshots
+// across every (dir + S3) target — the daemon-global pair plus every registry
+// server's per-server baseline dir (#616). Each target is reclaimed only where a
+// durable S3 copy exists; a dir with no S3 source is left untouched (its snapshots
+// are the only copy — the same invariant rotation enforces with
+// PruneLocalAfterUpload && ArchiveS3 != ""). The loop runs on the daemon context
+// and stops when it is cancelled; it shares the rotation cadence (baselines change
+// far less often than partitions, so this interval is ample). A bad
+// --baseline-retain value is a fatal misconfiguration returned BEFORE the
+// goroutine starts, so a typo fails the daemon fast rather than spinning.
+func startBaselinePruneLoop(ctx context.Context, reg *console.Registry, globalDir, globalS3, retainRaw string, interval time.Duration) error {
+	if retainRaw == "" {
+		return nil // retention not configured — leave baselines untouched
+	}
+	retain, err := cliutil.ParseRetain(retainRaw)
+	if err != nil {
+		return fmt.Errorf("--baseline-retain: %w", err)
+	}
+	if globalDir != "" && globalS3 == "" {
+		// The operator pointed retention at a local dir with no durable S3 source;
+		// warn once so the global dir not being reclaimed isn't a silent surprise.
+		// Per-server registry targets (added at runtime) may still have both.
+		slog.Warn("--baseline-retain is set and --baseline-dir is configured but --baseline-s3 is not; the global baseline dir will not be pruned (its snapshots are the only copy)")
+	}
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	slog.Info("baseline prune loop enabled", "retain", retainRaw, "interval", interval)
+	go func() {
+		runOnce := func() {
+			// Recover-guard the cycle: a panic in PruneLocal (live S3 calls, fs
+			// walks) must NEVER take down the daemon's primary forensic capture —
+			// this optional disk-reclaim feature shares the process with the
+			// stream. Mirrors rotation.StartLoop's guard (internal/rotation).
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("baseline prune cycle panicked; retention continues next tick", "panic", r)
+				}
+			}()
+			var entries []console.ServerEntry
+			if reg != nil {
+				entries = reg.List()
+			}
+			// A per-server local baseline dir with no S3 prefix is the only copy —
+			// skipped, but warn (matching the global/CLI signal) so its unbounded
+			// growth isn't silent.
+			for _, e := range entries {
+				if e.BaselineDir != "" && e.BaselineS3 == "" {
+					slog.Warn("baseline-retain: server has a local baseline dir but no S3 prefix; its baselines are the only copy and will not be pruned",
+						"server", e.Name, "dir", e.BaselineDir)
+				}
+			}
+			runBaselinePruneCycle(ctx, baselinePruneTargets(entries, globalDir, globalS3), retain, baseline.PruneLocal)
+		}
+		// One sweep shortly after startup (the min-age floor protects any
+		// just-created snapshot), then on the interval — unless the daemon is
+		// already shutting down.
+		if ctx.Err() == nil {
+			runOnce()
+		}
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				runOnce()
+			}
+		}
+	}()
+	return nil
 }
 
 // consoleOpts carries watch's console-surface settings into upConsoleConfig —

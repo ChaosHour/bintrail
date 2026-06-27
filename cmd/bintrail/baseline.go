@@ -31,18 +31,19 @@ Output structure:
 }
 
 var (
-	bslInput        string
-	bslOutput       string
-	bslTimestamp    string
-	bslTables       string
-	bslCompression  string
-	bslRowGroupSize int
-	bslUpload       string
-	bslUploadRegion string
-	bslFormat       string
-	bslRetry        bool
-	bslEncrypt      bool
-	bslEncryptKey   string
+	bslInput          string
+	bslOutput         string
+	bslTimestamp      string
+	bslTables         string
+	bslCompression    string
+	bslRowGroupSize   int
+	bslUpload         string
+	bslUploadRegion   string
+	bslBaselineRetain string
+	bslFormat         string
+	bslRetry          bool
+	bslEncrypt        bool
+	bslEncryptKey     string
 )
 
 func init() {
@@ -54,6 +55,7 @@ func init() {
 	baselineCmd.Flags().IntVar(&bslRowGroupSize, "row-group-size", 500_000, "Rows per Parquet row group")
 	baselineCmd.Flags().StringVar(&bslUpload, "upload", "", "S3 destination URL to upload Parquet files after generation (e.g. s3://my-bucket/baselines/)")
 	baselineCmd.Flags().StringVar(&bslUploadRegion, "upload-region", "", "AWS region for --upload (default: from AWS_REGION env var or ~/.aws/config)")
+	baselineCmd.Flags().StringVar(&bslBaselineRetain, "baseline-retain", "", "Prune local snapshots older than this (Nd/Nh) once a durable S3 copy exists (requires --upload; never deletes the only copy or the newest snapshot per table)")
 	baselineCmd.Flags().StringVar(&bslFormat, "format", "text", "Output format: text or json")
 	baselineCmd.Flags().BoolVar(&bslRetry, "retry", false, "Skip tables whose output Parquet file already exists and S3 objects that were already uploaded")
 	baselineCmd.Flags().BoolVar(&bslEncrypt, "encrypt", false, "Decrypt encrypted dump files before processing (requires openssl on $PATH)")
@@ -135,6 +137,32 @@ func runBaseline(cmd *cobra.Command, args []string) error {
 		slog.Info("baseline S3 upload complete", "files", uploaded, "destination", bslUpload)
 	}
 
+	var prunedSnapshots int
+	var reclaimedBytes int64
+	retain, doPrune, err := resolveBaselineRetain(bslBaselineRetain, bslUpload)
+	if err != nil {
+		return err
+	}
+	if doPrune {
+		res, err := baseline.PruneLocal(cmd.Context(), baseline.PruneOptions{
+			LocalDir: bslOutput,
+			S3URL:    bslUpload,
+			S3Region: bslUploadRegion,
+			Retain:   retain,
+		})
+		if err != nil {
+			return fmt.Errorf("baseline prune: %w", err)
+		}
+		prunedSnapshots = len(res.Pruned)
+		reclaimedBytes = res.ReclaimedBytes
+		if prunedSnapshots > 0 {
+			slog.Info("baseline prune complete", "pruned", prunedSnapshots, "reclaimed_bytes", reclaimedBytes)
+			if bslFormat != "json" {
+				fmt.Printf("  pruned    : %d local snapshots (%d bytes reclaimed)\n", prunedSnapshots, reclaimedBytes)
+			}
+		}
+	}
+
 	if bslFormat == "json" {
 		result := struct {
 			Tables       int    `json:"tables"`
@@ -142,10 +170,14 @@ func runBaseline(cmd *cobra.Command, args []string) error {
 			FilesWritten int    `json:"files_written"`
 			Uploaded     int    `json:"uploaded,omitempty"`
 			UploadDest   string `json:"upload_destination,omitempty"`
+			Pruned       int    `json:"pruned_snapshots,omitempty"`
+			Reclaimed    int64  `json:"reclaimed_bytes,omitempty"`
 		}{
 			Tables:       stats.TablesProcessed,
 			RowsWritten:  stats.RowsWritten,
 			FilesWritten: stats.FilesWritten,
+			Pruned:       prunedSnapshots,
+			Reclaimed:    reclaimedBytes,
 		}
 		if bslUpload != "" {
 			result.Uploaded = uploaded
@@ -159,6 +191,32 @@ func runBaseline(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  rows      : %d\n", stats.RowsWritten)
 	fmt.Printf("  files     : %d\n", stats.FilesWritten)
 	return nil
+}
+
+// resolveBaselineRetain decides what --baseline-retain should do given --upload.
+// It returns the parsed retention window and whether to actually prune:
+//   - retainRaw empty            → no pruning (feature off).
+//   - retainRaw malformed        → error (fail fast on a typo).
+//   - retain set, upload empty   → loud no-op (doPrune false): a durable S3 copy
+//     is the precondition for ever deleting a local snapshot (#616); without one
+//     the local copy is the only copy and is never deleted.
+//   - retain set, upload set     → prune.
+//
+// Extracted from runBaseline so the three outcomes are unit-testable without the
+// dump→convert pipeline (mirrors the daemon's startBaselinePruneLoop gating).
+func resolveBaselineRetain(retainRaw, upload string) (retain time.Duration, doPrune bool, err error) {
+	if retainRaw == "" {
+		return 0, false, nil
+	}
+	retain, err = cliutil.ParseRetain(retainRaw)
+	if err != nil {
+		return 0, false, fmt.Errorf("--baseline-retain: %w", err)
+	}
+	if upload == "" {
+		slog.Warn("--baseline-retain is set but --upload is not; refusing to prune local snapshots (they are the only copy)")
+		return retain, false, nil
+	}
+	return retain, true, nil
 }
 
 // decryptDumpFiles walks inputDir and decrypts every .enc file using openssl,
