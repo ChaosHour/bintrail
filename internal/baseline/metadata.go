@@ -24,6 +24,24 @@ const (
 	MetaKeyBinlogPos      = "bintrail.baseline_binlog_position"
 	MetaKeyGTIDSet        = "bintrail.baseline_gtid_set"
 	MetaKeyCreateTableSQL = "bintrail.create_table_sql"
+	// MetaKeyRowCount and MetaKeyContentDigest record, per table, how many rows
+	// the baseline ingested and an order-independent content fingerprint of them
+	// (consistency.Hasher, version-tagged). The digest is byte-identical to a
+	// live ConsistentTableChecksum of the same rows, so the verify capstone
+	// (#634) can compare a baseline against the source. Part of epic #631 (#633).
+	//
+	// The digest certifies SOURCE fidelity (the dump captured the same rows as
+	// the source), not Parquet-encoding fidelity: writer transforms such as
+	// zero-date→NULL are invisible to it (that is #634's concern). TIMESTAMP
+	// agreement assumes the dump used UTC (mydumper's default --tz-utc, which
+	// matches ConsistentTableChecksum's UTC session); an externally produced
+	// dump made with --skip-tz-utc on a non-UTC server would not match.
+	//
+	// Readers must treat RowCount as valid only when ContentDigest != ""; the
+	// readers clear ContentDigest if RowCount cannot be parsed, so the two are
+	// never returned in a trustworthy-digest / untrustworthy-count combination.
+	MetaKeyRowCount      = "bintrail.baseline_row_count"
+	MetaKeyContentDigest = "bintrail.baseline_content_digest"
 )
 
 // DumpMetadata contains information parsed from a mydumper metadata file or
@@ -34,6 +52,8 @@ type DumpMetadata struct {
 	BinlogPos      int64
 	GTIDSet        string
 	CreateTableSQL string // raw mydumper -schema.sql bytes; set for baselines written after #187
+	ContentDigest  string // version-tagged content fingerprint; set after #633, empty when absent (old baselines)
+	RowCount       int64  // rows ingested into this table's baseline; valid only when ContentDigest != ""
 }
 
 // ParseMetadata reads the mydumper "metadata" file in inputDir and returns the
@@ -137,6 +157,23 @@ func ReadParquetMetadata(path string) (DumpMetadata, error) {
 	if v, ok := pf.Lookup(MetaKeyCreateTableSQL); ok {
 		m.CreateTableSQL = v
 	}
+	if v, ok := pf.Lookup(MetaKeyContentDigest); ok {
+		m.ContentDigest = v
+	}
+	if v, ok := pf.Lookup(MetaKeyRowCount); ok {
+		n, parseErr := strconv.ParseInt(v, 10, 64)
+		if parseErr != nil {
+			slog.Warn("corrupt baseline_row_count in Parquet metadata",
+				"path", path, "raw_value", v, "error", parseErr)
+			// A digest we can't pair with a trustworthy count is not usable:
+			// clearing it keeps the "ContentDigest != \"\" ⇒ RowCount valid"
+			// contract from ever being observed false (a 0 would otherwise read
+			// as a verified-empty table).
+			m.ContentDigest = ""
+		} else {
+			m.RowCount = n
+		}
+	}
 	return m, nil
 }
 
@@ -171,6 +208,7 @@ func ReadParquetMetadataAny(ctx context.Context, path string) (DumpMetadata, err
 	defer rows.Close()
 
 	var m DumpMetadata
+	var rowCountCorrupt bool
 	for rows.Next() {
 		// DuckDB returns key/value as BLOB (BYTE_ARRAY) when the Parquet
 		// metadata column stores raw bytes. Scan as []byte to be safe.
@@ -194,10 +232,26 @@ func ReadParquetMetadataAny(ctx context.Context, path string) (DumpMetadata, err
 			m.GTIDSet = val
 		case MetaKeyCreateTableSQL:
 			m.CreateTableSQL = val
+		case MetaKeyContentDigest:
+			m.ContentDigest = val
+		case MetaKeyRowCount:
+			if n, parseErr := strconv.ParseInt(val, 10, 64); parseErr == nil {
+				m.RowCount = n
+			} else {
+				slog.Warn("corrupt baseline_row_count in S3 Parquet metadata",
+					"path", path, "raw_value", val, "error", parseErr)
+				rowCountCorrupt = true
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return DumpMetadata{}, fmt.Errorf("iterate metadata rows: %w", err)
+	}
+	// Applied after the loop: keys arrive as rows in arbitrary order, so the
+	// digest may be set after the count row. A digest we can't pair with a
+	// trustworthy count is not usable (see ReadParquetMetadata).
+	if rowCountCorrupt {
+		m.ContentDigest = ""
 	}
 	return m, nil
 }

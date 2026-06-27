@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/dbtrail/dbtrail/internal/consistency"
 )
 
 // Version is embedded in Parquet file metadata.
@@ -143,6 +145,15 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 
 			if cfg.Retry {
 				if fi, err := os.Stat(outPath); err == nil && fi.Size() > 0 {
+					// A retry-skipped file keeps whatever digest it already has.
+					// A file written before #633 (or by an older binary across a
+					// mid-baseline upgrade) has none, and re-running --retry will
+					// not heal it — surface that so the operator knows the
+					// snapshot won't be fully verifiable without a fresh run.
+					if existing, mErr := ReadParquetMetadata(outPath); mErr == nil && existing.ContentDigest == "" {
+						slog.Warn("skipped existing file has no content digest; this table won't be verifiable without a fresh baseline",
+							"db", tf.Database, "table", tf.Table, "file", outPath)
+					}
 					slog.Info("skipping existing file (--retry)",
 						"db", tf.Database, "table", tf.Table, "file", outPath)
 					mu.Lock()
@@ -265,6 +276,22 @@ func processTable(ctx context.Context, tf TableFiles, outPath string, cfg Writer
 		}
 	}()
 
+	// Fingerprint the rows as they stream past, in MySQL column order. The
+	// digest is byte-identical to a live consistency.ConsistentTableChecksum of
+	// the same rows (#633), so the verify capstone (#634) can compare a baseline
+	// against its source. Tapping the parser values (MySQL's text rendering, the
+	// form ConsistentTableChecksum reads via the text protocol) costs one extra
+	// hash per row and needs no second pass over the dump.
+	//
+	// Scope: this certifies that the dump captured the SAME ROWS as the source,
+	// not that WriteRow encoded them faithfully into Parquet. WriteRow applies
+	// value transforms the tap deliberately does NOT mirror — notably a MySQL
+	// zero-date is stored as Parquet NULL while the tap (and the live checksum's
+	// CAST(... AS CHAR)) both hash the "0000-00-00 00:00:00" string. Mirroring
+	// WriteRow here would instead produce a false MISMATCH on every zero-date
+	// table; the source-fidelity framing is the correct one. Parquet-encoding
+	// fidelity (and the zero-date NULLing) is the verify capstone's concern.
+	hasher := consistency.NewHasher()
 	var rowCount int64
 	rowFn := func(values []string, nulls []bool) error {
 		if ctx.Err() != nil {
@@ -273,6 +300,7 @@ func processTable(ctx context.Context, tf TableFiles, outPath string, cfg Writer
 		if err := w.WriteRow(values, nulls); err != nil {
 			return err
 		}
+		hasher.AddStrings(values, nulls)
 		rowCount++
 		return nil
 	}
@@ -294,6 +322,12 @@ func processTable(ctx context.Context, tf TableFiles, outPath string, cfg Writer
 			return rowCount, fmt.Errorf("unknown format %q", tf.Format)
 		}
 	}
+
+	// Persist the content fingerprint and row count into the Parquet footer
+	// before closing. SetMetadata upserts, so these win even if the same keys
+	// were seeded at writer construction.
+	w.SetMetadata(MetaKeyContentDigest, hasher.Digest())
+	w.SetMetadata(MetaKeyRowCount, strconv.FormatInt(rowCount, 10))
 
 	closed = true
 	if err := w.Close(); err != nil {
