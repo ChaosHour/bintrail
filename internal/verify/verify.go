@@ -44,7 +44,7 @@ type TableResult struct {
 	ReconstructDigest string
 	SourceRows        int64
 	ReconstructRows   int64
-	GTID              string // source snapshot GTID the comparison is anchored to
+	Anchor            string // the point the comparison is anchored to: a GTID set (live-source path) or a binlog coordinate file:pos (baseline-pair path)
 	Detail            string // reason for inconclusive/mismatch, or a note carried on a match (e.g. coverage-unverified)
 }
 
@@ -100,7 +100,7 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 	}
 	res.SourceDigest = src.Digest
 	res.SourceRows = src.RowCount
-	res.GTID = src.GTIDSet
+	res.Anchor = src.GTIDSet
 	asOf := time.Now().UTC()
 
 	// 2. Require the index to have indexed every event the source snapshot
@@ -178,27 +178,12 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 	// masked by this.
 	deferredRepr := hasDeferredRepr(orderedCols) && len(changes) > 0
 
-	hasher := consistency.NewHasher()
-	emitErr := reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
-		BaselinePath: baselinePath,
-		Schema:       schema,
-		Table:        table,
-		PKCols:       pkCols,
-		Changes:      changes,
-	}, func(rowMap map[string]any) error {
-		cells := make([][]byte, len(orderedCols))
-		for i, c := range orderedCols {
-			cells[i] = renderCell(rowMap[c.Name], c)
-		}
-		hasher.AddBytes(cells)
-		return nil
-	})
+	reconDigest, reconCount, emitErr := reconstructDigest(ctx, baselinePath, schema, table, pkCols, changes, orderedCols)
 	if emitErr != nil {
 		return res, fmt.Errorf("reconstruct %s.%s: %w", schema, table, emitErr)
 	}
-
-	res.ReconstructDigest = hasher.Digest()
-	res.ReconstructRows = hasher.Count()
+	res.ReconstructDigest = reconDigest
+	res.ReconstructRows = reconCount
 	if coverageNote != "" {
 		res.Detail = coverageNote
 	}
@@ -232,6 +217,34 @@ func classify(srcDigest string, srcRows int64, reconDigest string, reconRows int
 	return StatusMismatch, "content digest differs at equal row count (in-place value divergence)"
 }
 
+// reconstructDigest reconstructs a table from baselinePath merged with changes,
+// renders each row's columns (in orderedCols order) to the canonical text form,
+// and returns the order-independent content digest + row count. Shared by the
+// live-source verify (VerifyTable) and the baseline-pair verify (#642): both
+// sides of any comparison must be produced by this one function so the digests
+// are byte-comparable by construction.
+func reconstructDigest(ctx context.Context, baselinePath, schema, table string, pkCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, orderedCols []metadata.ColumnMeta) (string, int64, error) {
+	hasher := consistency.NewHasher()
+	err := reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
+		BaselinePath: baselinePath,
+		Schema:       schema,
+		Table:        table,
+		PKCols:       pkCols,
+		Changes:      changes,
+	}, func(rowMap map[string]any) error {
+		cells := make([][]byte, len(orderedCols))
+		for i, c := range orderedCols {
+			cells[i] = renderCell(rowMap[c.Name], c)
+		}
+		hasher.AddBytes(cells)
+		return nil
+	})
+	if err != nil {
+		return "", 0, err
+	}
+	return hasher.Digest(), hasher.Count(), nil
+}
+
 func inconclusive(res TableResult, detail string) TableResult {
 	res.Status = StatusInconclusive
 	res.Detail = detail
@@ -244,11 +257,22 @@ func inconclusive(res TableResult, detail string) TableResult {
 // binary families (base64 in the event image vs raw bytes from the source).
 func hasDeferredRepr(cols []metadata.ColumnMeta) bool {
 	for _, c := range cols {
-		switch strings.ToLower(c.DataType) {
-		case "enum", "set", "json",
-			"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit":
+		if isDeferredType(c.DataType) {
 			return true
 		}
+	}
+	return false
+}
+
+// isDeferredType reports whether a column's event-image representation can differ
+// from how the baseline/source renders it in a way this version doesn't yet
+// normalize: ENUM/SET (ordinal vs label), JSON (MySQL-canonical text), binary
+// families (base64 in the event image vs raw bytes), BIT.
+func isDeferredType(dataType string) bool {
+	switch strings.ToLower(dataType) {
+	case "enum", "set", "json",
+		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit":
+		return true
 	}
 	return false
 }
