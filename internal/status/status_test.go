@@ -1194,6 +1194,81 @@ func TestWriteStatusJSON_gapLost(t *testing.T) {
 	}
 }
 
+// ─── continuity verdict (#645) ──────────────────────────────────────────────────
+
+// TestWriteStatus_continuityLine pins the always-present continuity verdict in the
+// text Stream section: an honest contiguity affirmation on the happy path (scoped
+// to the captured range, NOT a liveness claim), a concise "GAP LOST" line when a
+// gap was stamped (the loud banner, tested above, stays for the detail), and "not
+// evaluated" for a legacy index whose gap columns are absent — never a clean
+// verdict asserted from un-evaluated data.
+func TestWriteStatus_continuityLine(t *testing.T) {
+	var ok bytes.Buffer
+	WriteStatus(&ok, nil, nil, nil, nil, nil, &StreamStateInfo{Mode: "gtid", ServerID: 7, LastCheckpoint: time.Now(), GapColumnsPresent: true})
+	okOut := ok.String()
+	if !strings.Contains(okOut, "Continuity:") || !strings.Contains(okOut, "no gaps in the captured range") {
+		t.Errorf("healthy stream must show an affirmative contiguity line:\n%s", okOut)
+	}
+	if strings.Contains(okOut, "GAP LOST") {
+		t.Errorf("healthy stream must not mention GAP LOST:\n%s", okOut)
+	}
+
+	var gap bytes.Buffer
+	WriteStatus(&gap, nil, nil, nil, nil, nil, gapLostStream())
+	gapOut := gap.String()
+	if !strings.Contains(gapOut, "Continuity:") || !strings.Contains(gapOut, "GAP LOST") {
+		t.Errorf("a gap-lost stream must show a GAP LOST continuity line:\n%s", gapOut)
+	}
+	if strings.Contains(gapOut, "no gaps in the captured range") {
+		t.Errorf("a gap-lost stream must not claim no gaps:\n%s", gapOut)
+	}
+
+	// Legacy index (gap columns absent) must not assert a clean verdict.
+	var legacy bytes.Buffer
+	WriteStatus(&legacy, nil, nil, nil, nil, nil, &StreamStateInfo{Mode: "gtid", LastCheckpoint: time.Now()})
+	legacyOut := legacy.String()
+	if !strings.Contains(legacyOut, "not evaluated (legacy index") {
+		t.Errorf("a legacy index must report continuity as not evaluated, not a clean verdict:\n%s", legacyOut)
+	}
+}
+
+// TestWriteStatusJSON_continuity pins the always-present machine-readable verdict:
+// continuity.status is "ok" when contiguity was confirmed, "gap_lost" when a gap
+// was stamped, and "unknown" on a legacy index whose gap columns are absent (so
+// "ok" is never emitted from un-evaluated data). Unlike gap_lost (omitempty),
+// continuity is present in all cases so a CI/cron consumer or the console green
+// badge asserts the verdict rather than inferring it from an absence.
+func TestWriteStatusJSON_continuity(t *testing.T) {
+	type parsed struct {
+		Stream struct {
+			Continuity struct {
+				Status string `json:"status"`
+			} `json:"continuity"`
+		} `json:"stream"`
+	}
+	for _, tc := range []struct {
+		name   string
+		stream *StreamStateInfo
+		want   string
+	}{
+		{"healthy", &StreamStateInfo{Mode: "gtid", LastCheckpoint: time.Now(), GapColumnsPresent: true}, "ok"},
+		{"gap", gapLostStream(), "gap_lost"},
+		{"legacy", &StreamStateInfo{Mode: "gtid", LastCheckpoint: time.Now()}, "unknown"},
+	} {
+		var buf bytes.Buffer
+		if err := WriteStatusJSON(&buf, nil, nil, nil, nil, nil, tc.stream); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		var got parsed
+		if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+			t.Fatalf("%s: invalid JSON: %v\n%s", tc.name, err, buf.String())
+		}
+		if got.Stream.Continuity.Status != tc.want {
+			t.Errorf("%s: continuity.status = %q, want %q\n%s", tc.name, got.Stream.Continuity.Status, tc.want, buf.String())
+		}
+	}
+}
+
 // TestWriteStatusJSON_sourceHealth pins the daemon→console emission seam (#599): the
 // raw source_health JSON must reach the API response verbatim as a nested object, and be
 // omitted when no daemon has polled. Pure unit (no MySQL) — this branch is the only thing
