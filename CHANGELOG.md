@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-06-29
+
+### Added
+- **Opt-in `flashback` compose profile — a time-travel SQL terminal without ProxySQL** (#664). A `docker compose --profile flashback up` brings up the in-process MySQL-protocol shim (`_flashback`/`_snapshot`/`_diff` virtual schemas) directly, so you can run `SELECT … AS OF '<time>'` from any MySQL client without standing up the full ProxySQL routing layer — the lowest-friction way to try time travel against an existing index.
+
+### Changed
+- **The bundled index MySQL is tuned for high write volume** (#656, #657). `binlog_events` stores full before/after row images as JSON under a write-heavy, append-mostly load, so the `index-mysql` compose service now sets `--max-allowed-packet=1G` (the 64M default rejected large BLOB/JSON row images — a row's base64-inflated image could exceed it), `--skip-log-bin` (the index is a write-only sink — nothing replicates from it, and its own binlog was pure write amplification plus a per-commit fsync that cancelled `innodb_flush_log_at_trx_commit=2`), `--innodb-redo-log-capacity=2G` (the 100M default triggers checkpoint stalls under bursty large-row writes), and `--innodb-flush-method=O_DIRECT`. `config.Connect` now honors the server's `max_allowed_packet` instead of the driver's fixed 64 MiB client cap. BYO indexes (`INDEX_DSN`) are unaffected; `docs/deployment.md §3` documents the equivalent settings, including the `innodb_log_file_size → innodb_redo_log_capacity` rename in MySQL 8.0.30+.
+
+### Fixed
+- **Oversized BLOB/JSON row events fail loud instead of being silently dropped** (#652). A row image larger than the index server's `max_allowed_packet` (≈48 MB raw once base64-inflated, at the old 64M default) could not be inserted, and the failure was swallowed: the `stream` ticker/shutdown checkpoint warned-and-continued (auto-skipping the event), and offline `index` logged the error but exited 0 — a cron/CI wrapper read it as success. The flush error now propagates exactly like the batch-full and DDL flush paths already did: `stream` aborts loudly and replays from the last durable checkpoint on restart (transient errors lose nothing), and `index` returns non-zero with a `failed_files` count. Paired with the index-side ceiling raise above, the realistic case now succeeds; a genuinely un-indexable event aborts loudly rather than vanishing.
+- **`recover` restores binary BLOB and TEXT columns correctly instead of emitting their base64 text** (#653). go-mysql delivers BLOB and TEXT columns (both `MYSQL_TYPE_BLOB`) as `[]byte`, which the indexer base64-encodes into the `binlog_events` JSON; on recovery the value came back as a base64 string and the reversal SQL wrote it verbatim — so a recovered BLOB became ASCII base64, not the original bytes, and a TEXT column likewise. The generated SQL now decodes by column type (from the schema snapshot): BLOB → `X'hex'`, TEXT → the original string, applied in the INSERT, UPDATE SET, and PK WHERE clauses (a BLOB/TEXT prefix PK was matching zero rows). VARCHAR/CHAR were always correct.
+- **Full-table `reconstruct --output-format mydumper` restores BLOB/TEXT values touched by binlog events** (#660). The same base64 storage encoding corrupted reconstruct's mydumper output for any row changed since the baseline. The fix decodes the delta-event images up front, by provenance: baseline pass-through values (which DuckDB delivers as native `[]byte`/string from the Parquet scan) are never touched, only the event-sourced values are decoded — so a baseline TEXT value whose content is itself valid base64 survives verbatim.
+
 ## [0.24.0] - 2026-06-28
 
 ### Added
