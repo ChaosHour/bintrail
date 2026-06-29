@@ -964,10 +964,17 @@ func streamLoop(
 		return nil
 	}
 
-	checkpoint := func() {
+	// checkpoint flushes the pending batch, then persists the stream position.
+	// A flush failure is RETURNED to the caller so the stream aborts loudly and
+	// replays from the last durable checkpoint on restart — the same fail-loud
+	// contract the batch-full (len>=BatchSize) and DDL flushes already follow.
+	// Swallowing it here let an un-indexable event (e.g. one over the server's
+	// max_allowed_packet) be silently skipped (#652). A saveCheckpoint failure
+	// is NOT data loss — it only re-streams from an older checkpoint on restart —
+	// so it stays a warning.
+	checkpoint := func() error {
 		if err := flush(); err != nil {
-			slog.Warn("batch flush failed", "error", err)
-			return
+			return err
 		}
 		if err := saveCheckpoint(db, state); err != nil {
 			slog.Warn("saveCheckpoint failed", "error", err)
@@ -982,6 +989,7 @@ func streamLoop(
 				"pos", state.binlogPos,
 				"events_indexed", state.eventsIndexed)
 		}
+		return nil
 	}
 
 	// advanceGTID adds a committed transaction's GTID to the durable set. It is
@@ -1011,15 +1019,21 @@ func streamLoop(
 	for {
 		select {
 		case <-ctx.Done():
-			checkpoint()
+			if err := checkpoint(); err != nil {
+				return err
+			}
 			return nil
 
 		case <-ticker.C:
-			checkpoint()
+			if err := checkpoint(); err != nil {
+				return err
+			}
 
 		case ev, ok := <-events:
 			if !ok {
-				checkpoint()
+				if err := checkpoint(); err != nil {
+					return err
+				}
 				return nil
 			}
 			// Update position tracking from each event.
@@ -1194,11 +1208,33 @@ func (d Deps) validate() error {
 	return nil
 }
 
+// drainParser stops the stream's parser goroutine and returns its final error.
+//
+// While parked, the parser (sp.Run) returns only on context cancellation — it
+// is blocked in GetEvent waiting for the next binlog event, or on a send to a
+// full events buffer (every such send is a select with a <-ctx.Done() arm).
+// One derives a cancellable context whose deferred cancel runs only once One
+// returns, so when streamLoop returns an error mid-stream (the ticker /
+// batch-full / DDL flush paths, with the caller's ctx still live) a bare
+// `<-parseErrCh` would block forever and One would hang instead of surfacing the
+// failure to its supervisor — turning a fail-loud abort into a silent wedge
+// (#652). Cancelling BEFORE the receive guarantees the parser unblocks.
+// Idempotent on the clean-exit paths (the context is already cancelled, or the
+// parser already returned via close(events)). sp.Run converts cancellation to a
+// nil return, so the resulting parseErr is nil and dropped by the caller's
+// `parseErr != nil` guard; a genuine upstream parser failure (ctx still live)
+// is non-nil and surfaced.
+func drainParser(cancel context.CancelFunc, parseErrCh <-chan error) error {
+	cancel()
+	return <-parseErrCh
+}
+
 // One runs one complete replication stream — connect, validate,
 // resolve identity, snapshot, gap-check, sync, index, checkpoint — until ctx
 // is cancelled or a fatal error occurs. It is self-contained by design: no
 // package globals, no signal handling, safe to run N instances concurrently
 // (each against its own index database).
+
 func One(ctx context.Context, cfg Config) error {
 	if !cliutil.IsValidOutputFormat(cfg.Format) {
 		return fmt.Errorf("invalid --format %q; must be text or json", cfg.Format)
@@ -1641,7 +1677,7 @@ func One(ctx context.Context, cfg Config) error {
 	loopErr := streamLoop(ctx, events, idx, indexDB,
 		time.Duration(cfg.Checkpoint)*time.Second, state, metrics, cfg.Hooks)
 
-	parseErr := <-parseErrCh
+	parseErr := drainParser(cancel, parseErrCh)
 
 	// ── 12. Summary ───────────────────────────────────────────────────────────────
 	if loopErr != nil {

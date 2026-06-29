@@ -325,6 +325,96 @@ func TestStreamLoop_flushAndCheckpoint(t *testing.T) {
 	}
 }
 
+// TestStreamLoop_flushFailurePropagates verifies that a flush failure at a
+// checkpoint is RETURNED to the caller (the stream aborts loudly) instead of
+// being swallowed with a warning — the silent-skip that let an un-indexable
+// event vanish (#652). The batch-full and DDL flush paths already propagated;
+// this covers the ticker / channel-closed checkpoint path that did not.
+//
+// The failure is forced by dropping binlog_events before the flush, so the
+// INSERT errors. Any InsertBatch error flows through the same checkpoint() path
+// the fix changed, so this is a deterministic stand-in for the oversized-event
+// (max_allowed_packet) rejection that motivated the issue.
+func TestStreamLoop_flushFailurePropagates(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00",
+		"testdb", "orders", "id", 1, "PRI", "int", "NO")
+
+	// Batch size 10 so the single event is not flushed inline (len < BatchSize);
+	// it flushes at channel close, exercising the checkpoint() path.
+	idx := indexer.New(db, 10)
+
+	events := make(chan parser.Event, 1)
+	events <- parser.Event{
+		BinlogFile: "binlog.000001",
+		StartPos:   0,
+		EndPos:     100,
+		Timestamp:  time.Now().UTC(),
+		Schema:     "testdb",
+		Table:      "orders",
+		EventType:  parser.EventInsert,
+		PKValues:   "1",
+		RowAfter:   map[string]any{"id": int64(1)},
+	}
+	close(events)
+
+	// Force the flush to fail (the pool stays open so CreateTestDB's cleanup can
+	// still drop the database).
+	testutil.MustExec(t, db, "DROP TABLE binlog_events")
+
+	state := &streamState{mode: "position", serverID: 1}
+	err := streamLoop(context.Background(), events, idx, db, time.Hour, state, observe.ForSource("test"), nil)
+	if err == nil {
+		t.Fatal("expected streamLoop to propagate the flush failure, got nil (a silent skip — #652)")
+	}
+	if !strings.Contains(err.Error(), "INSERT") {
+		t.Errorf("expected a batch-INSERT flush error, got: %v", err)
+	}
+}
+
+// TestStreamLoop_saveCheckpointFailureDoesNotAbort verifies the deliberate split
+// in the fail-loud fix: a FLUSH failure aborts the stream, but a saveCheckpoint
+// failure stays a warning (it only re-streams from an older checkpoint on
+// restart — re-processing, not data loss). A regression that made checkpoint
+// errors abort would crash streams on transient stream_state write blips.
+//
+// binlog_events is kept (the flush succeeds) and stream_state is dropped (so
+// saveCheckpoint fails); streamLoop must still return nil.
+func TestStreamLoop_saveCheckpointFailureDoesNotAbort(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	testutil.InsertSnapshot(t, db, 1, "2026-01-01 00:00:00",
+		"testdb", "orders", "id", 1, "PRI", "int", "NO")
+
+	idx := indexer.New(db, 10)
+
+	events := make(chan parser.Event, 1)
+	events <- parser.Event{
+		BinlogFile: "binlog.000001",
+		StartPos:   0,
+		EndPos:     100,
+		Timestamp:  time.Now().UTC(),
+		Schema:     "testdb",
+		Table:      "orders",
+		EventType:  parser.EventInsert,
+		PKValues:   "1",
+		RowAfter:   map[string]any{"id": int64(1)},
+	}
+	close(events)
+
+	// The flush (into binlog_events) succeeds; only saveCheckpoint fails.
+	testutil.MustExec(t, db, "DROP TABLE stream_state")
+
+	state := &streamState{mode: "position", serverID: 1}
+	if err := streamLoop(context.Background(), events, idx, db, time.Hour, state, observe.ForSource("test"), nil); err != nil {
+		t.Fatalf("a saveCheckpoint failure must NOT abort the stream, got: %v", err)
+	}
+	if state.eventsIndexed != 1 {
+		t.Errorf("expected the event to be indexed despite the checkpoint failure, got %d", state.eventsIndexed)
+	}
+}
+
 // ─── streamLoop live replication ───────────────────────────────────────────────────────
 
 // TestStreamLoop_liveReplication is a full end-to-end test that connects as a
