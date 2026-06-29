@@ -99,17 +99,11 @@ const defaultTimeout = 10 * time.Second
 // A 10-second TCP connect timeout is applied when the DSN does not specify one.
 // The caller is responsible for closing the returned *sql.DB.
 func Connect(dsn string) (*sql.DB, error) {
-	cfg, err := mysql.ParseDSN(dsn)
+	normalized, err := buildDSN(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("invalid DSN: %w", err)
+		return nil, err
 	}
-	cfg.ParseTime = true
-	cfg.Loc = time.UTC
-	if cfg.Timeout == 0 {
-		cfg.Timeout = defaultTimeout
-	}
-
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open("mysql", normalized)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open MySQL connection: %w", err)
 	}
@@ -118,6 +112,53 @@ func Connect(dsn string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to ping MySQL: %w", err)
 	}
 	return db, nil
+}
+
+// driverDefaultMaxAllowedPacket is the client-side max_allowed_packet the
+// go-sql-driver assigns when a DSN omits the parameter. Read from the driver
+// itself (via NewConfig) so it tracks any change to that default instead of
+// hardcoding 64 MiB.
+var driverDefaultMaxAllowedPacket = mysql.NewConfig().MaxAllowedPacket
+
+// buildDSN applies bintrail's connection invariants to a user DSN and returns
+// the normalized DSN string. Split out from Connect so the invariants are unit
+// testable without a live server. Invariants: parseTime=true (DATETIME scans
+// into time.Time), Loc=UTC, a default connect timeout, and aligning the
+// client's max_allowed_packet with the server's.
+func buildDSN(dsn string) (string, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return "", fmt.Errorf("invalid DSN: %w", err)
+	}
+	cfg.ParseTime = true
+	cfg.Loc = time.UTC
+	if cfg.Timeout == 0 {
+		cfg.Timeout = defaultTimeout
+	}
+	// Align the client's max_allowed_packet with the server's instead of the
+	// go-sql-driver's fixed 64 MiB default. binlog_events stores full
+	// before/after row images as JSON, and a large BLOB/JSON value
+	// (base64-inflated ~1.33×) can exceed 64 MiB. The rejection #652 reproduced
+	// is server-side (Error 1105 "… mysql_send_long_data() … longer than
+	// 'max_allowed_packet'"), so raising the *server* limit (docker-compose
+	// --max-allowed-packet=1G) is the load-bearing change; maxAllowedPacket=0
+	// makes the driver fetch @@max_allowed_packet from the server and size to it
+	// (bundled index MySQL: 1 GiB; a BYO index: whatever it set) so the client
+	// tracks the server rather than imposing its own cap.
+	//
+	// This is a ceiling raise, not a fix: events larger than the server's
+	// max_allowed_packet are still rejected, and that rejection must — but does
+	// not yet (#652) — fail loud rather than drop silently.
+	//
+	// Precedence: an explicit non-default maxAllowedPacket in the DSN is
+	// preserved. We compare against the driver's own default rather than
+	// string-matching the DSN, so a value the case-sensitive driver ignores
+	// (e.g. a mis-cased param) falls through to the safe server-honoring 0
+	// instead of being silently left at the 64 MiB cap.
+	if cfg.MaxAllowedPacket == driverDefaultMaxAllowedPacket {
+		cfg.MaxAllowedPacket = 0
+	}
+	return cfg.FormatDSN(), nil
 }
 
 // ParseSourceDSN decomposes a go-sql-driver DSN into host, port, user, and
