@@ -71,6 +71,13 @@ type FullTableConfig struct {
 	Parallelism int       // max concurrent tables (0 → runtime.NumCPU())
 	AllowGaps   bool      // false = strict abort on gaps (default for reconstruct)
 
+	// WarnEventThreshold logs a loud warning when a table's fetched event count
+	// exceeds it: full-table reconstruct holds every event plus one change-map
+	// entry per touched PK in memory and can exhaust RAM at scale (#654). 0 =
+	// disabled — the zero value, so direct library callers stay silent; the CLI
+	// defaults it to 5,000,000 via --warn-event-threshold.
+	WarnEventThreshold int64
+
 	// ArchiveFetcher fetches archived binlog events for a table. nil →
 	// parquetquery.Fetch (the container-safe DuckDB budget). The CLI sets it
 	// to a tuned fetcher under --ultrafast so the flag is honored on the
@@ -88,6 +95,28 @@ type TableReport struct {
 	DeletesSkipped int64 // baseline rows whose PK matched a DELETE event
 	Files          []string
 	Duration       time.Duration
+}
+
+// shouldWarnEvents reports whether a fetched event count should trigger the
+// large-window memory warning (#654). threshold <= 0 disables the warning, so
+// the zero-value FullTableConfig stays silent for direct library callers.
+func shouldWarnEvents(n, threshold int64) bool {
+	return threshold > 0 && n > threshold
+}
+
+// maybeWarnEventVolume emits the #654 large-window memory warning when the
+// fetched event count exceeds threshold (0 disables). Extracted from
+// ReconstructTable so the emission — not just the predicate — is unit-testable.
+func maybeWarnEventVolume(schema, table string, n int, threshold int64) {
+	if !shouldWarnEvents(int64(n), threshold) {
+		return
+	}
+	slog.Warn("reconstruct: very large event window — full-table reconstruct holds every event "+
+		"plus one change-map entry per touched row in memory and may exhaust RAM",
+		"schema", schema, "table", table,
+		"events", n, "threshold", threshold,
+		"hint", "narrow the window with a later --at or a fresher baseline snapshot, or raise/silence "+
+			"via --warn-event-threshold / BINTRAIL_RECONSTRUCT_WARN_EVENTS (0 disables)")
 }
 
 // ReconstructTables runs ReconstructTable concurrently for every entry in
@@ -374,6 +403,13 @@ func ReconstructTable(
 		return nil, fmt.Errorf("fetch events: %w", err)
 	}
 	rep.EventsApplied = int64(len(events))
+
+	// Large-window memory warning (#654). len(events) is the real, archive-inclusive
+	// count (FetchMerged already merged live + Parquet), so no separate COUNT is
+	// needed. Advisory only: it fires before the change-map build below and tells
+	// the operator to narrow the next run; it cannot shrink the already-resident
+	// slice (reconstruct warns, never refuses — the OOM at scale is unreproduced).
+	maybeWarnEventVolume(schema, table, len(events), cfg.WarnEventThreshold)
 
 	// ENUM/SET ordinals → labels (#476), each delta decoded with the
 	// snapshot in effect at its event time (#475). Must run before the
