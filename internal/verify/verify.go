@@ -147,6 +147,11 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 		}
 		return res, fmt.Errorf("fetch changes %s.%s: %w", schema, table, err)
 	}
+	// BLOB/TEXT base64 → real value, epoch-aware (#672; same helper #668 wired
+	// into the offline reconstruct writer path). SnapshotFullTableImages itself
+	// never decodes — every caller is responsible for decoding its own changes
+	// map first, same as the shim's runSnapshotFullTable does via mapEventImages.
+	reconstruct.DecodeEventBinaries(cfg.IndexDB, schema, table, rows)
 	changes := make(map[string]*query.ResultRow, len(rows))
 	for i := range rows {
 		changes[rows[i].PKValues] = &rows[i]
@@ -268,6 +273,17 @@ func hasDeferredRepr(cols []metadata.ColumnMeta) bool {
 // from how the baseline/source renders it in a way this version doesn't yet
 // normalize: ENUM/SET (ordinal vs label), JSON (MySQL-canonical text), binary
 // families (base64 in the event image vs raw bytes), BIT.
+//
+// TEXT is deliberately NOT here, despite being decoded by the same
+// DecodeEventBinaries call as BLOB (#672): once decoded, a TEXT value is just
+// a string, directly comparable to the baseline/source text — unlike
+// ENUM/JSON/binary, decoding doesn't leave a representation gap to defer.
+// Deferring it anyway would mask genuine TEXT divergences as Inconclusive on
+// every table with a TEXT column (the common case, e.g. wp_options), which
+// defeats the point of decoding it in the first place. The narrow remaining
+// risk — an unresolvable epoch leaving a value as stored base64 — is the same
+// accepted risk DecodeEventBinaries already carries for its other callers
+// (recover, shim, reconstruct); it is not given a broader safety net here.
 func isDeferredType(dataType string) bool {
 	switch strings.ToLower(dataType) {
 	case "enum", "set", "json",
