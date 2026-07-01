@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.1] - 2026-07-01
+
+### Added
+- **`docs/upgrade.md` — a comprehensive guide to upgrading an existing install** (#689). Covers version-checking, reading the changelog for BREAKING entries, the Docker Compose path (including the gotcha that `docker compose pull` only refreshes images, never `docker-compose.yml` itself — a new default like #690/0.26.0's `VERIFY_TRIGGER` silently never takes effect on an older compose file), standalone binary/package upgrades, building from source, what schema migration is automatic vs. the console registry's manual-touch case, upgrading a live `stream`/`watch` daemon without losing its checkpoint, and the no-downgrade policy. Linked from the README docs table.
+
+### Changed
+- **Console: user-facing copy rewritten in plain, direct language across the entire UI** (#691). Follows up the Verify Explain modal rewrite (#690) by applying the same voice everywhere — Overview, Events, Time-travel, Recover, Status, Storage (rotation/credentials/archiving/baselines/verify), server management, auth, the rotation dialog, and the command palette, plus the backend API error strings the frontend displays verbatim as toasts and capability gates. Real warnings (off-peak load, coverage gaps, non-downgradable) and domain nouns (baseline, binlog, snapshot) are kept intact — only CLI-flag references and internal jargon are cut from prose. Deliberately left technical: the Status page's database terminology (binlog file/position, LSN, WAL status, replica identity) and the PostgreSQL replication-health card, doctor-preflight remediation and the replication grant SQL (copy-pasteable commands), and DSN-only backend validation paths unreachable from the UI form.
+
+### Fixed
+- **Console: the Verification panel no longer floats detached from the rest of the Storage page** (#690). `ov-grid` is a 2-column grid with `align-items:start`; Baseline snapshots (one row per snapshot) routinely runs much taller than S3 archiving, so a 3rd grid item with no explicit placement landed under the short sibling with a large dead gap to its right where the tall one still extended. Verification now spans the full grid width in its own row.
+- **Console: the Verify "Explain" mismatch drill-down renders a readable diff instead of raw CLI text** (#690). The modal showed `internal/verify`'s terminal-formatted `MismatchExplanation.Write()` output verbatim; the structured per-row diff data was already being fetched but never rendered. Now shows a plain-language card per differing row (changed/missing/extra) with a Column/Recovered/Baseline comparison table, with the raw CLI text still available behind a collapsed "Raw output" disclosure.
+
 ## [0.26.0] - 2026-07-01
 
 ### Added
