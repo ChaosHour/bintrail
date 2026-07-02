@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.3] - 2026-07-02
+
+### Fixed
+- **S3 archive access (`verify`, archive queries) no longer fails with "region was not a valid DNS name" on an IAM-role-only EC2/ECS deployment with no `AWS_REGION` set** (#697). The AWS SDK's default config loader doesn't consult EC2/ECS instance metadata (IMDS) for a region, so it fell back to a permission-gated `GetBucketLocation` probe — one a minimal, least-privilege S3 policy commonly doesn't grant — leaving every S3 request with an empty, invalid region. Now falls back to the instance's IMDS region in that case, matching the fix already shipped for the baseline-upload S3 path (#610/#611). Also fixes the same reachable gap in the BYOS `bintrail agent --s3-bucket` storage backend.
+
 ## [0.26.2] - 2026-07-02
 
 ### Fixed
