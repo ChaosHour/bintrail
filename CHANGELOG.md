@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.2] - 2026-07-02
+
+### Fixed
+- **`bintrail verify` no longer reports a false MISMATCH on a JSON-valued TEXT column whose only difference is key order** (#692). A TEXT/LONGTEXT column storing `json_encode()`-style text (e.g. `wp_aiowps_audit_log.details`) preserves the source's original key order verbatim on disk; an event-touched row's image round-trips through Go's `map[string]any`, which loses that order, so the reconstructed value re-serialized alphabetically and compared byte-unequal to identical data. Baseline-anchored `verify` (the default mode) now re-renders both sides of a JSON object/array value into the same canonical form before comparing, refusing to do so (falling back to a raw byte comparison, so a genuine divergence still surfaces) on a duplicate object key, invalid UTF-8, or an unpaired UTF-16 surrogate escape — cases where canonicalizing could mask a real difference. Live-source `verify` had the same gap; see #696 below.
+- **`bintrail verify` no longer reports a false MISMATCH between a MySQL zero-date value and a baseline's `NULL`** (#694). `internal/baseline`'s Parquet writer deliberately maps `0000-00-00`-family values to `NULL` (Go's time parser can't represent them); an event-touched row's image still carries the literal sentinel text, so comparing the two reported a mismatch for the same underlying data. Baseline-anchored `verify` now normalizes the sentinel text to NULL on both sides of the comparison — safe under verify's existing assumption that the binlog captured every write to the row, an accepted trade-off documented and pinned by a regression test rather than silently relied on.
+- **`bintrail verify --source-dsn` (live-source mode) no longer has the same false-MISMATCH gaps as baseline-anchored mode** (#696, closes #693). The live-source comparison is asymmetric — one side is `verify`'s own reconstruct-and-render pipeline, the other is a raw MySQL scan (`internal/consistency.ConsistentTableChecksum`) that doesn't share any code with it. Both sides now apply the same JSON-key-order and zero-date normalization via a new `ConsistentTableChecksumNormalized` hook, so a table verified in either mode gets the same, correct answer.
+
 ## [0.26.1] - 2026-07-01
 
 ### Added
