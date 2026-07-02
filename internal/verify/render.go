@@ -127,6 +127,26 @@ func temporalPrecision(columnType string) int {
 	return n
 }
 
+// isZeroDateSentinel reports whether b is MySQL's all-zero date pseudo-NULL
+// sentinel ('0000-00-00', '0000-00-00 00:00:00', or the '.000000' fractional
+// variant) rendered for a DATE/DATETIME/TIMESTAMP column. Mirrors
+// internal/baseline's isZeroDate check exactly (unexported there; duplicated
+// here rather than adding a cross-package dependency for one string
+// comparison — both must agree on what counts as the sentinel, since this
+// function exists specifically to undo that package's own NULL substitution).
+//
+// TIME is deliberately excluded by the DataType switch, matching
+// internal/baseline's own scoping: '00:00:00' is legal midnight there, not a
+// pseudo-NULL, so it must never be treated as equivalent to NULL.
+func isZeroDateSentinel(b []byte, col metadata.ColumnMeta) bool {
+	switch strings.ToLower(strings.TrimSpace(col.DataType)) {
+	case "date", "datetime", "timestamp":
+	default:
+		return false
+	}
+	return bytes.HasPrefix(bytes.TrimSpace(b), []byte("0000-00-00"))
+}
+
 // canonicalizeJSONContainer re-renders a JSON object/array value from its
 // decoded form, so two byte-different-but-semantically-equal serializations
 // of the same JSON content compare equal. Scoped to CONTAINERS ({...}/[...])
@@ -149,7 +169,7 @@ func temporalPrecision(columnType string) int {
 // column typed as MySQL's native JSON already had a narrower version of this
 // same gap, covered by isDeferredType's inconclusive downgrade — this closes
 // it more precisely there too, resolving to a genuine match rather than
-// merely downgrading to "can't tell": see renderCellCanonicalJSON.
+// merely downgrading to "can't tell": see renderCellBaselineAnchored.
 //
 // UseNumber preserves large-integer/decimal literals exactly, the same
 // precision requirement renderCell's json.Number case already protects
@@ -279,22 +299,54 @@ func walkForDuplicateKeys(dec *json.Decoder) (bool, error) {
 	}
 }
 
-// renderCellCanonicalJSON renders a cell like renderCell, additionally
-// canonicalizing a JSON object/array value (see canonicalizeJSONContainer)
-// so a pure representation difference doesn't register as a content
-// difference.
+// renderCellBaselineAnchored renders a cell like renderCell, additionally
+// normalizing two known representation gaps between an event-image value and
+// a baseline-Parquet value of the SAME underlying data, so a pure
+// representation difference doesn't register as a content difference:
+//
+//   - a JSON object/array value (see canonicalizeJSONContainer) — Go's
+//     map[string]any decode loses object key order, which renderCell's
+//     default case then re-serializes alphabetically.
+//   - a DATE/DATETIME/TIMESTAMP zero-date sentinel (see isZeroDateSentinel)
+//     — internal/baseline.Writer.WriteRow deliberately maps MySQL's
+//     '0000-00-00'-family pseudo-NULL to Parquet NULL, unconditionally, for
+//     EVERY zero-date value (Go's time parser rejects it outright). An
+//     event-touched row's image still carries the literal sentinel text, so
+//     recon renders the string while a same-valued baseline cell renders
+//     NULL. This mapping only runs one direction (string → nil): it does NOT
+//     touch a genuine NULL.
+//
+//     A baseline NULL for a temporal column is NOT provably zero-date-only —
+//     WriteRow also NULLs a temporal column for a genuine SQL NULL (the
+//     ordinary isNull path, checked before errZeroDate even runs), and that
+//     information is already indistinguishable at rest: both paths write the
+//     identical parquet.NullValue(). So this normalization is safe under
+//     verify's baseline assumption that the binlog captured every write to
+//     the row: if it did, recon's zero-date-text cell and the baseline's
+//     NULL cell are the same underlying value, whichever path produced the
+//     NULL. It stops being safe only if the source transitioned zero-date ->
+//     NULL through a write the binlog never saw (sql_log_bin=0, direct file
+//     manipulation, a replication gap) — which already breaks verify's
+//     guarantee for every column type, not something this normalization
+//     introduces. See TestVerifyBaselinePair_StaleZeroDateVsGenuineNull_AcceptedRisk
+//     for the concrete case this accepts, and #693 for the tracking issue.
 //
 // Used ONLY by the baseline-anchored comparison (VerifyBaselinePair,
 // ExplainBaselinePairMismatch): both operands there are produced by this
-// same package, so canonicalizing them symmetrically cannot introduce a new
+// same package, so normalizing them symmetrically cannot introduce a new
 // disagreement. The live-source comparison (VerifyTable) keeps using
 // renderCell unwrapped — its OTHER operand is MySQL's own raw text via
 // internal/consistency.ConsistentTableChecksum, which this package does not
-// control and does not canonicalize; wrapping only one side there would
-// create a new mismatch instead of fixing one.
-func renderCellCanonicalJSON(v any, col metadata.ColumnMeta) []byte {
+// control and does not normalize; wrapping only one side there would create
+// a new mismatch instead of fixing one (MySQL's live CAST(...AS CHAR) still
+// renders a zero-date as the literal sentinel text, same as an event image —
+// only the BASELINE side ever substitutes NULL).
+func renderCellBaselineAnchored(v any, col metadata.ColumnMeta) []byte {
 	b := renderCell(v, col)
 	if b == nil {
+		return nil
+	}
+	if isZeroDateSentinel(b, col) {
 		return nil
 	}
 	if canon, ok := canonicalizeJSONContainer(b); ok {
