@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-07-03
+
 ### Added
 - **Public `ext` package: extension seams for embedding distributions** — an `AuditSink` interface (`ext.SetAuditSink`/`ext.Record`) recording data-access and script-generation operations, and `ext.SetForensicsEnabled` to override the forensics feature gate. Seams follow the `forensics.Enabled` convention: package-level vars set at startup, called at surface entry points. Wired surfaces: CLI `query`/`recover` and the MCP server's `query`/`recover` tools; the OSS binary installs no sink, so behavior is unchanged (one nil check per operation). Shim/console surfaces are follow-ups.
 
