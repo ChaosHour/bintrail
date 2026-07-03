@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-07-03
+
+### Changed
+- **The bintrail CLI is now embeddable: every command moved from `cmd/bintrail` (package main) into a new public `cliapp` package** (#723). External Go modules can run the full CLI via `cliapp.Main(version, commit, date)`, which returns the process exit code (same 64/65 agent exit-code contract). `cmd/bintrail` is now a thin shim that passes its `-ldflags`-injected build metadata through — no build-script or packaging changes, and `bintrail` binaries behave identically.
+
+### Added
+- **CI: `oss-firewall` guard** (#727) — rejects any Go import or go.mod/go.sum reference to private `github.com/nethalo/*` modules, mechanically enforcing the open-core dependency direction (private imports public, never the reverse).
+
 ## [0.26.3] - 2026-07-02
 
 ### Fixed
