@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	smithy "github.com/aws/smithy-go"
 	_ "github.com/duckdb/duckdb-go/v2"
 	"golang.org/x/sync/errgroup"
 
@@ -297,7 +299,15 @@ func listS3ParquetScoped(ctx context.Context, source string, since, until *time.
 		Bucket: &bucket,
 	})
 	if locErr != nil {
-		slog.Warn("could not detect S3 bucket region, using default", "bucket", bucket, "error", locErr)
+		if isBucketLocationAccessDenied(locErr) {
+			// Expected — see isBucketLocationAccessDenied. Still logs locErr so
+			// the rarer non-benign case sharing this same error code (an SCP or
+			// VPC-endpoint-policy deny, a cross-account restriction) stays
+			// diagnosable at --log-level debug.
+			slog.Debug("skipping S3 bucket region auto-detection: GetBucketLocation denied (expected under the minimal IAM policy); using resolved default region", "bucket", bucket, "region", cfg.Region, "error", locErr)
+		} else {
+			slog.Warn("could not detect S3 bucket region, using default", "bucket", bucket, "error", locErr)
+		}
 	} else {
 		r := string(loc.LocationConstraint)
 		if r == "" {
@@ -359,6 +369,21 @@ func listS3ParquetScoped(ctx context.Context, source string, since, until *time.
 
 	slog.Debug("listed S3 archive files", "source", source, "count", len(files))
 	return files, maxSize, bucketRegion, client, nil
+}
+
+// isBucketLocationAccessDenied reports whether err is an AWS AccessDenied-class
+// error from GetBucketLocation. This is the expected outcome under bintrail's
+// documented minimal least-privilege S3 IAM policy (docs/upload.md), which
+// intentionally omits s3:GetBucketLocation — not a misconfiguration worth a
+// WARN. Any other error (network failure, NoSuchBucket, throttling) is
+// unexpected and still warrants one.
+func isBucketLocationAccessDenied(err error) bool {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	code := apiErr.ErrorCode()
+	return code == "AccessDenied" || code == "AccessDeniedException"
 }
 
 // maxScopedDays is the maximum number of days for prefix-scoped S3 listing.
