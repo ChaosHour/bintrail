@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -984,30 +986,65 @@ func postBaselineColumns(changes map[string]*query.ResultRow, colNames []string)
 // because that copy is unexported. binaryColsFromTableMeta is the
 // fulltable-specific builder. A follow-up should hoist one shared copy once both
 // land (#661 is the third consumer).
+// "json" is included (non-binary) as a defense-in-depth companion to #736:
+// marshalRow now only promotes a []byte to raw JSON when it looks like a
+// JSON container ({ or [), so a JSON column whose top-level value is itself a
+// bare scalar (rare, but legal) falls through to this same base64 path
+// instead of failing to round-trip.
 func base64StoredKind(dataType string) (binary, ok bool) {
 	switch strings.ToLower(dataType) {
 	case "blob", "tinyblob", "mediumblob", "longblob":
 		return true, true
-	case "text", "tinytext", "mediumtext", "longtext":
+	case "text", "tinytext", "mediumtext", "longtext", "json":
 		return false, true
 	default:
 		return false, false
 	}
 }
 
+// decodeStoredBase64 also repairs events indexed before marshalRow was fixed
+// (#736) to gate on looksLikeJSONContainer: such an event may hold a
+// BLOB/TEXT value mis-promoted to a bare JSON scalar (e.g. the literal string
+// "false" stored as the JSON boolean false), decoding here as a Go
+// bool/json.Number instead of a string. That value IS the column's original
+// textual literal, so it is restored directly. A value that decoded to Go
+// nil (originally the string "null") is NOT repairable — indistinguishable
+// from a genuine SQL NULL — and is left as nil. This nil case, and a bare
+// JSON *string* scalar (bytes like `"YWJj"`, quotes included) that was
+// mis-promoted the same way, are historical-only gaps: by the time this
+// runs, the pre-#736 marshalRow had already parsed the outer quotes away as
+// ordinary JSON-string syntax, so the value arriving here is the
+// already-quote-stripped text (`YWJj`), indistinguishable from genuine
+// base64 content and wrongly re-decoded on top of the original corruption —
+// not repairable, a real fix belongs at the storage encoding, out of scope
+// here. A genuine JSON column captured AFTER this fix with a bare
+// string-scalar value does NOT hit this gap: it takes the ordinary
+// []byte-to-base64 path (same as any TEXT/BLOB), and this function correctly
+// reverses it to the original bytes, quotes included — which is exactly the
+// text MySQL needs to re-parse the value back into that JSON column.
 func decodeStoredBase64(v any, binary bool) any {
-	s, ok := v.(string)
-	if !ok {
-		return v
-	}
-	b, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
+	var text string
+	switch val := v.(type) {
+	case string:
+		b, err := base64.StdEncoding.DecodeString(val)
+		if err != nil {
+			return v
+		}
+		if binary {
+			return b
+		}
+		return string(b)
+	case bool:
+		text = strconv.FormatBool(val)
+	case json.Number:
+		text = string(val)
+	default:
 		return v
 	}
 	if binary {
-		return b
+		return []byte(text)
 	}
-	return string(b)
+	return text
 }
 
 // binaryColsFromTableMeta maps each BLOB/TEXT column of a table to whether it is
