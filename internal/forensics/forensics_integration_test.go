@@ -209,7 +209,7 @@ func TestIntegrationEnrichThreads(t *testing.T) {
 	}
 }
 
-// TestIntegrationActivity runs the three query modes live. Ring-buffer
+// TestIntegrationActivity runs the two query modes live. Ring-buffer
 // contents depend on server history, so assertions target the contract:
 // no errors, and fallback (with executable SQL) whenever data is absent.
 func TestIntegrationActivity(t *testing.T) {
@@ -265,18 +265,6 @@ func TestIntegrationActivity(t *testing.T) {
 		}
 	})
 
-	t.Run("ddl_history returns cleanly", func(t *testing.T) {
-		res, err := Activity(ctx, db, ActivityQuery{Type: QueryDDLHistory})
-		if err != nil {
-			t.Fatalf("Activity: %v", err)
-		}
-		if res.Source != "performance_schema" && res.Source != "fallback" {
-			t.Errorf("Source = %q, want performance_schema or fallback", res.Source)
-		}
-		if res.Source == "fallback" && len(res.FallbackQueries) == 0 {
-			t.Error("fallback source but no fallback queries")
-		}
-	})
 }
 
 func TestIntegrationListUsers(t *testing.T) {
