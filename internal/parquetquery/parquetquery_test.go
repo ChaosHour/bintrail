@@ -651,6 +651,24 @@ func TestFilterFilesByTimeRange(t *testing.T) {
 	}
 }
 
+// TestFilterFilesByTimeRange_untilOnlyKeepsVeryOldFiles pins half of the
+// #774 fix: filterFilesByTimeRange itself never excluded data purely for
+// being old when since is nil — only generateDatePrefixes did, by inventing
+// a now-31d start that kept files that old out of the S3 LISTING in the
+// first place. With that upstream bug fixed (generateDatePrefixes returns
+// nil for since==nil, so the full prefix gets listed), this confirms the
+// downstream filter correctly keeps an old file once it's in the list.
+func TestFilterFilesByTimeRange_untilOnlyKeepsVeryOldFiles(t *testing.T) {
+	files := []string{
+		"s3://b/event_date=2020-01-15/event_hour=10/e.parquet", // ~6 years before "now"
+	}
+	until := time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC)
+	got := filterFilesByTimeRange(files, nil, &until)
+	if len(got) != 1 {
+		t.Errorf("until-only should keep a file far older than 31 days when it satisfies until, got %d: %v", len(got), got)
+	}
+}
+
 func TestFilterFilesByTimeRangeUnparseable(t *testing.T) {
 	files := []string{"s3://bucket/no-hive/events.parquet"}
 	since := time.Date(2026, 3, 9, 11, 0, 0, 0, time.UTC)
@@ -741,18 +759,27 @@ func TestGenerateDatePrefixes(t *testing.T) {
 		}
 	})
 
-	t.Run("until only defaults start to 31 days ago", func(t *testing.T) {
-		// Use 5 days ago as until — should produce up to 31 prefixes
-		// but since start is capped to 31 days before now, result
-		// depends on the gap between now-31d and until.
+	// TestGenerateDatePrefixes/#774 subtests: with since==nil the function
+	// used to invent start = now-31d, which either silently dropped archived
+	// data older than that window (until within the last 31 days) or, when
+	// until itself predated the window, produced a negative span clamped to
+	// a single bogus day. With no lower bound there is no correct day to
+	// start scoping from, so since==nil must return nil ("list everything")
+	// regardless of until, deferring all filtering to until downstream
+	// (filterFilesByTimeRange).
+	t.Run("until only, until within 31 days returns nil (no invented start, #774)", func(t *testing.T) {
 		fiveDaysAgo := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -5)
 		got := generateDatePrefixes(base, nil, &fiveDaysAgo)
-		if got == nil {
-			t.Fatal("expected prefixes for until-only, got nil")
+		if got != nil {
+			t.Errorf("expected nil for until-only (recent), got %d prefixes: %v", len(got), got)
 		}
-		// Start = now-31d, end = 5 days ago → ~26 days of prefixes.
-		if len(got) < 20 || len(got) > 31 {
-			t.Errorf("expected 20-31 prefixes for until-only, got %d", len(got))
+	})
+
+	t.Run("until only, until older than 31 days returns nil, not a bogus single-day clamp (#774)", func(t *testing.T) {
+		old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+		got := generateDatePrefixes(base, nil, &old)
+		if got != nil {
+			t.Errorf("expected nil for until-only (old), got %d prefixes: %v", len(got), got)
 		}
 	})
 
@@ -840,8 +867,31 @@ func TestCanTerminateEarly(t *testing.T) {
 			mkRow(time.Date(2026, 3, 9, 10, 45, 0, 0, time.UTC), 3),
 		}
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
-		if !canTerminateEarly(results, remaining, 3) {
+		if !canTerminateEarly(results, remaining, 3, "") {
 			t.Error("expected early termination: next hour=11 is after all results in hour=10")
+		}
+	})
+
+	// TestCanTerminateEarly/DESC (#773): files are always iterated oldest-first
+	// (sortFilesByHour), so under Order=DESC the results accumulated so far
+	// are from the OLDEST hours read — exactly the rows a DESC (newest-first)
+	// query must NOT keep. The ASC cutoff heuristic above ("next file starts
+	// after our limit-th result") would still say "stop" here even though the
+	// files that matter most (the newest ones) haven't been read yet. DESC
+	// must never terminate early, regardless of how the ASC heuristic reads.
+	t.Run("DESC never terminates early even when the ASC heuristic would", func(t *testing.T) {
+		results := []query.ResultRow{
+			mkRow(time.Date(2026, 3, 9, 10, 15, 0, 0, time.UTC), 1),
+			mkRow(time.Date(2026, 3, 9, 10, 30, 0, 0, time.UTC), 2),
+			mkRow(time.Date(2026, 3, 9, 10, 45, 0, 0, time.UTC), 3),
+		}
+		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
+		if canTerminateEarly(results, remaining, 3, "DESC") {
+			t.Error("DESC must never terminate early: the newest hour (11) hasn't been read yet")
+		}
+		// Case-insensitivity mirrors query.OrderDirection elsewhere in this package.
+		if canTerminateEarly(results, remaining, 3, "desc") {
+			t.Error("DESC check must be case-insensitive (lowercase \"desc\")")
 		}
 	})
 
@@ -852,7 +902,7 @@ func TestCanTerminateEarly(t *testing.T) {
 			mkRow(time.Date(2026, 3, 9, 11, 45, 0, 0, time.UTC), 3),
 		}
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
-		if canTerminateEarly(results, remaining, 2) {
+		if canTerminateEarly(results, remaining, 2, "") {
 			t.Error("should not terminate: limit-th result is at 11:30, next hour starts at 11:00")
 		}
 	})
@@ -862,7 +912,7 @@ func TestCanTerminateEarly(t *testing.T) {
 			mkRow(time.Date(2026, 3, 9, 10, 15, 0, 0, time.UTC), 1),
 		}
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=12/e.parquet"}
-		if canTerminateEarly(results, remaining, 5) {
+		if canTerminateEarly(results, remaining, 5, "") {
 			t.Error("should not terminate: not enough results")
 		}
 	})
@@ -872,7 +922,7 @@ func TestCanTerminateEarly(t *testing.T) {
 			mkRow(time.Date(2026, 3, 9, 10, 15, 0, 0, time.UTC), 1),
 		}
 		remaining := []string{"s3://b/no-hive/events.parquet"}
-		if canTerminateEarly(results, remaining, 1) {
+		if canTerminateEarly(results, remaining, 1, "") {
 			t.Error("should not terminate: can't parse remaining file's hour")
 		}
 	})
@@ -886,7 +936,7 @@ func TestCanTerminateEarly(t *testing.T) {
 			mkRow(time.Date(2026, 3, 9, 10, 30, 0, 0, time.UTC), 3),
 		}
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
-		if !canTerminateEarly(results, remaining, 2) {
+		if !canTerminateEarly(results, remaining, 2, "") {
 			t.Error("expected early termination: sorted 2nd result (10:30) is before hour=11")
 		}
 	})
@@ -898,7 +948,7 @@ func TestCanTerminateEarly(t *testing.T) {
 			mkRow(time.Date(2026, 3, 9, 11, 0, 0, 0, time.UTC), 1),
 		}
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
-		if canTerminateEarly(results, remaining, 1) {
+		if canTerminateEarly(results, remaining, 1, "") {
 			t.Error("should not terminate: cutoff is exactly at next hour start")
 		}
 	})
@@ -907,7 +957,7 @@ func TestCanTerminateEarly(t *testing.T) {
 		results := []query.ResultRow{
 			mkRow(time.Date(2026, 3, 9, 10, 15, 0, 0, time.UTC), 1),
 		}
-		if canTerminateEarly(results, nil, 1) {
+		if canTerminateEarly(results, nil, 1, "") {
 			t.Error("should not terminate: no remaining files")
 		}
 	})
@@ -925,7 +975,7 @@ func TestCanTerminateEarly(t *testing.T) {
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
 		// limit=3 means we'd need 3 real-timestamp rows to ground a cutoff,
 		// but we only have 1. Must not terminate.
-		if canTerminateEarly(results, remaining, 3) {
+		if canTerminateEarly(results, remaining, 3, "") {
 			t.Error("should not terminate: only 1 non-drift row, cannot ground cutoff")
 		}
 	})
@@ -942,7 +992,7 @@ func TestCanTerminateEarly(t *testing.T) {
 			mkRow(time.Date(2026, 3, 9, 10, 45, 0, 0, time.UTC), 3),
 		}
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
-		if !canTerminateEarly(results, remaining, 2) {
+		if !canTerminateEarly(results, remaining, 2, "") {
 			t.Error("expected early termination: 2nd real row (10:30) is before hour=11, drift rows filtered out")
 		}
 	})
@@ -1347,16 +1397,75 @@ func TestClassifyEmptyS3Listing(t *testing.T) {
 		}
 	})
 
-	t.Run("unscoped listing (range > maxScopedDays) → SourceEmpty directly", func(t *testing.T) {
+	// TestClassifyEmptyS3Listing/until-only (post-review fix to #774, #876
+	// review): generateDatePrefixes(prefix, nil, old) now unconditionally
+	// returns nil for since==nil (correctly makes listS3ParquetScoped list
+	// the FULL prefix rather than inventing a bogus window). But that nil-ness
+	// is no longer the right signal for whether classifyEmptyS3Listing should
+	// probe: filterFilesByTimeRange runs downstream regardless of how the S3
+	// LIST call was scoped, and it alone can turn a non-empty raw listing
+	// into zero files whenever `until` excludes all real archived data (e.g.
+	// the archive's data starts after `until`). That is a healthy empty
+	// result, not a stale registration, and only the probe can tell them
+	// apart — so an until-only listing must still run it.
+	t.Run("until-only listing, until older than all data, probe finds nothing → SourceEmpty", func(t *testing.T) {
+		probed := false
 		s3BaseHasParquet = func(_ context.Context, _ *s3.Client, _, _ string) (bool, error) {
-			t.Fatal("probe must not run for an unscoped wide range")
+			probed = true
+			return false, nil
+		}
+		old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+		_, err := classifyEmptyS3Listing(context.Background(), nil, source, nil, &old)
+		if !probed {
+			t.Fatal("expected the probe to run for an until-only listing")
+		}
+		var emptyErr *query.SourceEmptyError
+		if !errors.As(err, &emptyErr) {
+			t.Fatalf("err = %v, want *query.SourceEmptyError", err)
+		}
+	})
+
+	// This is the exact regression scenario: an until-only query whose
+	// window predates all real archived data (a healthy, legitimately empty
+	// result) must NOT be misclassified as SourceEmptyError just because
+	// since==nil made generateDatePrefixes return nil.
+	t.Run("until-only listing, until older than all data, probe finds parquet → healthy empty range, not SourceEmpty", func(t *testing.T) {
+		s3BaseHasParquet = func(_ context.Context, _ *s3.Client, _, _ string) (bool, error) { return true, nil }
+		old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+		rows, err := classifyEmptyS3Listing(context.Background(), nil, source, nil, &old)
+		if err != nil || rows != nil {
+			t.Errorf("got rows=%v err=%v, want nil/nil (healthy empty range, real data exists elsewhere)", rows, err)
+		}
+	})
+
+	// Twin of the until-only fix: a wide (>maxScopedDays) bounded range has
+	// the same property — the S3 LIST call may be unscoped (full prefix),
+	// but filterFilesByTimeRange still narrows downstream and can legitimately
+	// zero out real data that falls outside [since, until]. Skipping the
+	// probe here was the same latent bug, just not the one #774 named.
+	t.Run("wide range (> maxScopedDays), probe finds nothing → SourceEmpty", func(t *testing.T) {
+		probed := false
+		s3BaseHasParquet = func(_ context.Context, _ *s3.Client, _, _ string) (bool, error) {
+			probed = true
 			return false, nil
 		}
 		wideSince := until.AddDate(0, 0, -(maxScopedDays + 5))
 		_, err := classifyEmptyS3Listing(context.Background(), nil, source, &wideSince, &until)
+		if !probed {
+			t.Fatal("expected the probe to run for a wide (>maxScopedDays) range")
+		}
 		var emptyErr *query.SourceEmptyError
 		if !errors.As(err, &emptyErr) {
 			t.Fatalf("err = %v, want *query.SourceEmptyError", err)
+		}
+	})
+
+	t.Run("wide range (> maxScopedDays), probe finds parquet → healthy empty range, not SourceEmpty", func(t *testing.T) {
+		s3BaseHasParquet = func(_ context.Context, _ *s3.Client, _, _ string) (bool, error) { return true, nil }
+		wideSince := until.AddDate(0, 0, -(maxScopedDays + 5))
+		rows, err := classifyEmptyS3Listing(context.Background(), nil, source, &wideSince, &until)
+		if err != nil || rows != nil {
+			t.Errorf("got rows=%v err=%v, want nil/nil (healthy empty range, real data exists elsewhere)", rows, err)
 		}
 	})
 }
