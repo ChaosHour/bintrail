@@ -991,9 +991,24 @@ func postBaselineColumns(changes map[string]*query.ResultRow, colNames []string)
 // JSON container ({ or [), so a JSON column whose top-level value is itself a
 // bare scalar (rare, but legal) falls through to this same base64 path
 // instead of failing to round-trip.
+//
+// "binary"/"varbinary" are included (binary) since #756: metadata.MapRow now
+// reinterprets those two DataTypes as []byte (they arrive from go-mysql as a
+// raw Go string with no charset, which json.Marshal could silently corrupt to
+// U+FFFD), so they take the same []byte-to-base64 storage path as BLOB and
+// must be decoded the same way here.
+//
+// Retroactive-reclassification risk (#756, accepted): unlike BLOB/TEXT (always
+// []byte-and-base64 from day one), a BINARY/VARBINARY event indexed BEFORE
+// this fix was stored as a plain, non-base64 string. decodeStoredBase64 can't
+// tell that apart from a post-fix base64 string, so a pre-fix value whose raw
+// bytes happen to satisfy the base64 alphabet+padding decodes to different,
+// wrong bytes with no error — astronomically unlikely for random binary
+// content, but plausible for a VARBINARY column storing ASCII-like data. See
+// the fuller rationale on the sibling copy in internal/recovery/recovery.go.
 func base64StoredKind(dataType string) (binary, ok bool) {
 	switch strings.ToLower(dataType) {
-	case "blob", "tinyblob", "mediumblob", "longblob":
+	case "blob", "tinyblob", "mediumblob", "longblob", "binary", "varbinary":
 		return true, true
 	case "text", "tinytext", "mediumtext", "longtext", "json":
 		return false, true

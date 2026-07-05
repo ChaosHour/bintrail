@@ -9,6 +9,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"golang.org/x/text/encoding/charmap"
 )
 
 // latestPerTableLoadTimeout bounds NewLatestPerTableResolver's union query.
@@ -38,6 +41,15 @@ type ColumnMeta struct {
 	DataType        string // e.g. "int", "datetime", "varchar" (information_schema.COLUMNS.DATA_TYPE)
 	ColumnType      string // full type declaration, e.g. "int(11) unsigned", "datetime(6)" (COLUMN_TYPE). Empty on pre-#212 snapshots.
 	IsGenerated     bool   // true for STORED or VIRTUAL generated columns
+	// CharacterSet is information_schema.COLUMNS.CHARACTER_SET_NAME (#756).
+	// Only meaningful for CHAR/VARCHAR — MySQL reports NULL for BINARY/
+	// VARBINARY/BLOB/numeric columns (absorbed here as ""), and coerceTextEncoding
+	// only consults it for those two types. Empty on pre-#756 snapshots (re-run
+	// `bintrail snapshot` to capture it) and on PostgreSQL snapshots (#533 has no
+	// MySQL-style charset concept), in which case an invalid-UTF-8 CHAR/VARCHAR
+	// value cannot be safely transcoded and MapRow fails loud on it rather than
+	// let json.Marshal replace it with U+FFFD.
+	CharacterSet string
 	// IsIdentityAlways marks a PostgreSQL GENERATED ALWAYS AS IDENTITY column (#557).
 	// Recovery keeps it on a reverse-INSERT (with OVERRIDING SYSTEM VALUE) but omits
 	// it from a reverse-UPDATE SET (PostgreSQL rejects SET on it). Always false for
@@ -111,7 +123,8 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 	rows, err := db.Query(`
 		SELECT schema_name, table_name, column_name, ordinal_position,
 		       column_key, data_type, COALESCE(column_type, '') AS column_type,
-		       is_generated, is_identity_always
+		       is_generated, is_identity_always,
+		       COALESCE(character_set_name, '') AS character_set_name
 		FROM schema_snapshots
 		WHERE snapshot_id = ?
 		ORDER BY schema_name, table_name, ordinal_position`,
@@ -180,7 +193,7 @@ type snapshotScanStats struct {
 	pre212Tables []string
 }
 
-// scanSnapshotRows consumes a schema_snapshots result set (the 9-column
+// scanSnapshotRows consumes a schema_snapshots result set (the 10-column
 // SELECT shared by NewResolver and NewLatestPerTableResolver) into tables,
 // keyed "schema.table", and reports the pre-#212 signals callers warn on.
 func scanSnapshotRows(rows *sql.Rows, tables map[string]*TableMeta) (snapshotScanStats, error) {
@@ -189,11 +202,11 @@ func scanSnapshotRows(rows *sql.Rows, tables map[string]*TableMeta) (snapshotSca
 	tableSawDataType := make(map[string]bool)
 
 	for rows.Next() {
-		var schemaName, tableName, columnName, columnKey, dataType, columnType string
+		var schemaName, tableName, columnName, columnKey, dataType, columnType, characterSet string
 		var ordinalPosition int
 		var isGenerated, isIdentityAlways bool
 
-		if err := rows.Scan(&schemaName, &tableName, &columnName, &ordinalPosition, &columnKey, &dataType, &columnType, &isGenerated, &isIdentityAlways); err != nil {
+		if err := rows.Scan(&schemaName, &tableName, &columnName, &ordinalPosition, &columnKey, &dataType, &columnType, &isGenerated, &isIdentityAlways, &characterSet); err != nil {
 			return stats, fmt.Errorf("failed to scan snapshot row: %w", err)
 		}
 
@@ -212,6 +225,7 @@ func scanSnapshotRows(rows *sql.Rows, tables map[string]*TableMeta) (snapshotSca
 			ColumnType:       columnType,
 			IsGenerated:      isGenerated,
 			IsIdentityAlways: isIdentityAlways,
+			CharacterSet:     characterSet,
 		}
 		if columnType != "" {
 			stats.sawColumnType = true
@@ -290,7 +304,8 @@ func NewLatestPerTableResolver(db *sql.DB) (*Resolver, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT s.schema_name, s.table_name, s.column_name, s.ordinal_position,
 		       s.column_key, s.data_type, COALESCE(s.column_type, '') AS column_type,
-		       s.is_generated, s.is_identity_always
+		       s.is_generated, s.is_identity_always,
+		       COALESCE(s.character_set_name, '') AS character_set_name
 		FROM schema_snapshots s
 		JOIN (
 			SELECT schema_name, table_name, MAX(snapshot_id) AS snapshot_id
@@ -415,9 +430,105 @@ func (r *Resolver) MapRow(schema, table string, row []any) (map[string]any, erro
 	}
 	named := make(map[string]any, len(row))
 	for i, col := range tm.Columns {
-		named[col.Name] = coerceUnsigned(row[i], col)
+		v, err := coerceTextEncoding(coerceUnsigned(row[i], col), col)
+		if err != nil {
+			return nil, fmt.Errorf("%s.%s.%s: %w", schema, table, col.Name, err)
+		}
+		named[col.Name] = v
 	}
 	return named, nil
+}
+
+// coerceTextEncoding closes the byte-corruption gap left by go-mysql's
+// no-transcoding delivery of BINARY/VARBINARY/CHAR/VARCHAR (#756): go-mysql
+// hands back the column's exact source bytes as a Go string, with no charset
+// applied. marshalRow then JSON-marshals that string, and encoding/json
+// silently replaces every invalid-UTF-8 byte with U+FFFD instead of
+// erroring — silent, at-rest data loss. Two distinct fixes, by DataType:
+//
+//   - BINARY/VARBINARY: reinterpreted as []byte, which routes the value
+//     through marshalRow's existing []byte-to-base64 path — the same one
+//     BLOB/TEXT already use (base64StoredKind in the recover/reconstruct/shim
+//     decode paths is updated alongside this to recognize the two new
+//     DataTypes). Byte-perfect regardless of content, since a BINARY/
+//     VARBINARY value (an MD5 digest, a binary UUID...) has no text
+//     semantics to preserve.
+//   - CHAR/VARCHAR: passed through unchanged when already valid UTF-8 — the
+//     overwhelming common case (utf8/utf8mb4/ascii columns, and any other
+//     charset whose actual bytes happen to be 7-bit ASCII). An invalid-UTF-8
+//     value is transcoded from latin1 when the snapshot recorded that
+//     charset — MySQL's "latin1" is actually cp1252/Windows-1252, not the
+//     ISO-8859-1 the name suggests (documented in the MySQL reference manual's
+//     West European character set chapter) — or rejected with an error for
+//     any other/unknown charset (including a
+//     pre-#756 snapshot, which never captured CharacterSet): MapRow fails the
+//     row rather than let json.Marshal corrupt it. Callers (parser.go's
+//     emitInserts/emitUpdates/emitDeletes) already warn-and-skip on a MapRow
+//     error, the same handling as a column-count mismatch, so this turns
+//     silent corruption into a loud, actionable warning instead.
+//
+// TEXT/BLOB/JSON/GEOMETRY are unaffected: go-mysql already delivers those as
+// []byte, so they never reach this function as a string.
+//
+// Residual, accepted ambiguity (same class as marshalRow's
+// looksLikeJSONContainer gate, and #736's bool/json.Number repair): a
+// latin1/cp1252 value whose raw bytes happen to ALSO form valid UTF-8 (e.g.
+// latin1 bytes 0xC3 0xA9, which decode as UTF-8 "é") passes the
+// utf8.ValidString check and is left as-is — silently misread as the
+// wrong text, with no error, since bintrail cannot tell "genuinely UTF-8"
+// from "coincidentally valid UTF-8" from the bytes alone. Only reachable
+// content-sniffing, not a per-value type tag, distinguishes the two; a full
+// fix would need to carry the source encoding out-of-band, which is out of
+// scope for #756's reported corruption class (the common case — genuinely
+// mis-set charsets producing INVALID UTF-8 — is what this function fixes).
+// Charset support beyond latin1 is deliberately out of scope too: the issue
+// this closes only reports latin1, and its accepted "at minimum" fallback is
+// exactly the fail-loud default branch below — not silent corruption, and
+// not a guess at an unverified charset.
+func coerceTextEncoding(v any, col ColumnMeta) (any, error) {
+	switch strings.ToLower(col.DataType) {
+	case "binary", "varbinary":
+		if s, ok := v.(string); ok {
+			return []byte(s), nil
+		}
+		return v, nil
+	case "char", "varchar":
+		s, ok := v.(string)
+		if !ok || utf8.ValidString(s) {
+			return v, nil
+		}
+		switch strings.ToLower(col.CharacterSet) {
+		case "latin1":
+			decoded, err := charmap.Windows1252.NewDecoder().String(s)
+			if err != nil {
+				return nil, fmt.Errorf("failed to transcode latin1 (cp1252) value: %w", err)
+			}
+			// charmap.Windows1252's decoder is total — it never returns a
+			// non-nil error, even for the 5 cp1252 code points cp1252 itself
+			// leaves undefined (0x81, 0x8D, 0x8F, 0x90, 0x9D): those silently
+			// decode to U+FFFD instead. Left unchecked, that's the exact
+			// silent-corruption failure mode #756 exists to close, just
+			// narrowed to 5 specific bytes. A genuine latin1/cp1252 value
+			// never legitimately contains U+FFFD (MySQL's latin1 has no
+			// character at those 5 positions either), so its presence here
+			// means the source byte was one of the 5 undefined points, not a
+			// real transcoding — fail loud instead of embedding it.
+			if strings.ContainsRune(decoded, utf8.RuneError) {
+				return nil, fmt.Errorf(
+					"value contains a byte with no latin1 (cp1252) character assignment — cannot transcode without further corruption")
+			}
+			return decoded, nil
+		case "":
+			return nil, fmt.Errorf(
+				"value is not valid UTF-8 and the schema snapshot has no captured character set for this column (pre-#756 snapshot) — re-run `bintrail snapshot` to enable safe decoding")
+		default:
+			return nil, fmt.Errorf(
+				"value is not valid UTF-8 under charset %q, which bintrail cannot yet safely transcode (only latin1 is supported today) — indexing it as-is would silently corrupt it",
+				col.CharacterSet)
+		}
+	default:
+		return v, nil
+	}
 }
 
 // coerceUnsigned reinterprets an integer value decoded by go-mysql into the
@@ -614,6 +725,11 @@ type columnRow struct {
 	columnType                        string // full COLUMN_TYPE (e.g. "datetime(6)"); needed by full-table reconstruct for PK precision
 	generationExpression              sql.NullString
 	columnDefault                     sql.NullString
+	// characterSet is CHARACTER_SET_NAME (#756): NULL for BINARY/VARBINARY/BLOB/
+	// numeric columns, populated for CHAR/VARCHAR/TEXT. Only CHAR/VARCHAR consult
+	// it (coerceTextEncoding) — it enables safe latin1-to-UTF8 transcoding of an
+	// invalid-UTF-8 value instead of json.Marshal silently corrupting it to U+FFFD.
+	characterSet sql.NullString
 }
 
 // fkRow holds a single foreign key column mapping as fetched from
@@ -649,7 +765,7 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		query = `
 			SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME,
 			       ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, COLUMN_TYPE,
-			       IS_NULLABLE, COLUMN_DEFAULT, GENERATION_EXPRESSION
+			       IS_NULLABLE, COLUMN_DEFAULT, GENERATION_EXPRESSION, CHARACTER_SET_NAME
 			FROM information_schema.COLUMNS
 			WHERE TABLE_SCHEMA NOT IN ('information_schema','performance_schema','mysql','sys')
 			ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`
@@ -658,7 +774,7 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		query = fmt.Sprintf(`
 			SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME,
 			       ORDINAL_POSITION, COLUMN_KEY, DATA_TYPE, COLUMN_TYPE,
-			       IS_NULLABLE, COLUMN_DEFAULT, GENERATION_EXPRESSION
+			       IS_NULLABLE, COLUMN_DEFAULT, GENERATION_EXPRESSION, CHARACTER_SET_NAME
 			FROM information_schema.COLUMNS
 			WHERE TABLE_SCHEMA IN (%s)
 			ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`, placeholders)
@@ -681,7 +797,7 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		if err := srcRows.Scan(
 			&c.schemaName, &c.tableName, &c.columnName,
 			&c.ordinalPosition, &c.columnKey, &c.dataType, &c.columnType,
-			&c.isNullable, &c.columnDefault, &c.generationExpression,
+			&c.isNullable, &c.columnDefault, &c.generationExpression, &c.characterSet,
 		); err != nil {
 			return SnapshotStats{}, fmt.Errorf("failed to scan column row: %w", err)
 		}
@@ -739,17 +855,21 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 	for i := 0; i < len(columns); i += batchSize {
 		batch := columns[i:min(i+batchSize, len(columns))]
 
-		valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?,?),", len(batch)), ",")
+		valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?,?,?),", len(batch)), ",")
 		insertSQL := "INSERT INTO schema_snapshots " +
 			"(snapshot_id, snapshot_time, schema_name, table_name, column_name, " +
-			"ordinal_position, column_key, data_type, column_type, is_nullable, column_default, is_generated) VALUES " +
+			"ordinal_position, column_key, data_type, column_type, character_set_name, is_nullable, column_default, is_generated) VALUES " +
 			valClause
 
-		insertArgs := make([]any, 0, len(batch)*12)
+		insertArgs := make([]any, 0, len(batch)*13)
 		for _, c := range batch {
 			var def any
 			if c.columnDefault.Valid {
 				def = c.columnDefault.String
+			}
+			var charset any
+			if c.characterSet.Valid {
+				charset = c.characterSet.String
 			}
 			// Generated-ness is read from GENERATION_EXPRESSION, not EXTRA: EXTRA
 			// also reports "DEFAULT_GENERATED" for an ordinary column with an
@@ -763,7 +883,7 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 			isGenerated := c.generationExpression.Valid && strings.TrimSpace(c.generationExpression.String) != ""
 			insertArgs = append(insertArgs,
 				nextID, snapshotTime, c.schemaName, c.tableName, c.columnName,
-				c.ordinalPosition, c.columnKey, c.dataType, c.columnType, c.isNullable, def, isGenerated,
+				c.ordinalPosition, c.columnKey, c.dataType, c.columnType, charset, c.isNullable, def, isGenerated,
 			)
 		}
 

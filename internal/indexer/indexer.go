@@ -339,10 +339,17 @@ func marshalRow(row map[string]any) ([]byte, error) {
 	// query.looksLikeJSONContainer, which guards the same ambiguity on the
 	// baseline/Parquet read side.
 	//
-	// go-mysql delivers only BLOB/TEXT, JSON, and GEOMETRY columns as []byte
-	// (VARCHAR/CHAR/VARBINARY/BINARY arrive as Go string; ENUM/SET as int64),
-	// so this branch is the full extent of what needs gating — no other
-	// column kind can reach it.
+	// go-mysql itself delivers only BLOB/TEXT, JSON, and GEOMETRY columns as
+	// []byte (VARCHAR/CHAR/VARBINARY/BINARY arrive as Go string from go-mysql;
+	// ENUM/SET as int64) — but metadata.MapRow now reinterprets BINARY/
+	// VARBINARY as []byte too (#756, before this function ever sees the row),
+	// so by the time a row reaches marshalRow, []byte covers those five kinds.
+	// They all go through the same looksLikeJSONContainer/json.Valid gate
+	// above: a BINARY/VARBINARY value whose first non-whitespace byte happens
+	// to be '{'/'[' and whose full content happens to be valid JSON would be
+	// promoted too, same residual ambiguity as a TEXT/BLOB value that
+	// genuinely looks like JSON (documented below) — astronomically unlikely
+	// for real binary content, and not fixable from bytes alone.
 	//
 	// Residual, accepted ambiguity (not fixed here, same limit as the
 	// baseline-side guard above): a plain TEXT/BLOB value whose content
@@ -434,6 +441,21 @@ func EnsureSchema(db *sql.DB) error {
 	// values are preserved; the resolver already COALESCEs NULL to ''.
 	if err := ensureColumnWidened(db, "schema_snapshots", "column_type", "text",
 		`ALTER TABLE schema_snapshots MODIFY COLUMN column_type TEXT DEFAULT NULL COMMENT 'full type from information_schema.COLUMNS.COLUMN_TYPE'`,
+	); err != nil {
+		return err
+	}
+	// character_set_name carries information_schema.COLUMNS.CHARACTER_SET_NAME
+	// (#756): NULL for BINARY/VARBINARY/numeric columns, populated for CHAR/
+	// VARCHAR. go-mysql delivers those four types as a raw Go string with no
+	// charset applied, and an invalid-UTF-8 value (a legacy latin1 table, a
+	// binary UUID/digest) previously reached json.Marshal, which silently
+	// replaces bad bytes with U+FFFD — at-rest data loss. Capturing the charset
+	// lets MapRow transcode a latin1 CHAR/VARCHAR value to UTF-8 (MySQL's
+	// "latin1" is actually cp1252) and fail loud instead of guess for any other
+	// non-UTF-8 charset; a pre-#756 snapshot has this column NULL, so its
+	// CHAR/VARCHAR columns keep failing loud on invalid UTF-8 until re-snapshotted.
+	if err := ensureColumn(db, "schema_snapshots", "character_set_name",
+		`ALTER TABLE schema_snapshots ADD COLUMN character_set_name VARCHAR(32) DEFAULT NULL COMMENT 'information_schema.COLUMNS.CHARACTER_SET_NAME; NULL for BINARY/VARBINARY/numeric columns; enables safe latin1-to-UTF8 transcoding of CHAR/VARCHAR values at index time instead of silent U+FFFD corruption (#756)' AFTER column_type`,
 	); err != nil {
 		return err
 	}
