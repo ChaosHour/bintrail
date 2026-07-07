@@ -383,9 +383,40 @@ surface, use the demo image ([demo.md](./demo.md)).
 | `SHIM_PASSWORD` | compose `flashback` profile | Cleartext password for `SHIM_USER` (required) |
 | `SHIM_AUTH_METHOD` | compose `flashback` profile (optional) | Client auth plugin for the shim (default `mysql_native_password`; set `caching_sha2_password` for drivers that require it) |
 | `BINTRAIL_INDEX_DSN` | bintrail-mcp | Index DSN for the MCP server |
+| `AWS_ACCESS_KEY_ID` | compose (optional) | Static AWS credential for S3 (Archive to S3, baselines, and reading either back). Leave empty to rely on a mounted `~/.aws` or an EC2/ECS/EKS instance role instead — see below |
+| `AWS_SECRET_ACCESS_KEY` | compose (optional) | Paired with `AWS_ACCESS_KEY_ID` above |
+| `AWS_SESSION_TOKEN` | compose (optional) | Only needed for temporary/STS credentials |
+| `AWS_REGION` | compose (optional) | Region for the S3 bucket(s) used by Archive to S3 / baselines |
 
 (`SERVER_ID` is no longer needed — `bintrail-console watch` derives a stable
 one from the source DSN.)
+
+### S3 credentials (Archive to S3 / baselines)
+
+Both **Archive to S3** (per-source, set from the console UI) and reading
+**baseline** snapshots back from `s3://` go through the `bintrail` service's
+ambient AWS credential chain — there's no per-source credential field. Set
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` /
+`AWS_REGION` in `.env`, then `docker compose up -d` to recreate the container
+with them (setting them in your host shell after the container is already
+running does nothing — env vars only apply at container creation). Skip this
+entirely if the host already provides credentials another way (a mounted
+`~/.aws`, or an EC2/ECS/EKS instance role reachable from inside the
+container) — the chain tries those too.
+
+Missing/invalid credentials show up as:
+
+- In `docker compose logs -f bintrail`: `duckdb: AWS credential chain
+  resolved no usable credentials for S3 reads` (DuckDB, the console's Parquet
+  query engine, couldn't resolve anything from the chain).
+- In the console UI: `Could not list baselines: ... HTTP 403 Forbidden ...
+  No credentials are provided`, or an equivalent 403 on Archive to S3 uploads.
+
+Both point at the same root cause — no usable AWS credentials reached the
+container — not an IAM permissions problem. Once credentials resolve, the IAM
+principal still needs S3 permissions on the bucket: see [S3 IAM
+Policy](s3-iam-policy.md) for a copy-paste policy covering Archive to S3,
+baselines, and reading either back.
 
 ## Image details
 
