@@ -1,0 +1,72 @@
+# S3 IAM Policy (copy-paste)
+
+One IAM policy that covers every dbtrail feature that touches S3 — archiving
+rotated partitions, baseline snapshots, `bintrail upload`, and querying/
+time-traveling against archived data. Attach it to the IAM user or role that
+runs dbtrail, swap in your bucket name, and every `--archive-s3` /
+`--baseline-s3` / `--s3-bucket` flag in the docs will work without further
+tuning.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BintrailS3Access",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:DeleteObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::my-bucket",
+        "arn:aws:s3:::my-bucket/*"
+      ]
+    }
+  ]
+}
+```
+
+Replace `my-bucket` with your bucket name (both ARNs — the bucket itself and
+everything inside it). If your account isn't in the standard `aws` partition
+(GovCloud, China), replace `arn:aws:s3` with `arn:aws-us-gov:s3` or
+`arn:aws-cn:s3`.
+
+`bintrail init --s3-bucket <bucket>` prints this exact policy for you (with
+the partition already filled in) if it can't create/configure the bucket
+itself — so if you've already run that, you don't need to write this by
+hand.
+
+## What each permission is for
+
+| Action | Used by |
+|---|---|
+| `s3:PutObject` | `bintrail rotate --archive-s3`, `bintrail baseline --upload`, `bintrail upload` — writing Parquet archives/baselines to the bucket |
+| `s3:GetObject` | `bintrail query`/`recover --archive-s3`, `--baseline-s3`/`reconstruct` reads, and the `HeadObject` existence check `bintrail upload --retry` issues (S3 authorizes `HeadObject` under `s3:GetObject` — there's no separate `s3:HeadObject` action) |
+| `s3:ListBucket` | Enumerating archived partitions/baseline snapshots (`ListObjectsV2`), and the bucket-reachability check (`HeadBucket`) `bintrail init --s3-bucket` and `bintrail rotate` run |
+| `s3:DeleteObject` | Removing superseded archives during `archive reconcile --repair --prune`, and baseline upload's own cleanup of its in-progress marker. Optional but recommended — omit it if you'd rather archives/baselines only ever be deleted manually |
+
+## One thing this policy deliberately leaves out
+
+**`s3:GetBucketLocation`** is not in the policy above. It's only needed if
+your archive/baseline bucket lives in a **different AWS region** than the
+one dbtrail otherwise resolves for its credentials (env vars, `~/.aws`
+profile, or EC2/ECS/EKS instance metadata). Without it, `bintrail query
+--archive-s3` just uses the region it already resolved — same-region setups
+(the common case) work fine. See [S3
+Prerequisites](query-and-recovery.md#s3-prerequisites) for the full
+explanation, or add `"s3:GetBucketLocation"` to the `Action` list above (as
+a bucket-level permission, alongside `s3:ListBucket`) if your bucket is
+cross-region.
+
+## Tighter scope (optional)
+
+The policy above grants access to the whole bucket. If you want to scope it
+to a prefix instead (e.g. only `archives/*` inside a bucket shared with
+other tools), see [upload.md — Minimum IAM
+permissions](upload.md#minimum-iam-permissions) for a prefix-scoped example
+— just be aware a prefix-only policy needs one grant per prefix you actually
+use (`archives/`, `baselines/`, etc.) since `--archive-s3` and
+`--baseline-s3`/`--upload` are typically pointed at different prefixes.

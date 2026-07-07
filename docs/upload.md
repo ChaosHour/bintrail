@@ -99,6 +99,12 @@ The AWS region is resolved in this order:
 
 ### Minimum IAM permissions
 
+> Want one policy that covers `upload` **and** archiving/baselines/queries
+> against S3, with no per-feature tuning? Use **[S3 IAM
+> Policy](s3-iam-policy.md)** instead — it's the same shape as below, just
+> bucket-wide instead of prefix-scoped. Keep reading here only if you want
+> to scope permissions to a single prefix.
+
 The IAM principal (user or role) needs these S3 permissions on the destination bucket:
 
 ```json
@@ -109,8 +115,7 @@ The IAM principal (user or role) needs these S3 permissions on the destination b
       "Effect": "Allow",
       "Action": [
         "s3:PutObject",
-        "s3:GetObject",
-        "s3:HeadObject"
+        "s3:GetObject"
       ],
       "Resource": "arn:aws:s3:::my-bucket/archives/*"
     }
@@ -119,8 +124,7 @@ The IAM principal (user or role) needs these S3 permissions on the destination b
 ```
 
 - `s3:PutObject` — required for uploading files
-- `s3:HeadObject` — required when using `--retry` to check if files already exist
-- `s3:GetObject` — required if you later query archives with `bintrail query --archive-s3`
+- `s3:GetObject` — required for the `HeadObject` existence check `--retry` issues (AWS authorizes `HeadObject` under the `s3:GetObject` permission — there is no separate `s3:HeadObject` IAM action), and if you later query archives with `bintrail query --archive-s3`
 - `s3:GetBucketLocation` — **optional**, bucket-level (not scoped to `/archives/*`). `bintrail query --archive-s3` uses it only to cross-check the bucket's region against the one already resolved from the credential chain; without it, that check is skipped (logged at debug level, not a warning) and the resolved region is used as-is. Grant it only if the archive bucket lives in a different region than your EC2/ECS/EKS principal otherwise resolves — see [S3 Prerequisites](query-and-recovery.md#s3-prerequisites).
 
 ---

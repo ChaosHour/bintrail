@@ -314,7 +314,7 @@ bintrail rotate \
   --archive-s3-region us-east-1
 ```
 
-Files are written locally first, then uploaded (Hive-partitioned, Athena/Glue/DuckDB-compatible); re-run with `--retry` after a partial failure. Once archived, `query` and `recover` **discover the archives automatically** (from `archive_state`) and merge them with live results — no extra flags (use `--no-archive` to skip). The full setup — creating and locking down the bucket, the minimum IAM policy, the AWS credential chain — is in [Rotation and Status](rotation-and-status.md#archiving-partitions-to-parquet) and [Upload](upload.md).
+Files are written locally first, then uploaded (Hive-partitioned, Athena/Glue/DuckDB-compatible); re-run with `--retry` after a partial failure. Once archived, `query` and `recover` **discover the archives automatically** (from `archive_state`) and merge them with live results — no extra flags (use `--no-archive` to skip). The full setup — creating and locking down the bucket, the AWS credential chain — is in [Rotation and Status](rotation-and-status.md#archiving-partitions-to-parquet) and [Upload](upload.md); for the IAM policy, copy-paste from **[S3 IAM Policy](s3-iam-policy.md)** — one policy covers this, baselines (Scenario I), and `bintrail upload`.
 
 ---
 
