@@ -184,6 +184,16 @@ All three baseline-merging entry points — `reconstruct` single-row, `reconstru
 
 This is an offline/`_snapshot` concern only — `_flashback` and `bintrail query`/`recover` read the row-event history directly and never claim a never-touched row still exists.
 
+### PK-changing UPDATE in the reconstruction window
+
+An `UPDATE` that changes a row's **primary key** (e.g. `UPDATE orders SET id = 2 WHERE id = 1`) is stored in the index keyed by its **before-image** PK (`pk_values` = the old key). `reconstruct` folds events into a change map keyed by that before-image PK, so a changed PK cannot be applied safely — the after-image row it would emit carries a *different* key than its map entry:
+
+- **Resurrection** — `UPDATE pk 1→2; DELETE pk=2`: the `DELETE` is keyed by the new PK (`2`) and never collides with the `UPDATE` entry (keyed by `1`), so a naive merge emits the `pk=2` after-image for a row the `DELETE` actually removed.
+- **Duplication** — `UPDATE pk 1→2; UPDATE pk=2`: `pk=2` is emitted twice, a `1062 Duplicate entry` that only surfaces when you load the dump.
+- **Silent drop** — `UPDATE pk 1→2; INSERT pk=1`: the later `INSERT` reuses the old key, overwriting the `UPDATE` in the change map — a map-only check misses it and the moved row (`pk=2`) is never emitted.
+
+Rather than ship a silently duplicated, resurrected, or row-dropping dump, the full-table reconstruct entry points detect a PK-changing `UPDATE` up front and **refuse** the run with an error naming the table and the `old → new` key transition ([#782](https://github.com/dbtrail/dbtrail/issues/782)). The detection scans the **raw event stream** before it collapses into the change map (so the silent-drop permutation above cannot slip through). `reconstruct --output-format mydumper` and the binlog-only fallback for a never-baselined table fetch the **whole** window, so their check covers every event in `(baseline snapshot time, --at]`. The shim's `_snapshot` and `verify` fetch only the **latest event per PK** (a query-time optimization), so they refuse whenever the PK-changing `UPDATE` is the surviving event for its old key; a PK-changing `UPDATE` later superseded on that key is outside their fetched set — `verify` then reports the resulting drift as a **mismatch** rather than passing silently. **Single-row** `reconstruct` for the *new* key returns a clear "a PK-changing UPDATE in the window likely brought this PK into existence … cannot be resolved" message instead of the misleading `no row found in baseline` (the row *did* exist — under a different stored key). In every case: re-run `bintrail baseline` to capture a snapshot **at or after** the PK change, then reconstruct from the new baseline.
+
 ### DuckDB resource tuning (`--ultrafast`)
 
 When `query`, `recover`, or `reconstruct` scan Parquet archives, DuckDB runs under a conservative, container-safe budget by default: **2 threads and a 4 GB memory limit**, spilling to the OS temp directory when exceeded. These defaults keep bintrail alive in small shared containers; on a dedicated box with plenty of RAM they leave performance on the table.
