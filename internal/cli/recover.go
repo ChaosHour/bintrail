@@ -18,6 +18,7 @@ import (
 	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -265,6 +266,40 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		slog.Warn("could not load schema snapshot; WHERE clauses will use all columns", "error", err)
 		resolver = nil
+	}
+
+	// ── Re-encode --pk/--pks against the at-rest pk_values form ────────────────
+	// (#957) binlog_events.pk_values is stored PIPE/BACKSLASH-ESCAPED
+	// (event.BuildPKValues escapes each PK component before joining with "|"),
+	// but --pk/--pks bind the raw flag value straight through. A value
+	// containing a literal "|"/"\" is ambiguous without knowing the live
+	// table's actual PK column count: it could be the user-typed delimiter
+	// between components of a composite PK (see the documented
+	// "--pk '12345|2'" usage — the raw, unescaped form is what's stored), or
+	// a literal character inside a single-column PK (the escaped form is
+	// what's stored). An earlier revision of this fix resolved that
+	// ambiguity from the schema resolver above, but its snapshot can be stale
+	// relative to the live table (e.g. an ALTER TABLE widened/narrowed the PK
+	// and no `bintrail snapshot` re-run happened yet since) — trusting it can
+	// silently corrupt a previously-correct composite lookup. Instead, match
+	// BOTH candidate encodings whenever escaping would actually change the
+	// value: event.EscapePKValue is a no-op unless the value contains "|" or
+	// "\", so the overwhelming common case (plain numeric/text PKs) emits the
+	// exact same query as before this feature existed.
+	if opts.PKValues != "" {
+		if esc := event.EscapePKValue(opts.PKValues); esc != opts.PKValues {
+			opts.PKValuesAlt = esc
+		}
+	}
+	if len(opts.PKValuesIn) > 0 {
+		expanded := make([]string, 0, len(opts.PKValuesIn))
+		for _, v := range opts.PKValuesIn {
+			expanded = append(expanded, v)
+			if esc := event.EscapePKValue(v); esc != v {
+				expanded = append(expanded, esc)
+			}
+		}
+		opts.PKValuesIn = expanded
 	}
 
 	// ── Fetch events (live + archives) ────────────────────────────────────────
