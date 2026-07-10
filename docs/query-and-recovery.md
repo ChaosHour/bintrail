@@ -381,6 +381,16 @@ The resolver is loaded best-effort in the `recover` command — a failure logs a
 
 Generated columns (`STORED` or `VIRTUAL`) are computed by MySQL and cannot be set explicitly, so the generated script skips them in `INSERT`/`UPDATE` SET clauses — the script won't fail trying to assign a value MySQL owns.
 
+### Column type encodings (BLOB/TEXT, GEOMETRY, VECTOR)
+
+Columns that MySQL delivers as raw bytes are stored base64-encoded in the index, so `recover` decodes them back to a loadable literal using the column type from the schema snapshot:
+
+- **`BLOB`/`BINARY`/`VARBINARY`** → an `X'<hex>'` literal; **`TEXT`/`JSON`** → a decoded string literal.
+- **`GEOMETRY`** (and `POINT`, `LINESTRING`, `POLYGON`, … the whole spatial family) → `ST_GeomFromWKB(X'<wkb>', <srid>)`. The at-rest MySQL geometry value is `SRID` (4 bytes, little-endian) followed by the WKB; `recover` splits off the SRID and passes the WKB to `ST_GeomFromWKB` with the SRID as its second argument. Before this, a geometry column emitted its raw base64 string, which a geometry column cannot load — failing the entire `BEGIN`/`COMMIT` script over a single geometry value.
+- **`VECTOR`** (MySQL 9.0+) is **not yet** transformed. Its base64 value is emitted as-is, which a real `VECTOR` column rejects at apply time (a loud failure, not silent corruption). A `STRING_TO_VECTOR('[…]')` decode of its packed-float at-rest form is a follow-up.
+
+Typing these columns requires a schema snapshot that describes the table. **Without a snapshot covering the table** — none loaded, or the loaded one omits it — `recover` cannot type its columns, so a `BLOB`/`TEXT`/`BINARY`/`VARBINARY`/`GEOMETRY` value is emitted as its **stored base64 text** (e.g. `'aGVsbG8='` instead of `'hello'`), which the target column will not load correctly. Scalar columns (`INT`, `VARCHAR`, `DATETIME`, …) are unaffected and reverse correctly with or without a snapshot. If a table you need to recover has byte-typed columns, take a `bintrail snapshot` covering it **before** recovering so those columns decode to a proper literal.
+
 ### Output Format
 
 The recovery output is a self-contained SQL script:
