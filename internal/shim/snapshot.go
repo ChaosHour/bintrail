@@ -75,6 +75,13 @@ func (h *Handler) baselineSource() string {
 // it is converted to ER_TOO_BIG_SELECT, mirroring runFullTable's cap path.
 var errFullTableCapExceeded = errors.New("full-table snapshot row cap exceeded")
 
+// errLimitReached short-circuits the buffered full-table merge once a user's
+// LIMIT (#997) has been satisfied. Like errFullTableCapExceeded it never
+// escapes runSnapshotFullTable — but it is a SUCCESS signal (the images slice
+// is already truncated to the LIMIT), distinct from the cap error, so it must
+// be checked before the cap-error translation.
+var errLimitReached = errors.New("full-table snapshot LIMIT reached")
+
 // runSnapshotFullTable resolves a full-table (no-WHERE) _snapshot query by
 // merging the baseline snapshot at-or-before AsOf with the post-snapshot
 // binlog deltas across the whole table (#362). The result is the table's true
@@ -225,6 +232,41 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		changes[rows[i].PKValues] = &rows[i]
 	}
 
+	input := reconstruct.SnapshotFullTableInput{
+		BaselinePath: baselinePath,
+		Schema:       q.Schema,
+		Table:        q.Table,
+		PKCols:       pkCols,
+		Changes:      changes,
+		// rows was fetched LimitPerPK=1, so it is already collapsed to the latest
+		// event per PK; hand it to the #782 guard anyway (authoritative over what
+		// was fetched), bounded by that fetch (see pkChangingUpdateInEvents).
+		Events: rows,
+	}
+
+	// #998: with a bound connection and no LIMIT, stream the merged rows straight
+	// to the wire. The baseline (potentially millions of rows) flows through the
+	// DuckDB merge cursor one row at a time, so peak shim memory is O(post-baseline
+	// changes) — the `changes` map above — not O(table size), and the
+	// FullTableRowCap ceiling is lifted. A LIMIT keeps the bounded buffered path
+	// below (cheap browse); an unbound handler (unit tests, embedders that never
+	// call BindConn) also stays buffered.
+	//
+	// The streamed column set is fixed before the first row (the header must
+	// precede any row): the user's explicit projection verbatim when given (#313,
+	// matching the buffered imagesToResultVerbatim — a projected full-table query
+	// streams too, since a projection doesn't change the row count), else the
+	// table's newest-snapshot order. When neither is resolvable (empty projection
+	// is impossible; nil snapshot), fall through to the buffered path, which
+	// derives columns from the images it has.
+	streamCols := q.Columns
+	if streamCols == nil {
+		streamCols = h.columnOrderFor(q.Schema, q.Table)
+	}
+	if h.conn != nil && q.Limit == 0 && len(streamCols) > 0 {
+		return h.streamSnapshotFullTable(ctx, q, input, streamCols)
+	}
+
 	rowCap := h.cfg.FullTableRowCap
 	if rowCap <= 0 {
 		rowCap = defaultFullTableRowCap
@@ -246,39 +288,117 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 	// widens — "0.10000000149011612" vs the event side's "0.1"), and a baseline
 	// BIGINT UNSIGNED > 2^63 can't round-trip (baseline stores bigint as signed
 	// Int64). Stop at cap+1 so overflow is detectable.
+	// Residual unchanged-TOAST markers (#592) are caught upstream by
+	// SnapshotFullTableImages' checkChangesToast on the delta events (baseline
+	// rows can't carry a marker), NOT by buildImagesResult below: fullTableTextCell
+	// coerces every cell to text first, so a marker would already be a []byte by
+	// the time buildImagesResult's IsUnchangedToastMarker check runs and never
+	// match. Keep the upstream guard — the streaming sibling (projectCell) checks
+	// the raw value instead, which is the pattern to prefer.
 	images := make([]map[string]any, 0)
-	err = reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
-		BaselinePath: baselinePath,
-		Schema:       q.Schema,
-		Table:        q.Table,
-		PKCols:       pkCols,
-		Changes:      changes,
-		// rows was fetched LimitPerPK=1, so it is already collapsed to the latest
-		// event per PK; hand it to the #782 guard anyway (authoritative over what
-		// was fetched), bounded by that fetch (see pkChangingUpdateInEvents).
-		Events: rows,
-	}, func(rowMap map[string]any) error {
+	err = reconstruct.SnapshotFullTableImages(ctx, input, func(rowMap map[string]any) error {
 		img := make(map[string]any, len(rowMap))
 		for k, v := range rowMap {
 			img[k] = h.fullTableTextCell(q.Schema, q.Table, k, v)
 		}
 		images = append(images, img)
+		// Cap FIRST — a LIMIT never RAISES the cap (#997): overflow past rowCap
+		// aborts, and only then does a LIMIT at or below rowCap stop the merge
+		// early via the success sentinel, so the browse succeeds instead of
+		// tripping the cap.
 		if len(images) > rowCap {
 			return errFullTableCapExceeded
 		}
+		if q.Limit > 0 && len(images) >= q.Limit {
+			return errLimitReached
+		}
 		return nil
 	})
-	if err != nil {
+	// Keep the errLimitReached SUCCESS sentinel filtered out FIRST: images is
+	// already truncated to the LIMIT. A future refactor into sequential
+	// `if errors.Is(...)` branches must preserve this ordering, or a legit LIMIT
+	// success would be mistranslated into a wire error.
+	if err != nil && !errors.Is(err, errLimitReached) {
 		if errors.Is(err, errFullTableCapExceeded) {
 			return nil, mysql.NewError(mysql.ER_TOO_BIG_SELECT, fmt.Sprintf(
-				"resolve %s: %s.%s at %s would return more than %d rows; narrow the AS OF range or filter by PK",
-				q.Type, q.Schema, q.Table, q.AsOf.Format("2006-01-02 15:04:05"), rowCap,
+				"resolve %s: %s.%s at %s would return more than %d rows; add a LIMIT (e.g. LIMIT %d) to browse, narrow the AS OF range or filter by PK",
+				q.Type, q.Schema, q.Table, q.AsOf.Format("2006-01-02 15:04:05"), rowCap, rowCap,
 			))
 		}
 		return nil, err
 	}
 
 	return h.fullTableResult(q, images)
+}
+
+// streamSnapshotFullTable streams a full-table _snapshot resultset row-by-row
+// over the bound connection (#998), lifting the FullTableRowCap for the
+// baseline-merge path. It projects every merged row onto cols — a FIXED column
+// set decided before the first row (the streaming header must be written before
+// any row is seen): the user's explicit projection when given (verbatim, like
+// imagesToResultVerbatim), else the table's newest-snapshot order. Keys missing
+// from a row render as NULL.
+//
+// SELECT * caveat: for the newest-snapshot column set, a column dropped between
+// AS OF and now (present in a row image but absent from the current snapshot —
+// the #600 case) is NOT surfaced on the streaming path, because the fixed set
+// can't append per-row image-only keys the way the buffered fullTableColumns
+// does; a LIMIT'd (buffered) SELECT * still surfaces it. An explicit projection
+// is unaffected — imagesToResultVerbatim never appends image-only keys either.
+//
+// Errors: reconstruct.SnapshotFullTableImages runs its TOAST / PK-changing-
+// UPDATE guards before materialising the baseline and emits nothing until the
+// merge starts, so a setup failure returns before any wire write (a clean
+// first-packet ERR). A failure once rows are already on the wire returns an
+// error that go-mysql renders as an ERR packet mid-resultset — the client sees
+// no terminating EOF and reads it as an unambiguous failure (see streamWriter).
+func (h *Handler) streamSnapshotFullTable(ctx context.Context, q TimeTravelQuery, input reconstruct.SnapshotFullTableInput, cols []string) (*mysql.Result, error) {
+	sw := newStreamWriter(h.conn, cols)
+	cells := make([]any, len(cols)) // reused per row; writeRow encodes synchronously
+
+	// SELECT * degrades LOUDLY, not silently, for the #600 dropped-column case.
+	// The streamed header is fixed before the first row, so — unlike the buffered
+	// fullTableColumns — it can't append a per-row image-only key (a column
+	// present at AS OF but dropped from the current schema since). Rather than
+	// omit it silently (the shim Warns before degrading everywhere else —
+	// fullTableTextCell, tableMetaFor), Warn ONCE per query naming the column and
+	// pointing at the LIMIT'd buffered path that surfaces it. Only for SELECT *; a
+	// verbatim projection (q.Columns != nil) intentionally excludes unrequested
+	// columns. A full union header would need the baseline Parquet schema up
+	// front, i.e. a second full materialization of an S3 baseline — deferred.
+	var known map[string]struct{}
+	if q.Columns == nil {
+		known = make(map[string]struct{}, len(cols))
+		for _, c := range cols {
+			known[c] = struct{}{}
+		}
+	}
+	warnedDrop := false
+
+	err := reconstruct.SnapshotFullTableImages(ctx, input, func(rowMap map[string]any) error {
+		if known != nil && !warnedDrop {
+			for k := range rowMap {
+				if _, ok := known[k]; !ok {
+					h.logger.Warn("shim: streaming full-table _snapshot SELECT * omits a column present at AS OF but dropped from the current schema (the streamed column set is fixed before the first row) — re-run with a LIMIT to use the buffered path that surfaces it",
+						"schema", q.Schema, "table", q.Table, "omitted_column", k)
+					warnedDrop = true
+					break
+				}
+			}
+		}
+		for i, c := range cols {
+			v, cerr := h.projectCell(q.Schema, q.Table, c, rowMap[c])
+			if cerr != nil {
+				return cerr
+			}
+			cells[i] = v
+		}
+		return sw.writeRow(cells)
+	})
+	if err != nil {
+		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
+	}
+	return sw.finish()
 }
 
 // pkColumnMetas returns the primary-key column metas of schema.table from its
@@ -540,9 +660,12 @@ func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, erro
 		// Refusing beats serving the marker's JSON as the column value.
 		return nil, err
 	}
-	if state == nil {
-		// Either the row never existed at AsOf (no baseline image and no
-		// INSERT in the window) or its latest event was a DELETE.
+	if len(state) == 0 {
+		// Either the row never existed at AsOf (no baseline image and no INSERT
+		// in the window) or its latest event was a DELETE. A non-DELETE tail that
+		// folds to empty is a corrupt/partial row image — surfaced as a Warn, not
+		// silently (mirrors runPointInTime).
+		h.warnCorruptImageDrop(q.Schema, q.Table, rows)
 		return emptyResult(), nil
 	}
 
