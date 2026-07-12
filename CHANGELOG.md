@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.1] - 2026-07-12
+
+### Fixed
+- **Single-row `_snapshot` now folds the baseline for PostgreSQL sources** (#1006). The shim's single-row `_snapshot` — and the embedded `bintrail-console watch --flashback-listen` port (#996), which routes through the same code — silently degraded to the binlog-only `_flashback` path for **every** PostgreSQL source: the PK-type gate rejected PG's empty `schema_snapshots.data_type` (PG records `pg_type_oid`, not a MySQL type token), so a row present in a baseline but never touched within the retained binlog window resolved to zero rows and the baseline fold never ran. The gate now bypasses for a confirmed `postgres` source flavor, mirroring the offline `reconstruct` path — PG baselines store raw pgoutput text, so `ReadBaselineRow`'s bound `pkColumn = ?` is a string-identity match that can only recover the right row or find nothing, never a wrong row. When a PG source's flavor cannot be confirmed, the degrade log now names that as the cause instead of blaming the (empty) PK type. CLI `reconstruct` and the console `/api/reconstruct` endpoint were unaffected; full-table `_snapshot` for PG continues to fail loud (out of GA scope). Validated end-to-end against RDS PostgreSQL 16.14.
+
 ## [0.31.0] - 2026-07-11
 
 ### Added
