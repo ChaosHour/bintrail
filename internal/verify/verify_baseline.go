@@ -24,6 +24,67 @@ type BaselineConfig struct {
 	IndexDBName    string
 	NoArchive      bool
 	ArchiveFetcher query.ArchiveFetcher
+	// SourceFlavor is the index's source family (query.SourceFlavor: "postgres"
+	// selects the PG path — LSN anchor, text-identity PK, time-bounded delta
+	// window; "" / "mysql" / "mariadb" keep the MySQL path). Set once per run by
+	// the caller from the index, never the registry field — the index is truth.
+	SourceFlavor string
+}
+
+// flavorPostgres is the stream_state.flavor value for a PostgreSQL-source index
+// (matches internal/query.SourceFlavor). Verify keys its PG branches on the
+// index-read flavor, not the console registry field — the index is authoritative.
+const flavorPostgres = "postgres"
+
+// ResolverFor picks the schema resolver for the index's source flavor. A PG index
+// stores one relation per snapshot_id (#603 / WritePGSnapshot), so
+// metadata.NewResolver(db, 0) would resolve only the newest relation and every
+// other table would StatusError; the per-table resolver folds each relation's own
+// MAX snapshot_id into one whole-schema view. MySQL keeps the latest-snapshot
+// resolver. This is the #1018-wide resolver seam — any console reconstruct
+// surface for PG hits the same one-table-per-id trap.
+func ResolverFor(db *sql.DB) (*metadata.Resolver, error) {
+	if query.SourceFlavor(db) == flavorPostgres {
+		return metadata.NewLatestPerTableResolver(db)
+	}
+	return metadata.NewResolver(db, 0)
+}
+
+// anchorLabel renders the human anchor string for a result: an LSN for a
+// PostgreSQL baseline, the binlog file:pos for MySQL.
+func anchorLabel(pg bool, p BaselinePair) string {
+	if pg {
+		return fmt.Sprintf("LSN:%d", p.NewLSN)
+	}
+	return fmt.Sprintf("%s:%d", p.NewAnchor.File, p.NewAnchor.Pos)
+}
+
+// baselineFetchOptions builds the delta-window query for reconstructing the
+// previous baseline forward to the new one. The window is ALWAYS time-bounded
+// (Since/Until on event_timestamp). MySQL additionally pins the exact binlog-
+// position cut — UntilPos at the new anchor, SincePos at the prev anchor when it
+// recorded one (#797). PostgreSQL does NOT: its events carry a non-monotonic
+// "X/Y" LSN in binlog_file that the length-lexicographic position filter cannot
+// bound correctly, so a PG window is time-bounded only (accepting the (prev,new]
+// boundary drift the live-source path documents; a numeric-LSN position filter
+// is a deferred refinement, #1022). "PG never sets a position bound" is the
+// load-bearing correctness invariant — kept in ONE place, shared by
+// VerifyBaselinePair and ExplainBaselinePairMismatch.
+func baselineFetchOptions(p BaselinePair, pg bool) query.Options {
+	opts := query.Options{
+		Schema:     p.Schema,
+		Table:      p.Table,
+		Since:      &p.PrevSnapshot,
+		Until:      &p.NewSnapshot,
+		LimitPerPK: 1,
+	}
+	if !pg {
+		opts.UntilPos = &p.NewAnchor
+		if p.PrevAnchor.File != "" && p.PrevAnchor.Pos != 0 {
+			opts.SincePos = &p.PrevAnchor
+		}
+	}
+	return opts
 }
 
 // BaselinePair is one table's previous + new baseline, with the new baseline's
@@ -41,6 +102,11 @@ type BaselinePair struct {
 	// previous baseline predates position recording; callers must check before
 	// using it as a query.Options.SincePos, same convention as NewAnchor.
 	PrevAnchor query.BinlogPos
+	// NewLSN / PrevLSN are the PostgreSQL WAL LSN anchors (baseline.MetaKeyLSN)
+	// of the new and previous baselines — the PG equivalent of NewAnchor/
+	// PrevAnchor. 0 = a MySQL baseline or a pre-#593 PG baseline (no LSN).
+	NewLSN  uint64
+	PrevLSN uint64
 }
 
 // VerifyBaselinePair proves, drift-free, that the recovery chain reproduces a
@@ -54,8 +120,8 @@ type BaselinePair struct {
 // not taken from #633's persisted value). Neither side reads the live source, so
 // there is no snapshot drift, no off-peak requirement, and no production impact.
 func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair) (TableResult, error) {
-	res := TableResult{Schema: p.Schema, Table: p.Table,
-		Anchor: fmt.Sprintf("%s:%d", p.NewAnchor.File, p.NewAnchor.Pos)}
+	pg := cfg.SourceFlavor == flavorPostgres
+	res := TableResult{Schema: p.Schema, Table: p.Table, Anchor: anchorLabel(pg, p)}
 
 	tm, err := cfg.Resolver.Resolve(p.Schema, p.Table)
 	if err != nil {
@@ -65,17 +131,28 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 	if len(pkCols) == 0 {
 		return inconclusive(res, "table has no primary key"), nil
 	}
-	for _, c := range pkCols {
-		if !reconstruct.SupportedPKType(c.DataType) {
-			return inconclusive(res, fmt.Sprintf("primary-key column %q has type %q unsupported by the baseline canonicalizer", c.Name, c.DataType)), nil
+	// MySQL's PK canonicalizer only handles a known type surface. PostgreSQL
+	// stores every PK column as raw text on BOTH the baseline (COPY text) and
+	// delta (pgoutput text) sides, so the match is string-identity — the
+	// canonicalizer, and this type gate, are bypassed. A genuinely unhandled PG
+	// type is #1009's message concern, not a false inconclusive here.
+	if !pg {
+		for _, c := range pkCols {
+			if !reconstruct.SupportedPKType(c.DataType) {
+				return inconclusive(res, fmt.Sprintf("primary-key column %q has type %q unsupported by the baseline canonicalizer", c.Name, c.DataType)), nil
+			}
 		}
 	}
-	// A real baseline anchor is never at binlog position 0; an empty file or a
-	// zero position means the anchor wasn't recorded (pre-#633) or its metadata
-	// is corrupt (the reader keeps the file but zeroes an unparseable position).
-	// Bounding the reconstruction at position 0 would cut it short and could pass
-	// a window that touched no rows as a (false) match — refuse instead.
-	if p.NewAnchor.File == "" || p.NewAnchor.Pos == 0 {
+	// The reconstruction is bounded at the new baseline's exact anchor. MySQL
+	// uses the binlog file:pos; PostgreSQL uses the slot consistent-point LSN
+	// (MetaKeyLSN). A zero anchor means it was never recorded (pre-#633 MySQL /
+	// pre-#593 PG) or is corrupt — refuse rather than pass a too-short window as
+	// a false match.
+	if pg {
+		if p.NewLSN == 0 {
+			return inconclusive(res, "new PostgreSQL baseline has no usable LSN anchor; cannot bound the reconstruction"), nil
+		}
+	} else if p.NewAnchor.File == "" || p.NewAnchor.Pos == 0 {
 		return inconclusive(res, "new baseline has no usable binlog anchor (missing or zero position); cannot bound the reconstruction"), nil
 	}
 	if !p.PrevSnapshot.Before(p.NewSnapshot) {
@@ -120,17 +197,7 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 	// lower-bound artifact. A reported MATCH is unaffected either way (a too-wide
 	// lower bound can only add a superseded older event, never drop a real one).
 	engine := query.New(cfg.IndexDB)
-	fetchOpts := query.Options{
-		Schema:     p.Schema,
-		Table:      p.Table,
-		Since:      &p.PrevSnapshot,
-		Until:      &p.NewSnapshot, // coarse time bound: partition pruning + gap planner
-		UntilPos:   &p.NewAnchor,   // exact cut at the new baseline's binlog point
-		LimitPerPK: 1,
-	}
-	if p.PrevAnchor.File != "" && p.PrevAnchor.Pos != 0 {
-		fetchOpts.SincePos = &p.PrevAnchor
-	}
+	fetchOpts := baselineFetchOptions(p, pg)
 	rows, _, err := query.FetchMerged(ctx, cfg.IndexDB, engine, query.FetchMergedOptions{
 		Opts:           fetchOpts,
 		DBName:         cfg.IndexDBName,
@@ -173,12 +240,12 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 	// way on both sides closes the false-mismatch gap a TEXT/JSON column's
 	// event-image round-trip can otherwise open (see its doc comment) without
 	// risking the live-source comparison, which this function is not used for.
-	reconDigest, reconCount, err := reconstructDigest(ctx, p.PrevPath, p.Schema, p.Table, pkCols, changes, rows, orderedCols, renderCellNormalized)
+	reconDigest, reconCount, err := reconstructDigest(ctx, p.PrevPath, p.Schema, p.Table, pkCols, changes, rows, orderedCols, pg, renderCellNormalized)
 	if err != nil {
 		return res, fmt.Errorf("reconstruct prev %s.%s: %w", p.Schema, p.Table, err)
 	}
 	// Truth side: the new baseline as-is (no events), via the same path.
-	newDigest, newCount, err := reconstructDigest(ctx, p.NewPath, p.Schema, p.Table, pkCols, map[string]*query.ResultRow{}, nil, orderedCols, renderCellNormalized)
+	newDigest, newCount, err := reconstructDigest(ctx, p.NewPath, p.Schema, p.Table, pkCols, map[string]*query.ResultRow{}, nil, orderedCols, pg, renderCellNormalized)
 	if err != nil {
 		return res, fmt.Errorf("read new baseline %s.%s: %w", p.Schema, p.Table, err)
 	}
@@ -315,6 +382,8 @@ func FindBaselinePair(ctx context.Context, source string) (pairs []BaselinePair,
 			NewSnapshot:  tNew,
 			NewAnchor:    query.BinlogPos{File: meta.BinlogFile, Pos: uint64(meta.BinlogPos)},
 			PrevAnchor:   query.BinlogPos{File: prevMeta.BinlogFile, Pos: uint64(prevMeta.BinlogPos)},
+			NewLSN:       meta.LSN,
+			PrevLSN:      prevMeta.LSN,
 		})
 	}
 	// Symmetric to unpaired: tables in the prev snapshot the new one no longer
