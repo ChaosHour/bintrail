@@ -2,7 +2,7 @@
 
 <img src="docs/img/dbtrail _ header.png" alt="dbtrail — the open-source time-travel flashback for MySQL. Every change leaves a trail: follow it back." width="100%">
 
-**Point-in-time recovery for MySQL — no locks, no schema changes, no waiting for a restore.**
+**Point-in-time recovery for MySQL and PostgreSQL --- no locks, no schema changes, no waiting for a restore.**
 
 [![Release](https://img.shields.io/github/v/release/dbtrail/dbtrail)](https://github.com/dbtrail/dbtrail/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
@@ -12,7 +12,7 @@
 SELECT * FROM orders WHERE id = 123 AS OF '2026-05-20 14:00:00'
 ```
 
-*— against production MySQL. That's the experience dbtrail makes possible.*
+*— against production MySQL/Postgres. That's the experience dbtrail makes possible.*
 
 <img src="docs/img/console-overview.png" alt="dbtrail console: what changed recently and where — every row change indexed, deletes surfaced first" width="850">
 
@@ -22,7 +22,7 @@ SELECT * FROM orders WHERE id = 123 AS OF '2026-05-20 14:00:00'
 
 ## What you get
 
-dbtrail tails the MySQL binary log and keeps every row change with full
+dbtrail tails the MySQL binary log or the Postgres WAL and keeps every row change with full
 before/after images in a searchable index:
 
 - **See every change** — what changed and when, for every row, with before → after diffs
