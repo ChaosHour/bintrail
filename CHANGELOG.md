@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-07-16
+
 ### Added
 - **Extension seams for embedding distributions** (#1029): the exported `indexquery` package (a read-plane facade over the index — query/merge/format/connect/schema helpers), `cliapp.AddCommands` (register extra top-level commands before `cliapp.Main`), and the `ext` registries `ext.RegisterSourceJob` (daemon-scoped source jobs, run at `up`'s wiring point), `ext.RegisterDoctorCheck` (extra preflight checks appended to `doctor` and `up`'s preflight), and `ext.RegisterAgentCommand` (agent WebSocket commands consulted for non-builtin types). All no-ops in the stock binary; same startup-only contract as the existing `ext` setters.
 
