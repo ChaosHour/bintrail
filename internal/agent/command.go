@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/forensics"
 )
 
@@ -232,8 +233,12 @@ func forensicsAttributionGate(cmdType string) string {
 }
 
 // dispatch routes a Command to the appropriate Handler method and returns
-// the Response to send back.
-func dispatch(ctx context.Context, h Handler, cmd Command) Response {
+// the Response to send back. A command type with no builtin case is looked
+// up in the extension registry (ext.RegisterAgentCommand) — builtin types
+// always win — and only fails as unknown when the registry has no handler
+// either. deps carries the connection handles registry handlers receive;
+// the zero value is fine when nothing is registered.
+func dispatch(ctx context.Context, h Handler, cmd Command, deps ext.AgentDeps) Response {
 	resp := Response{ID: cmd.ID, Type: cmd.Type}
 
 	// Entitlement gate for the forensics attribution family (#701 D1) —
@@ -341,7 +346,52 @@ func dispatch(ctx context.Context, h Handler, cmd Command) Response {
 		resp.Data = result
 
 	default:
+		if handler, ok := ext.LookupAgentCommand(cmd.Type); ok {
+			return runExtCommand(ctx, handler, cmd, deps)
+		}
 		resp.Error = fmt.Sprintf("unknown command type %q", cmd.Type)
 	}
+	return resp
+}
+
+// runExtCommand invokes an extension-registered command handler with two
+// containment layers the builtin cases don't need:
+//
+//   - Panic containment: a registry handler is externally-registered code
+//     reachable by a remote command. A panic must degrade to a per-command
+//     error response and a normal return — never kill the agent process
+//     (the in-memory BYOS buffer dies with it).
+//   - Response pre-marshaling: the handler's result is marshalled HERE, so a
+//     value json.Marshal rejects (NaN, channel, cyclic structure, ...)
+//     becomes a per-command error on the wire instead of failing later in
+//     writeJSON — which would tear down the connection and enter a reconnect
+//     loop that dies the same way on every redelivery. Response.Data carries
+//     the pre-marshalled bytes as json.RawMessage; the envelope marshal
+//     splices them verbatim, so writeJSON can no longer fail on handler
+//     output.
+func runExtCommand(ctx context.Context, handler ext.AgentCommandFunc, cmd Command, deps ext.AgentDeps) (resp Response) {
+	resp = Response{ID: cmd.ID, Type: cmd.Type}
+	defer func() {
+		if p := recover(); p != nil {
+			resp.Data = nil
+			resp.Error = fmt.Sprintf("command handler for %q panicked: %v", cmd.Type, p)
+		}
+	}()
+	result, err := handler(ctx, deps, cmd.Data)
+	if err != nil {
+		resp.Error = err.Error()
+		return resp
+	}
+	if result == nil {
+		// (nil, nil) is a valid empty success: the response omits the data
+		// field entirely, indistinguishable on the wire from "no data".
+		return resp
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		resp.Error = fmt.Sprintf("marshal response for %q: %v", cmd.Type, err)
+		return resp
+	}
+	resp.Data = json.RawMessage(data)
 	return resp
 }

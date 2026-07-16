@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/doctor"
 	"github.com/dbtrail/dbtrail/internal/forensics"
@@ -124,6 +125,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 		// there is still room). Standalone `doctor` keeps full FAIL
 		// semantics for CI.
 		preflight := doctor.Build(cmd.Context(), upSourceDSN, upIndexDSN, upSchemas, upRotationCfg.Retain)
+		appendExtDoctorChecks(cmd.Context(), preflight, upSourceDSN, upIndexDSN)
 		if err := preflight.Write(os.Stderr, "text"); err != nil {
 			return fmt.Errorf("write preflight report: %w", err)
 		}
@@ -218,6 +220,15 @@ func runUpStream(cmd *cobra.Command, args []string) error {
 			Retention: upAttributionRetention,
 		})
 	}
+	// Extension source jobs (ext.RegisterSourceJob) share the same lifecycle
+	// and contract as rotation and the poller above: secondary daemon-scoped
+	// work that must never be fatal to the stream. No-op in the stock binary.
+	// Flavor is the value the stream below actually runs with: `up` has no
+	// --source-flavor flag of its own, so strmFlavor holds streamCmd's default
+	// ("mysql") or the BINTRAIL_SOURCE_FLAVOR override, which bindCommandEnv
+	// (streamCmd) applied at flag-binding time; populateStreamFlags above
+	// deliberately leaves it untouched.
+	ext.RunSourceJobs(rotCtx, ext.SourceJobInfo{SourceDSN: upSourceDSN, IndexDSN: upIndexDSN, Flavor: strmFlavor})
 	return runStream(cmd, args)
 }
 
