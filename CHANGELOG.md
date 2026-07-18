@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-07-17
+
+### Added
+- **The web console now serves MCP at `/mcp`** (#1042, epic #1038): the four read-only tools (`query`, `recover`, `status`, `list_schema_changes`) over Streamable HTTP, authenticated with the console's static access token (`Authorization: Bearer`, constant-time compare; the endpoint refuses with an actionable error when no token is configured — password login is a browser credential and cannot authenticate an MCP client). Per-server routing by URL path: `/mcp` targets the console's default server, `/mcp/{id-or-name}` a specific registry entry (`default` = the command-line entry). The endpoint carries the console's read boundary — the same result caps as the console API (1,000 events / 10,000 recover statements), the per-server no-archive posture, RBAC-aware redaction of captured statement text, and rejection of the `index_dsn`/`profile` tool parameters (connection routing and the RBAC posture belong to the console, not the caller). Works on standalone `serve` and on `watch`. The tool handlers moved to a shared internal package (`internal/mcptools`); the standalone `bintrail-mcp` binary's behavior is unchanged.
+- **`bintrail-mcp --connect <url> [--token <t>]`: a stdio↔Streamable-HTTP bridge** (#1044). The process runs as a local stdio MCP server — what Claude Desktop launches — and forwards every request to a remote bintrail MCP endpoint (the console `/mcp`, or a `bintrail-mcp --http` server). The remote's tools are mirrored verbatim (schemas, descriptions, annotations) and re-synced on `tools/list_changed`, so the bridge never drifts from the server it fronts; the token is scoped to the configured endpoint's host so a cross-host redirect never receives it. Unreachable endpoints and rejected tokens produce a fast, one-line non-zero exit (surfaced in Claude Desktop's MCP logs) instead of a silent hang.
+- **`.mcpb` bundles in releases: one-click Claude Desktop install** (#1044). Each release publishes MCP Bundle artifacts (`dbtrail-<os>-<arch>.mcpb`) that Claude Desktop installs on double-click, prompting for exactly two values — the console/MCP endpoint URL and the access token (stored as a sensitive value) — and running the bundled `bintrail-mcp` in bridge mode. No JSON editing, no DSN on the client. Bundles cover the release build matrix (Linux amd64/arm64); `make mcpb` builds a host-native bundle on other platforms.
+- **Console "Connect AI" settings page** (#1046): assembles the MCP hookup for the selected server — the ready-to-copy `/mcp` URL (per-server form when several servers are registered), the `.mcpb` bundle download matching the running version (releases-page fallback on unversioned builds), and a raw-config snippet for other stdio MCP clients. Availability keys on a new `capabilities.mcp` flag (static token configured); without a token the page explains how to enable it instead of showing a URL that would only answer 403. The token value is never rendered. The page is available on both `serve` and `watch`; Storage/Rotation stay watch-only.
+
+### Documentation
+- New [Connect an AI assistant](docs/connect-ai.md) guide (#1047): the console-first 5-minute walkthrough — token, Connect AI page, bundle install — with a symptom-first troubleshooting table and the MCP surface's security model. README and the MCP reference lead with it.
+
 ## [0.38.0] - 2026-07-17
 
 ### Added
