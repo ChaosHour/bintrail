@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.1] - 2026-07-18
+
+### Added
+- **Privacy policy** (#1048): `PRIVACY.md` documents the Claude Desktop extension's data handling — the bundle is a local bridge that connects only to the user-configured endpoint, the token lives in the OS credential store, and the project collects nothing (no telemetry). Linked from the README and declared in the `.mcpb` manifest (`privacy_policies`), as required for Claude Connectors Directory listing of local extensions. `.mcpb` release assets now cover macOS too (`dbtrail-darwin-{arm64,amd64}.mcpb`, built natively per release since v0.39.0's post-release assets).
+
 ## [0.39.0] - 2026-07-17
 
 ### Added
