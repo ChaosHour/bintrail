@@ -106,6 +106,13 @@ type Config struct {
 	// DefaultAuthPath(). A missing file means password login is not
 	// configured; a corrupt one fails New loudly.
 	AuthPath string
+	// MCPTokenPath locates the managed MCP token file (SHA-256 only, written
+	// by the Settings → Connect AI generate flow — #1052). Empty means
+	// DefaultMCPTokenPath(). A missing file means no managed token; a corrupt
+	// one is logged loudly and disables the managed token until regenerated —
+	// unlike AuthPath, it deliberately never fails New (the daemon may be the
+	// stream supervisor).
+	MCPTokenPath string
 	// TLSCert / TLSKey serve the console over HTTPS (both-or-neither). Static
 	// files only — rotation is a restart; ACME is out of scope.
 	TLSCert string
@@ -182,6 +189,11 @@ type Server struct {
 	sessions     *sessionStore
 	loginLimiter *loginLimiter
 	tlsConf      *tls.Config
+	// Managed MCP token (#1052): mcpTokenPath is the on-disk hash file;
+	// managedTok is the live credential, swapped in place by the
+	// generate/rotate/revoke handlers so changes apply without a restart.
+	mcpTokenPath string
+	managedTok   managedMCPToken
 }
 
 // serverHeader selects the target server per request. Selection is stateless —
@@ -217,6 +229,25 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	passwordCfg := authFile != nil
+
+	// Managed MCP token (#1052): an /mcp-ONLY credential minted from the UI.
+	// Missing file = the normal not-configured state; an unreadable file is
+	// logged loudly but never blocks startup — this daemon may be the stream
+	// supervisor, and capture must not die over a UI-convenience credential
+	// (regenerating from Settings → Connect AI overwrites the bad file). It
+	// deliberately plays no part in the bind/setup policy below and is NOT
+	// accepted by tokenMiddleware: its advertised scope is the read-only MCP
+	// tools, so it must not unlock the browser API (registry CRUD, monitor
+	// verbs, its own rotation).
+	mcpTokenPath := cfg.MCPTokenPath
+	if mcpTokenPath == "" {
+		mcpTokenPath = DefaultMCPTokenPath()
+	}
+	mcpTokFile, err := LoadMCPTokenFile(mcpTokenPath)
+	if err != nil {
+		slog.Error("console: MCP token file unreadable; managed MCP token disabled until regenerated from Settings → Connect AI", "path", mcpTokenPath, "error", err)
+		mcpTokFile = nil
+	}
 
 	// Bind/credential policy. Password login is the primary path; the static
 	// token is an opt-in automation credential (set explicitly, never
@@ -305,7 +336,9 @@ func New(cfg Config) (*Server, error) {
 		sessions:         newSessionStore(),
 		loginLimiter:     newLoginLimiter(),
 		tlsConf:          tlsConf,
+		mcpTokenPath:     mcpTokenPath,
 	}
+	s.managedTok.initFromDisk(mcpTokenPath, mcpTokFile)
 	s.cm.hideBoot = cfg.HideBoot
 
 	// Seed the ephemeral boot bundle when the caller supplied a command-line
@@ -420,6 +453,12 @@ func (s *Server) buildHandler() http.Handler {
 	// keeps them under the tokenMiddleware-wrapped /api/ catch-all).
 	api.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	api.HandleFunc("POST /api/auth/password", s.handlePasswordChange)
+	// Managed MCP token (#1052): status / generate-or-rotate / revoke, all
+	// behind the same credential as every /api route. Values never serialize
+	// except the one-time plaintext in the generate response.
+	api.HandleFunc("GET /api/mcp-token", s.handleMCPTokenGet)
+	api.HandleFunc("POST /api/mcp-token", s.handleMCPTokenGenerate)
+	api.HandleFunc("DELETE /api/mcp-token", s.handleMCPTokenRevoke)
 
 	root := http.NewServeMux()
 	root.HandleFunc("GET /api/healthz", s.handleHealthz) // unauthenticated liveness
@@ -459,9 +498,10 @@ func (s *Server) buildHandler() http.Handler {
 	}
 	root.Handle("/api/", s.tokenMiddleware(api)) // credential on all other /api/*
 	// MCP endpoint (#1039): the four read-only tools over Streamable HTTP,
-	// static-token-authenticated, routed per server by URL path. Carries its
-	// own auth check (token-only — see mcp.go) instead of tokenMiddleware,
-	// and sits on root so it inherits hostGuard + securityHeaders.
+	// token-authenticated (static or UI-managed — #1052), routed per server
+	// by URL path. Carries its own auth check (tokens only, no sessions —
+	// see mcp.go) instead of tokenMiddleware, and sits on root so it
+	// inherits hostGuard + securityHeaders.
 	mcpH := s.mcpHandler()
 	root.Handle("/mcp", mcpH)
 	root.Handle("/mcp/{server}", mcpH)
@@ -473,7 +513,8 @@ func (s *Server) buildHandler() http.Handler {
 // Handler returns the fully assembled HTTP handler. Exposed for tests.
 func (s *Server) Handler() http.Handler { return s.mux }
 
-// Token returns the active access token (supplied or generated). Empty in
+// Token returns the static automation token — never the UI-managed MCP
+// token (the flashback port depends on that distinction). Empty in
 // password-only mode.
 func (s *Server) Token() string { return s.token }
 

@@ -21,11 +21,15 @@ import (
 // in the URL path — mirroring how the flashback port routes by connection
 // username — instead of the X-Bintrail-Server header the browser API uses.
 //
-// Auth: the static console token as a Bearer credential, compared in constant
-// time. Like the flashback port, the endpoint requires a token to be
-// CONFIGURED — login sessions are a browser credential and the bcrypt
-// password store cannot authenticate a headless MCP client — so under
-// password-only or no auth the endpoint refuses with an actionable error.
+// Auth: a console token as a Bearer credential, compared in constant time —
+// either the static --token / BINTRAIL_CONSOLE_TOKEN or the UI-managed MCP
+// token (#1052). The managed token authenticates HERE ONLY: its advertised
+// scope is the read-only MCP tools, so tokenMiddleware does not accept it and
+// it cannot drive the browser API. Like the flashback port, the endpoint
+// requires a token to be CONFIGURED — login sessions are a browser credential
+// and the bcrypt password store cannot authenticate a headless MCP client —
+// so under password-only or no auth the endpoint refuses with an actionable
+// error.
 // The host-header allowlist and security headers apply like every route
 // (the handler is mounted on the guarded root mux).
 //
@@ -48,17 +52,19 @@ func (s *Server) mcpHandler() http.Handler {
 		nil,
 	)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.token == "" {
-			// Mirror the flashback-port precedent: no static token configured
-			// means MCP clients have no credential that could authenticate
-			// them — refuse with the remediation, never serve open.
+		if s.token == "" && !s.managedTok.configured() {
+			// Mirror the flashback-port precedent: no token configured means
+			// MCP clients have no credential that could authenticate them —
+			// refuse with the remediation, never serve open.
 			writeJSONError(w, http.StatusForbidden,
-				"the MCP endpoint requires a static console token: start with --token / BINTRAIL_CONSOLE_TOKEN "+
+				"the MCP endpoint requires a console token: generate one in Settings → Connect AI, "+
+					"or start with --token / BINTRAIL_CONSOLE_TOKEN "+
 					"(password login is a browser credential and cannot authenticate MCP clients)")
 			return
 		}
 		got := bearerToken(r)
-		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) != 1 {
+		staticOK := got != "" && s.token != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1
+		if !staticOK && !s.managedTok.matches(got) {
 			writeJSONError(w, http.StatusUnauthorized, "unauthorized: missing or invalid token")
 			return
 		}
