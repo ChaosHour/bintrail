@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.39.1] - 2026-07-18
+## [0.40.0] - 2026-07-18
+
+### Added
+- **UI-managed MCP access token — generate, rotate, and revoke from Settings → Connect AI** (#1053, closes #1052): a fresh install now needs zero out-of-UI configuration to connect an AI client. The Connect AI page grows an **Access token** card: **Generate** mints a cryptographically random `bmt_`-prefixed token from an authenticated browser session and shows the plaintext exactly once (it is never stored — only its SHA-256 is persisted, in `~/.config/bintrail/console-mcp-token.yaml`, `0600`, atomic write, versioned envelope with the registry's read-only-if-newer contract); **Rotate**/**Revoke** apply immediately, with no restart, including to sibling console processes sharing the file (every check re-reads it, so a revoke that reports success actually revokes everywhere). The managed token is **scoped to `/mcp` alone** — it authenticates the read-only MCP tools and nothing else (not the browser API, not server registry CRUD, not its own rotation), so handing it to an AI client grants exactly what the UI says it grants. `--token` / `BINTRAIL_CONSOLE_TOKEN` keep working unchanged and are reported as environment-owned; the flashback MySQL-protocol port still requires the static token (a hash-only store cannot drive `mysql_native_password`). New `GET/POST/DELETE /api/mcp-token` endpoints (values never serialized; the plaintext appears only in the generate response). A corrupt or newer-version token file never blocks daemon startup — the managed token degrades with a loud log and the Generate button self-heals malformed files, while unreadable ones are refused rather than destroyed.
+
+
 
 ### Added
 - **Privacy policy** (#1048): `PRIVACY.md` documents the Claude Desktop extension's data handling — the bundle is a local bridge that connects only to the user-configured endpoint, the token lives in the OS credential store, and the project collects nothing (no telemetry). Linked from the README and declared in the `.mcpb` manifest (`privacy_policies`), as required for Claude Connectors Directory listing of local extensions. `.mcpb` release assets now cover macOS too (`dbtrail-darwin-{arm64,amd64}.mcpb`, built natively per release since v0.39.0's post-release assets).
