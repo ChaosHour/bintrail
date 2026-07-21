@@ -12,6 +12,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/agent"
 	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/observe"
+	"github.com/dbtrail/dbtrail/internal/telemetry"
 )
 
 var (
@@ -46,6 +47,7 @@ binlog files still existing on disk.`,
 func init() {
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Log level: debug, info, warn, error")
 	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", "text", "Log format: text or json")
+	rootCmd.PersistentFlags().String("telemetry", "", "Usage telemetry: on or off (overrides BINTRAIL_TELEMETRY; DO_NOT_TRACK=1 overrides everything)")
 	// Register the source-agnostic read commands that have moved to internal/cli
 	// (#529) so a future bintrail-pg can register the same set. Today: status.
 	cli.AddReadCommands(rootCmd)
@@ -54,6 +56,10 @@ func init() {
 	// package and self-registered via init(); they moved to internal/cli so both
 	// binaries expose them.
 	cli.AddMaintenanceCommands(rootCmd)
+	// Usage telemetry control surface (status/show/on/off). Registered on every
+	// binary that can report, so `telemetry off` works from whichever one the
+	// operator has on PATH.
+	cli.AddTelemetryCommand(rootCmd)
 }
 
 // AddCommands registers additional top-level commands on the bintrail root
@@ -72,6 +78,7 @@ func AddCommands(cmds ...*cobra.Command) {
 func Main(version, commitSHA, buildDate string) int {
 	Version, CommitSHA, BuildDate = version, commitSHA, buildDate
 	rootCmd.Version = fmt.Sprintf("%s (commit %s, built %s)", Version, CommitSHA, BuildDate)
+	telemetry.SetVersion(version)
 
 	err := rootCmd.Execute()
 	if err == nil {
