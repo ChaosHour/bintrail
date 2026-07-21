@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-07-21
+
+### Added
+- **Opt-out usage telemetry — metadata-only, spool-based, off in one line** (#1054 epic; #1063/#1064/#1066/#1067/#1068/#1069): official release builds report coarse usage statistics — which command ran, `ok`/`error` with a bounded error class, a duration bucket, and minor-truncated version + OS/arch — to help prioritize the roadmap and catch reliability regressions. The wire payload is a **closed 13-field allowlist** (`internal/telemetry`); it never carries rows, schemas, table/column names, DSNs, hostnames, IPs, file paths, GTIDs, binlog positions, flag values, arguments, error strings, or any persistent identifier. `run_id` is ephemeral (per-process, absent from daemon beacons). Disable with `bintrail telemetry off`, `DO_NOT_TRACK=1`, `BINTRAIL_TELEMETRY=off`, or `--telemetry=off` (first that applies wins; `telemetry status` reports which did). New `bintrail telemetry {status,show,on,off}` on all three binaries — `show` prints the exact JSON that would be sent and sends nothing; `off` also discards anything already spooled locally. **No command ever touches the network on its request path**: events append to a local NDJSON spool (`~/.config/bintrail/telemetry-spool/`, `0600`) and are delivered by a later run, drop-on-fail, capped 5 MB/day and 7-day retention, multi-process-safe via claim-by-rename. Long-running daemons (`stream`/`agent`/`up`/`watch`) send at most one beacon per UTC day (first only after an hour, so a crash loop never beacons), off the replication path, disclosed with one WARN line at startup. CI detection and a missing home directory suppress reporting but can never enable it.
+- **Telemetry is inert unless a build is official.** The ingestion endpoint is injected via `-ldflags` and empty by default, so a plain `go build` — and the entire test suite, including the E2E binary — produces a binary with no network path at all; `telemetry status` reports `not compiled in`. This is the one-line assertion a distribution packager can check.
+- **Demo image never reports** (#1063): `ghcr.io/dbtrail/bintrail-demo` hard-disables telemetry in the image and its entrypoint, asserted by the smoke test against every process in the container. Landed before any send code existed.
+- **CI trust guards** (#1061): `internal/telemetry` is proven to link **no** other package in this repository (so it cannot reach the code that knows DSNs, rows, or server identity — a structural guarantee the field allowlist alone cannot give); the request builder is proven to carry no credential; the single root hook is proven un-shadowable on all three binaries; and the MCP server is proven unable to link the telemetry package at all.
+- **`TELEMETRY.md`** (#1062): every field with an example and rationale, the complete never-sent list, spool/delivery mechanics, control precedence, per-surface matrix, cloned-image hazard, ingestion commitments, GDPR Art 13 elements, and the explicit non-goal that telemetry is architecturally incapable of sales or lead-gen use. Anti-drift tests keep the document equal to the wire format.
+
+### Changed
+- **README/PRIVACY privacy wording corrected** (#1069): the README no longer claims "no telemetry, no analytics, no phone-home" (untrue of release builds once #1054 shipped) — it now discloses metadata-only telemetry and the one-line opt-out, and links `TELEMETRY.md`. `PRIVACY.md` clarifies that its "collects nothing" statement is scoped to the Claude Desktop extension, whose MCP bridge is structurally telemetry-free.
+
+**Note:** the telemetry ingestion endpoint is intentionally left unset even in this release, so v0.41.0 binaries **collect and send nothing**. Enabling collection is a separate, later release decision.
+
 ## [0.40.0] - 2026-07-18
 
 ### Added
