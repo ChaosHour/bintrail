@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-07-22
+
 ### Added
 - **Turn usage telemetry off from the web console** (#1577). The Storage page (under `bintrail-console watch`) grows a **Usage telemetry** card showing the current state and a one-click opt-out. Turning it off both persists the machine-wide choice to the consent file (honored by every bintrail process from its next run) **and** stops the running daemon's beacons immediately — no restart — via a new live-consent toggle on the telemetry client (`SetRuntimeConsent`, an atomically-flipped decision). When a higher-precedence control (`DO_NOT_TRACK`, `BINTRAIL_TELEMETRY`, or `--telemetry`) is in charge, the card explains that and leaves the toggle to that control. Writing the consent file is local machine config, not a data write, so the console's read-only-over-data boundary is unchanged. New `GET`/`POST /api/telemetry`.
 
