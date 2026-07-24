@@ -300,7 +300,7 @@ be attributed to a customer, a company, or a person even in principle.
 ## Legal basis and your rights
 
 - **Controller**: dbtrail. Contact via the repository issue tracker or the
-  address published at <https://dbtrail.io>.
+  address published at <https://dbtrail.com>.
 - **Purposes**: deciding what to build next (which commands are actually used)
   and finding reliability problems (which error classes are rising).
 - **Lawful basis**: legitimate interest in maintaining and improving the
