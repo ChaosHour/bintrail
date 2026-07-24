@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 )
@@ -586,5 +587,107 @@ func TestHasReplPrivileges(t *testing.T) {
 				t.Errorf("client = %v, want %v", gotClient, tt.wantClient)
 			}
 		})
+	}
+}
+
+// ─── #1033: corrupt snapshot with duplicated column rows ─────────────────────
+
+// snapshotCols is the column set of NewResolver's schema_snapshots SELECT.
+var snapshotCols = []string{
+	"schema_name", "table_name", "column_name", "ordinal_position",
+	"column_key", "data_type", "column_type",
+	"is_generated", "is_identity_always", "character_set_name",
+}
+
+func TestNewResolver_dedupesIdenticalDuplicateRows(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// Pre-#844 concurrent writers: every column double-inserted verbatim.
+	rows := sqlmock.NewRows(snapshotCols)
+	for range 2 {
+		rows.AddRow("mydb", "wp_options", "option_id", 1, "PRI", "bigint", "bigint unsigned", false, false, "")
+	}
+	for range 2 {
+		rows.AddRow("mydb", "wp_options", "option_name", 2, "", "varchar", "varchar(191)", false, false, "utf8mb4")
+	}
+	for range 2 {
+		rows.AddRow("mydb", "wp_options", "option_value", 3, "", "longtext", "longtext", false, false, "utf8mb4")
+	}
+	for range 2 {
+		rows.AddRow("mydb", "wp_options", "autoload", 4, "", "varchar", "varchar(20)", false, false, "utf8mb4")
+	}
+	mock.ExpectQuery("SELECT schema_name, table_name").WithArgs(12).WillReturnRows(rows)
+	mock.ExpectQuery(`SELECT MIN\(snapshot_time\)`).WithArgs(12).
+		WillReturnRows(sqlmock.NewRows([]string{"MIN(snapshot_time)"}).AddRow(time.Date(2026, 7, 4, 15, 2, 39, 0, time.UTC)))
+
+	r, err := NewResolver(db, 12)
+	if err != nil {
+		t.Fatalf("NewResolver failed: %v", err)
+	}
+	tm, err := r.Resolve("mydb", "wp_options")
+	if err != nil {
+		t.Fatalf("Resolve failed: %v", err)
+	}
+	if len(tm.Columns) != 4 {
+		t.Errorf("expected 4 deduplicated columns, got %d", len(tm.Columns))
+	}
+	if len(tm.PKColumns) != 1 || tm.PKColumns[0] != "option_id" {
+		t.Errorf("expected PKColumns [option_id], got %v", tm.PKColumns)
+	}
+}
+
+func TestNewResolver_conflictingDuplicateRowsFailLoud(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	rows := sqlmock.NewRows(snapshotCols).
+		AddRow("mydb", "orders", "id", 1, "PRI", "int", "int", false, false, "").
+		AddRow("mydb", "orders", "name", 2, "", "varchar", "varchar(50)", false, false, "utf8mb4").
+		AddRow("mydb", "orders", "renamed", 2, "", "varchar", "varchar(50)", false, false, "utf8mb4")
+	mock.ExpectQuery("SELECT schema_name, table_name").WithArgs(13).WillReturnRows(rows)
+	mock.ExpectQuery(`SELECT MIN\(snapshot_time\)`).WithArgs(13).
+		WillReturnRows(sqlmock.NewRows([]string{"MIN(snapshot_time)"}).AddRow(time.Date(2026, 7, 4, 15, 2, 39, 0, time.UTC)))
+
+	_, err = NewResolver(db, 13)
+	if err == nil {
+		t.Fatal("expected error for conflicting duplicate ordinal rows, got nil")
+	}
+	if !strings.Contains(err.Error(), "corrupt") || !strings.Contains(err.Error(), "mydb.orders") {
+		t.Errorf("error should name the corruption and table, got: %v", err)
+	}
+}
+
+func TestNewResolver_sameNameDifferentTypeDuplicateFailsLoud(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// The realistic pre-#844 conflict: two writers straddling a DDL capture
+	// the SAME column name at the same ordinal with different type metadata.
+	// Pins the full-struct comparison — a name-only dedupe would silently
+	// load the wrong signedness/charset.
+	rows := sqlmock.NewRows(snapshotCols).
+		AddRow("mydb", "orders", "id", 1, "PRI", "int", "int", false, false, "").
+		AddRow("mydb", "orders", "qty", 2, "", "int", "int", false, false, "").
+		AddRow("mydb", "orders", "qty", 2, "", "int", "int unsigned", false, false, "")
+	mock.ExpectQuery("SELECT schema_name, table_name").WithArgs(14).WillReturnRows(rows)
+	mock.ExpectQuery(`SELECT MIN\(snapshot_time\)`).WithArgs(14).
+		WillReturnRows(sqlmock.NewRows([]string{"MIN(snapshot_time)"}).AddRow(time.Date(2026, 7, 4, 15, 2, 39, 0, time.UTC)))
+
+	_, err = NewResolver(db, 14)
+	if err == nil {
+		t.Fatal("expected error for same-name different-type duplicate, got nil")
+	}
+	if !strings.Contains(err.Error(), "corrupt") || !strings.Contains(err.Error(), "int unsigned") {
+		t.Errorf("error should name the corruption and the diverging column types, got: %v", err)
 	}
 }
