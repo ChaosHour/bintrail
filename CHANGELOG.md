@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-07-24
+
+### Added
+- **Console authorization denials land on the audit seam; sessions carry the verified identity** (#1092): a console session now records the verified login identity it was minted for (the auth-file username, an external provider's identity, a credential-backend username — display/audit only, never an authorization input). With that in hand, every authorization denial is emitted on the `ext.AuditSink` seam: `authz.denied` (permission and unclassified-route refusals, with actor, method, path, and the missing permission) and `profile.denied` (nonexistent session profile, and each unredactable-surface refusal — time-travel, baseline listings, recover-cascade, verify, extension views — with the gate named). `/api/capabilities` also stops advertising `extension_views` to sessions whose policy lacks `extview:read` (their data routes would 403, so the nav item would be a lie). **The stock binary is unchanged**: with no sink installed `ext.Record` is a no-op, policy-less sessions are never denied, and nil policies see the ext-views listing exactly as before.
+
+### Fixed
+- **`--batch-size ≥ 4096` no longer crash-loops the indexer** (#1090, closes #956): 16 placeholders/row × 4096 rows exceeds MySQL's 65535 prepared-statement parameter cap, so every batch INSERT died with a cryptic Error 1390. Oversized batch sizes are now clamped to the derived maximum (4095) with a startup warning — a daemon with `BINTRAIL_BATCH_SIZE=5000` keeps running.
+- **A corrupt schema snapshot with duplicated column rows no longer halts capture indefinitely** (#1091, closes #1033): pre-#844 indexes can carry snapshots whose columns were double-inserted by concurrent writers; the resolver reported 2× the real column count and the schema-drift guard then skipped 100% of row events (observed: ~2 days of binlog read and discarded). The snapshot loader now dedupes exact duplicates and fails loud on genuine conflicts.
+
 ## [0.44.0] - 2026-07-23
 
 ### Added
