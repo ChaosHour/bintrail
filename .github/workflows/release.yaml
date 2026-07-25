@@ -11,7 +11,268 @@ permissions:
   id-token: write   # cosign keyless signing via OIDC
 
 jobs:
+  # --- Integration matrix, run against the TAGGED ref itself -----------------
+  #
+  # #950: release.yaml used to be gated on unit tests only (`go test ./...`,
+  # no `-tags=integration`, no service containers). The corruption/data-loss
+  # guards live in the integration suite (ci.yml), which only ran on PRs — and
+  # because merges are `--admin` squashes, the post-squash tree that actually
+  # gets tagged may never have been exercised by that matrix. These three jobs
+  # duplicate ci.yml's `integration` / `integration-mariadb-source` /
+  # `integration-postgres-source` jobs (minus the PR-only `changes`-based
+  # path-skip logic, which doesn't apply here — a release always runs the
+  # full matrix regardless of which files changed) and run on the exact commit
+  # the tag points at. The `release` job below `needs:` all three, so a red
+  # integration run blocks GoReleaser from publishing.
+  #
+  # !!! KEEP IN SYNC WITH ci.yml !!!
+  # This is a hand-maintained COPY, not a shared definition (a workflow_call
+  # refactor was evaluated for #950 and rejected: reusable-workflow job names
+  # are reported as "<caller job> / <called job>", which would rename the
+  # `integration (8.0)` / `integration (8.4)` / etc. required-status-check
+  # contexts that branch protection on `main` currently pins by exact string —
+  # only a repo-admin settings change can accommodate that, so it was punted).
+  # Concretely: the readiness probes below MUST use host-TCP + a real query
+  # with 3 consecutive successes (NOT `docker exec ... mysqladmin/mariadb-admin
+  # ping`, which answers over the container's local socket and can return
+  # ready while the real server on the mapped host port is still starting or
+  # mid-restart during first-init — see #949, commit 95bd02e, and the matching
+  # comments in ci.yml's `integration` / `integration-mariadb-source` /
+  # `integration-postgres-source` jobs for the full story). If ci.yml's
+  # integration jobs change (readiness probes, env guards, tripwire test
+  # names, matrix versions), port the change here too.
+  integration-mysql:
+    runs-on: ubuntu-22.04
+    # Job-level permissions override the workflow-level grant (contents:write,
+    # packages:write, id-token:write — needed only by the `release` job's
+    # publish steps). These test jobs only need read access to the tagged ref.
+    permissions:
+      contents: read
+
+    # Two supported cells: the BYO contract floor (8.0) and the bundled index
+    # engine (8.4). fail-fast: false so a regression on one version still
+    # reports the other. Mirrors ci.yml's `integration` job.
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql: ["8.0", "8.4"]
+
+    env:
+      BINTRAIL_TEST_DSN: "root:testroot@tcp(127.0.0.1:13306)"
+      # A MySQL server is guaranteed present in this job, so a dial/ping
+      # failure must FAIL the run, not silently skip (#949). Mirrors
+      # BINTRAIL_REQUIRE_MARIADB / BINTRAIL_REQUIRE_POSTGRES below.
+      BINTRAIL_REQUIRE_MYSQL: "1"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Start MySQL (bintrail-test-mysql, ${{ matrix.mysql }})
+        run: |
+          docker run -d --name bintrail-test-mysql \
+            -e MYSQL_ROOT_PASSWORD=testroot \
+            -p 13306:3306 \
+            mysql:${{ matrix.mysql }} \
+            --binlog-format=ROW \
+            --binlog-row-image=FULL \
+            --log-bin=binlog \
+            --server-id=1
+          echo "Waiting for MySQL to accept connections..."
+          # Host-TCP probe with a real query, 3 consecutive successes — NOT
+          # `docker exec ... mysqladmin ping` (socket-local; can false-ready
+          # against the temporary first-init mysqld). See #949 / ci.yml.
+          consecutive=0
+          for i in $(seq 1 60); do
+            if docker run --rm --network host "mysql:${{ matrix.mysql }}" \
+                 mysql --protocol=TCP -h 127.0.0.1 -P 13306 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
+              consecutive=$((consecutive + 1))
+              if [ "$consecutive" -ge 3 ]; then
+                echo "MySQL is ready (3 consecutive successful probes)."
+                exit 0
+              fi
+            else
+              consecutive=0
+            fi
+            sleep 2
+          done
+          echo "MySQL did not become ready in time" >&2
+          docker logs bintrail-test-mysql >&2 || true
+          exit 1
+
+      # -p 1 serializes package execution — see ci.yml's `integration` job for
+      # the full rationale (shared single binlog, exact-count assertions).
+      # False-green tripwire mirrors ci.yml: assert the flagship end-to-end
+      # and caching_sha2 auth-seam tests genuinely ran (#949).
+      - name: Integration tests (-tags=integration)
+        run: |
+          set -o pipefail
+          go test -tags=integration -race -p 1 -count=1 -v ./... 2>&1 | tee /tmp/mysql-it.out
+          grep -q -- '--- PASS: TestEndToEnd_fullPipeline' /tmp/mysql-it.out \
+            || { echo "FATAL: MySQL end-to-end integration test did not run — false-green tripwire" >&2; exit 1; }
+          grep -q -- '--- PASS: TestCachingSha2ColdAuthSeam' /tmp/mysql-it.out \
+            || { echo "FATAL: caching_sha2 cold-auth seam test did not run — false-green tripwire" >&2; exit 1; }
+
+  integration-mariadb-source:
+    # Mirrors ci.yml's `integration-mariadb-source` job. See that job's
+    # comments for why MariaDB-as-source needs its own job (two containers,
+    # a shared-binlog-window constraint the 8.0/8.4 matrix can't absorb).
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    env:
+      BINTRAIL_TEST_DSN: "root:testroot@tcp(127.0.0.1:13306)"
+      BINTRAIL_TEST_MARIADB_DSN: "root:testroot@tcp(127.0.0.1:13307)"
+      BINTRAIL_REQUIRE_MARIADB: "1"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Start MySQL index (bintrail-test-mysql, 8.4)
+        run: |
+          docker run -d --name bintrail-test-mysql \
+            -e MYSQL_ROOT_PASSWORD=testroot \
+            -p 13306:3306 \
+            mysql:8.4 \
+            --binlog-format=ROW --binlog-row-image=FULL --log-bin=binlog --server-id=1
+          # Host-TCP probe, 3 consecutive successes — see the integration-mysql
+          # job above / #949 for why `docker exec ... mysqladmin ping` races.
+          consecutive=0
+          for i in $(seq 1 60); do
+            if docker run --rm --network host mysql:8.4 \
+                 mysql --protocol=TCP -h 127.0.0.1 -P 13306 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
+              consecutive=$((consecutive + 1))
+              [ "$consecutive" -ge 3 ] && { echo "MySQL index is ready."; exit 0; }
+            else
+              consecutive=0
+            fi
+            sleep 2
+          done
+          echo "MySQL did not become ready in time" >&2
+          docker logs bintrail-test-mysql >&2 || true
+          exit 1
+
+      - name: Start MariaDB source (bintrail-test-mariadb, 11.4)
+        run: |
+          docker run -d --name bintrail-test-mariadb \
+            -e MARIADB_ROOT_PASSWORD=testroot \
+            -p 13307:3306 \
+            mariadb:11.4 \
+            --log-bin=mariadb-bin --binlog-format=ROW --binlog-row-image=FULL \
+            --server-id=2 --gtid-strict-mode=ON
+          # Same socket-vs-TCP readiness race as the MySQL-start step (#949):
+          # host-TCP probe with a real query, 3 consecutive successes.
+          consecutive=0
+          for i in $(seq 1 60); do
+            if docker run --rm --network host mariadb:11.4 \
+                 mariadb --protocol=TCP -h 127.0.0.1 -P 13307 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
+              consecutive=$((consecutive + 1))
+              [ "$consecutive" -ge 3 ] && { echo "MariaDB source is ready."; exit 0; }
+            else
+              consecutive=0
+            fi
+            sleep 2
+          done
+          echo "MariaDB did not become ready in time" >&2
+          docker logs bintrail-test-mariadb >&2 || true
+          exit 1
+
+      - name: MariaDB-source integration tests
+        run: go test -tags=integration -race -p 1 -count=1 -run 'MariaDB|Mariadb|mariadb|Flavor|FourColumns' ./...
+
+  integration-postgres-source:
+    # Mirrors ci.yml's `integration-postgres-source` job.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    # Spans the supported PostgreSQL range: 14 (declared minimum) through 17.
+    # fail-fast: false so a regression on one version still reports the others.
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["14", "15", "16", "17"]
+
+    env:
+      BINTRAIL_TEST_DSN: "root:testroot@tcp(127.0.0.1:13306)"
+      BINTRAIL_TEST_PG_DSN: "postgres://postgres:testpg@127.0.0.1:15432/pgtest?sslmode=disable"
+      BINTRAIL_REQUIRE_POSTGRES: "1"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Start MySQL index (bintrail-test-mysql, 8.4)
+        run: |
+          docker run -d --name bintrail-test-mysql \
+            -e MYSQL_ROOT_PASSWORD=testroot \
+            -p 13306:3306 \
+            mysql:8.4 \
+            --binlog-format=ROW --binlog-row-image=FULL --log-bin=binlog --server-id=1
+          # Host-TCP probe, 3 consecutive successes — see integration-mysql
+          # job above / #949 for why `docker exec ... mysqladmin ping` races.
+          consecutive=0
+          for i in $(seq 1 60); do
+            if docker run --rm --network host mysql:8.4 \
+                 mysql --protocol=TCP -h 127.0.0.1 -P 13306 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
+              consecutive=$((consecutive + 1))
+              [ "$consecutive" -ge 3 ] && { echo "MySQL index is ready."; exit 0; }
+            else
+              consecutive=0
+            fi
+            sleep 2
+          done
+          echo "MySQL did not become ready in time" >&2
+          docker logs bintrail-test-mysql >&2 || true
+          exit 1
+
+      - name: Start PostgreSQL source (bintrail-test-postgres, ${{ matrix.postgres }})
+        run: |
+          docker run -d --name bintrail-test-postgres \
+            -e POSTGRES_PASSWORD=testpg \
+            -e POSTGRES_DB=pgtest \
+            -p 15432:5432 \
+            postgres:${{ matrix.postgres }} \
+            -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10
+          # Probe TCP from inside the container — see ci.yml's equivalent step
+          # for why a socket-only pg_isready would false-ready during init.
+          for i in $(seq 1 60); do
+            if docker exec bintrail-test-postgres pg_isready -h 127.0.0.1 -U postgres -d pgtest --quiet 2>/dev/null; then
+              echo "PostgreSQL source is ready."; exit 0
+            fi
+            sleep 2
+          done
+          echo "PostgreSQL did not become ready in time" >&2
+          docker logs bintrail-test-postgres >&2 || true
+          exit 1
+
+      # Same false-green tripwire as ci.yml: assert the headline end-to-end
+      # tests genuinely ran, not merely that `go test` exited 0.
+      - name: PostgreSQL-source integration tests
+        run: |
+          set -o pipefail
+          go test -tags=integration -race -p 1 -count=1 -v \
+            ./internal/pgcapture/ ./internal/pgstreamrun/ ./internal/pgbaseline/ ./internal/pgshim/ 2>&1 | tee /tmp/pg-it.out
+          grep -q -- '--- PASS: TestOne_EndToEnd_PostgresToIndexToRecovery' /tmp/pg-it.out \
+            || { echo "FATAL: PG end-to-end integration test did not run — false-green tripwire" >&2; exit 1; }
+          grep -q -- '--- PASS: TestPGBaseline_Integration' /tmp/pg-it.out \
+            || { echo "FATAL: pgbaseline integration suite did not run — false-green tripwire" >&2; exit 1; }
+          grep -q -- '--- PASS: TestPGWire_PostgresSourceRoundTrip' /tmp/pg-it.out \
+            || { echo "FATAL: pgwire PostgreSQL-source E2E did not run — false-green tripwire" >&2; exit 1; }
+
   release:
+    needs: [integration-mysql, integration-mariadb-source, integration-postgres-source]
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
