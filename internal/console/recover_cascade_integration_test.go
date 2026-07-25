@@ -4,6 +4,8 @@ package console
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -657,5 +659,147 @@ func TestIntegrationRecoverCascade_refusedUnderProfile(t *testing.T) {
 	}
 	if caps.RecoverCascade {
 		t.Errorf("capability recover_cascade must be false under an RBAC profile, got: %s", capsBody)
+	}
+}
+
+// seedCascadeConsoleOversized is seedCascadeConsole's #849 sibling: the same
+// parent-DELETE + child-INSERT + FK-CASCADE shape, except the child table
+// carries MANY moderate-sized rows (oversizedChildCount rows of
+// oversizedChildBlobBytes each, all referencing parent id=1) instead of a
+// couple of small ones. The cascade engine copies each INSERT's row_after
+// into the synthesized victim's RowBefore (internal/cascade/cascade.go:553,
+// "last known state → INSERT target"), so this flows straight into cascade
+// victim payload EstimateScriptBytes sums — pushing the COMBINED (parent +
+// victims) script over recoverMaxScriptBytes (32 MiB) while the parent DELETE
+// alone (`{"id":1}`) stays tiny.
+//
+// Deliberately MANY moderate rows, not one giant row: a single row wider than
+// MySQL's default sort_buffer_size (256 KB) makes the cascade engine's own
+// victim-lookup query — a JSON_EXTRACT filter combined with a
+// ROW_NUMBER() OVER (PARTITION BY ...) window (eng.Fetch with LimitPerPK) —
+// die with ER_OUT_OF_SORTMEMORY (1038) before cascade synthesis ever runs, an
+// early version of this fixture hit exactly that. internal/query/query.go's
+// late-materialization fix (narrow-key sort + join-back) doesn't cover the
+// cascade engine's own query, so the fixture works around the cliff by
+// staying under it — oversizedChildBlobBytes is comfortably below 256 KB —
+// rather than raising a GLOBAL MySQL setting that would leak into whatever
+// else shares this test server (concurrent packages, other tests) and
+// silently mask the class of bug internal/query/query.go's fix addresses if
+// left too high. All oversizedChildCount rows stay far under
+// cascade.CandidateLimit (1000, the per-FK victim query LIMIT).
+const (
+	oversizedChildCount     = 260
+	oversizedChildBlobBytes = 160 << 10 // 160 KiB/row: 260 * 160 KiB ≈ 40.6 MiB combined, over the 32 MiB budget; each row well under MySQL's default 256 KiB sort_buffer_size
+)
+
+func seedCascadeConsoleOversized(t *testing.T) (*Server, string) {
+	t.Helper()
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	h := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h})
+	childTs := h.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	parentTs := h.Add(20 * time.Minute).Format("2006-01-02 15:04:05")
+
+	blob := strings.Repeat("x", oversizedChildBlobBytes)
+	for i := 0; i < oversizedChildCount; i++ {
+		childID := 100 + i
+		rowAfter := []byte(fmt.Sprintf(`{"id":%d,"pid":1,"blob":"%s"}`, childID, blob))
+		testutil.InsertEvent(t, db, "binlog.000001", uint64(100+i*10), uint64(100+i*10+5), childTs, nil,
+			dbName, "child", 1 /*INSERT*/, fmt.Sprintf("%d", childID), nil, nil, rowAfter)
+	}
+	testutil.InsertEvent(t, db, "binlog.000001", 100000, 100100, parentTs, nil,
+		dbName, "parent", 3 /*DELETE*/, "1", nil, []byte(`{"id":1}`), nil)
+
+	testutil.MustExec(t, db, `INSERT INTO fk_constraints
+		(snapshot_id, constraint_name, schema_name, table_name, column_name, ordinal_position,
+		 referenced_schema_name, referenced_table_name, referenced_column_name, delete_rule, update_rule)
+		VALUES (1, 'fk_child', ?, 'child', 'pid', 1, ?, 'parent', 'id', 'CASCADE', 'RESTRICT')`,
+		dbName, dbName)
+
+	snapTs := h.Format("2006-01-02 15:04:05")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "parent", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "pid", 2, "", "int", "YES")
+
+	cfg := Config{DB: db, DBName: dbName, Listen: "127.0.0.1:8090", Token: intToken, NoArchive: true}
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv, dbName
+}
+
+// TestIntegrationRecoverCascade_overByteBudget pins recoverMaxScriptBytes
+// wiring on the EXPLICIT endpoint (handleRecoverCascade's own
+// recovery.NewForDialect(...) + gen.SetMaxScriptBytes(recoverMaxScriptBytes)
+// in recover_cascade.go, #849 item 3): a combined parent+victims script far
+// over budget must refuse with the same actionable 422 the plain /api/recover
+// path uses (writeRecoverError), not render at the Generator's CLI-sized
+// 2 GiB zero-config default.
+func TestIntegrationRecoverCascade_overByteBudget(t *testing.T) {
+	srv, dbName := seedCascadeConsoleOversized(t)
+
+	rec, body := doReq(t, srv, "POST", "/api/recover-cascade", `{"schema":"`+dbName+`","table":"parent"}`)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422, body = %s", rec.Code, body)
+	}
+	var errBody map[string]string
+	if err := json.Unmarshal(body, &errBody); err != nil {
+		t.Fatalf("decode error body: %v (body=%s)", err, body)
+	}
+	msg := errBody["error"]
+	for _, want := range []string{"MiB budget", "Narrow the recovery filter", "bintrail recover"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message missing %q: %s", want, msg)
+		}
+	}
+	if strings.Contains(msg, "0 = unlimited") {
+		t.Errorf("error message must not leak the CLI-only '0 = unlimited' phrasing: %s", msg)
+	}
+}
+
+// TestIntegrationRecover_autoCascade_overByteBudget pins recoverMaxScriptBytes
+// wiring on the AUTO-DETECTED cascade path (cascadeRecover's own
+// gen.SetMaxScriptBytes(recoverMaxScriptBytes) in recover_cascade.go, #849
+// item 3) together with the api.go warning fix (#849 item 2, the code-review
+// follow-up): a combined script over budget must NOT render at 2 GiB, must
+// degrade to the plain (parent-only) recovery — not fail the whole request —
+// and the warning explaining why must say the budget was the reason (not
+// "cascade synthesis failed", which would misdiagnose a refusal that happened
+// AFTER synthesis succeeded) and must not leak the CLI-only "0 = unlimited"
+// phrasing that has no console equivalent.
+func TestIntegrationRecover_autoCascade_overByteBudget(t *testing.T) {
+	srv, dbName := seedCascadeConsoleOversized(t)
+
+	rec, body := doReq(t, srv, "POST", "/api/recover", `{"schema":"`+dbName+`","table":"parent"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 (over-budget cascade degrades to plain recover), body = %s", rec.Code, body)
+	}
+	var resp recoverResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, body)
+	}
+	if resp.CascadeDetected {
+		t.Errorf("cascade_detected should be false: the combined script was over budget, so recover degraded to the plain path\n---\n%s", resp.SQL)
+	}
+	if !strings.Contains(resp.SQL, "`"+dbName+"`.`parent`") {
+		t.Errorf("the plain fallback should still re-create the parent\n---\n%s", resp.SQL)
+	}
+	if strings.Contains(resp.SQL, "`"+dbName+"`.`child`") {
+		t.Errorf("the plain fallback must NOT include the cascade-synthesized (oversized) children\n---\n%s", resp.SQL)
+	}
+	joined := strings.Join(resp.Warnings, " | ")
+	for _, want := range []string{"combined script would hold", "MiB budget", "re-creates the parent only", "Narrow the recovery filter"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("warnings missing %q: %v", want, resp.Warnings)
+		}
+	}
+	if strings.Contains(joined, "0 = unlimited") {
+		t.Errorf("warnings must not leak the CLI-only '0 = unlimited' phrasing: %v", resp.Warnings)
+	}
+	if strings.Contains(joined, "Cascade synthesis failed") {
+		t.Errorf("a budget refusal after successful synthesis must not be misdiagnosed as a synthesis failure: %v", resp.Warnings)
 	}
 }
