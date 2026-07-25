@@ -54,9 +54,13 @@ type recoverCascadeResponse struct {
 	SetNullCount   int    `json:"set_null_count"`
 	// Complete is a convenience for the client: it is exactly Incomplete being
 	// empty (an operational synthesis error is folded into Incomplete too), so the
-	// two are always set together — never independently.
+	// two are always set together — never independently. Warnings never affects
+	// Complete (#618) — it carries advisory notes about an otherwise-complete
+	// recovery, in the SAME shape recoverResponse.Warnings uses for the plain
+	// recover endpoint's gap/RBAC/cascade-fallback notes (internal/console/api.go).
 	Complete   bool     `json:"complete"`
 	Incomplete []string `json:"incomplete,omitempty"`
+	Warnings   []string `json:"warnings,omitempty"`
 }
 
 // rbacActive reports whether the console is running under an RBAC profile with
@@ -174,6 +178,7 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 		Parents:        len(synth.ParentDeletes),
 		Children:       len(synth.Victims),
 		Caveats:        synth.Caveats,
+		Warnings:       synth.Warnings,
 		BaselineActive: synth.BaselineActive,
 	})
 	if err != nil {
@@ -188,6 +193,7 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 		SetNullCount:   len(synth.SetNullRows),
 		Complete:       len(synth.Caveats) == 0 && synth.SynthErr == nil,
 		Incomplete:     synth.Caveats,
+		Warnings:       synth.Warnings,
 	})
 }
 
@@ -244,7 +250,8 @@ type cascadeSynthResult struct {
 	Victims        []query.ResultRow
 	SetNullRows    []cascade.SetNullRestore
 	Caveats        []string
-	SynthErr       error // operational synthesis failure; its text is also folded into Caveats
+	Warnings       []string // advisory-only notes (cascade.Result.Warnings, #618) — never gates Complete
+	SynthErr       error    // operational synthesis failure; its text is also folded into Caveats
 	BaselineActive bool
 }
 
@@ -375,6 +382,7 @@ func (s *Server) synthesizeCascade(ctx context.Context, b *bundle, p cascadeSynt
 		Victims:        res.Victims,
 		SetNullRows:    res.SetNullRows,
 		Caveats:        caveats,
+		Warnings:       res.Warnings,
 		SynthErr:       synthErr,
 		BaselineActive: baselineProvider != nil,
 	}, nil
@@ -412,6 +420,7 @@ type cascadeRecoverResult struct {
 	VictimCount    int
 	SetNullCount   int
 	Caveats        []string
+	Warnings       []string // advisory-only notes (cascade.Result.Warnings, #618) — never gates Complete
 }
 
 // parentDeletesOnTable filters rows down to the DELETE events on table — used
@@ -488,6 +497,7 @@ func (s *Server) cascadeRecover(ctx context.Context, b *bundle, body recoverRequ
 		Table:          body.Table,
 		Children:       len(synth.Victims),
 		Caveats:        caveats,
+		Warnings:       synth.Warnings,
 		BaselineActive: synth.BaselineActive,
 		Combined:       true,
 	})
@@ -500,6 +510,7 @@ func (s *Server) cascadeRecover(ctx context.Context, b *bundle, body recoverRequ
 		VictimCount:    len(synth.Victims),
 		SetNullCount:   len(setNull),
 		Caveats:        caveats,
+		Warnings:       synth.Warnings,
 	}, nil
 }
 
@@ -518,7 +529,7 @@ type cascadeBaselineProvider struct {
 }
 
 func (p *cascadeBaselineProvider) BaselineChildren(ctx context.Context, schema, table, fkCol, parentPK string, at time.Time, limit int) (cascade.BaselineLookup, bool, error) {
-	path, snap, _, err := reconstruct.FindBaseline(ctx, p.source, schema, table, at)
+	path, snap, stale, err := reconstruct.FindBaseline(ctx, p.source, schema, table, at)
 	if err != nil {
 		if errors.Is(err, reconstruct.ErrNoBaseline) {
 			return cascade.BaselineLookup{}, false, nil // table not covered → Phase-1 only
@@ -570,7 +581,7 @@ func (p *cascadeBaselineProvider) BaselineChildren(ctx context.Context, schema, 
 			Row:      rrow,
 		})
 	}
-	return cascade.BaselineLookup{SnapshotTime: snap, Rows: out, Truncated: trunc}, true, nil
+	return cascade.BaselineLookup{SnapshotTime: snap, Rows: out, Truncated: trunc, StaleMessage: stale.Message}, true, nil
 }
 
 func columnDataType(tm *metadata.TableMeta, name string) string {
