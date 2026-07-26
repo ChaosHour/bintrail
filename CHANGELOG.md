@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.46.0] - 2026-07-26
+
+### Added
+- **Transaction commit time in microseconds** (#1111): every indexed event carries a one-second `event_timestamp` — all the binlog's common header holds — so inside one second the index preserved event ORDER but not event TIME. MySQL 8.0.1+ already writes the commit instant in microseconds into the GTID event; it is now captured as a nullable `commit_ts_us` on `binlog_events`, carried per transaction like `connection_id`, and surfaced in `query --format json|csv`. No source configuration needed (`gtid_mode` may be OFF — 8.0 stamps the anonymous GTID event too); `NULL` on MariaDB, on MySQL < 8.0.1, and for rows indexed before the column existed. Archive reads substitute a typed NULL when the column is absent, so every Parquet archive already on disk keeps reading.
+- **Extension seam for MCP tools** (#1113): `ext/mcpext` lets an embedding distribution add tools to every MCP server the core builds — the standalone `bintrail-mcp` binary and the console's `/mcp` endpoint alike — resolving their target through the same routing the built-in four use, so an extension tool reads the server the operator selected and inherits its posture (including the console's refusal of a tool-level `index_dsn`). No-op in the stock binaries.
+- **MCP `reconstruct` tool** (#953, #1114): single-row point-in-time reconstruction and `--history` over MCP, deliberately stricter than the console's HTTP endpoint (`allow_gaps` defaults false, destructive-DDL and capture-gap checks on). The console binds its own baseline resolution and rejects client-supplied baseline paths.
+- **`verify --check recover`** (#1001, #1115): a verification mode that walks each PK's event chain in time order and asserts every UPDATE/DELETE before-image equals the state the previous event left — the data `recover` dereferences, which the content modes never touch. Index-only, bounded by `--max-events`, and deliberately conservative: a chain starting mid-window is `inconclusive`, never a mismatch.
+- **`verify --format json`** (#954, #1109): machine-readable verification reports, with the exit decision shared by both renderings so text and JSON can never disagree on it.
+- **`recover-cascade` reverses ON UPDATE CASCADE / SET NULL** (#1002, #1116): a parent-key UPDATE now synthesizes the child rows the cascade rewrote, consulting the FK's `update_rule` — never merged with `delete_rule`. Restores stay PK-anchored and guarded, so they can decline to touch a row but never widen the blast radius.
+- **Apply-side codegen switches on `recover`** (#1003, #1110): `--suppress-triggers` (PostgreSQL) emits `SET LOCAL session_replication_role = replica` after `BEGIN`; `--restore-auto-increment` (MySQL) appends a commented-out `AUTO_INCREMENT` reset after `COMMIT` (an ALTER's implicit commit would split the reversal's atomicity). Both opt-in and gated per dialect at generation time.
+- **Audit seam coverage at every historical-read surface** (#945, #1119): `ext.Record` now fires from every surface that serves historical row data — CLI, MCP, shim, console — pinned by contract tests over a canonical surface/action set. Emission sits on the success path, outside every lock and transaction, and cannot fail a query.
+- **Source jobs run on the `stream` and `agent` daemons** (#1105): the `ext.RegisterSourceJob` seam previously fired only under `up`, `watch` and the console monitor, so the two capture paths a plain deployment actually runs started no per-source background work at all.
+- **Opt-in point-consistent baselines** (#1099): `bintrail dump` documents mydumper's NO_LOCK cross-table skew and gains a mode that takes the snapshot at one consistent point.
+- **`stream` auto-discovers GTID mode** (#1140): a first run against a `gtid_mode=ON` source no longer needs `--start-gtid` to end up in GTID mode.
+
+### Fixed
+- **A binary primary key no longer kills the daemon** (#1132, #1134): PK bytes that `utf8mb4` cannot store are hex-encoded (`0x…`) instead of aborting the batch INSERT. Scope covers TEXT/BLOB as well; `docs` now state that `--pk` needs the `0x` spelling for binary keys (#1138, #1142).
+- **BYOS reads accept pre-#1132 `pk_values` spellings** (#1137, #1141), so an index written by an older agent stays queryable.
+- **`verify` no longer reports false mismatches on BINARY(n) and spatial columns** (#1135, #1143): the binlog trims `0x00` padding from fixed-width `BINARY(n)`, which read as drift against the source. Spatial columns are decoded rather than compared as opaque bytes.
+- **Spatial and VECTOR values render correctly on the read surfaces** (#1144, #1146): the shim decodes spatial event values to raw bytes, and `recover` emits VECTOR as `X'hex'`.
+- **Sub-second event times are floored, not rounded, into `event_timestamp`** (#1136, #1139): rounding up could place an event in the following second — and, at a partition boundary, in the following partition.
+- **Identifiers and PK values interpolated into `--` comments are sanitized** (#1131, #1133) so a crafted value cannot break out of the comment in generated recovery SQL.
+- **Console recover output is capped by BYTES, not just rows** (#849, #1096): a row-count cap alone let a wide-row reversal script reach the 2 GiB default budget on a shared daemon.
+- **`recover-cascade` surfaces a stale baseline as a warning, not as incompleteness** (#618, #1094), and the CLI and console now share one baseline provider (#1101, #1102, #1106) so the two surfaces cannot diverge on lookup semantics.
+- **Full-table `reconstruct` streams its event window instead of materializing it** (#1097, #1112): the window is paged through a keyset cursor, with the TOAST and PK-change guards moved onto the per-event fold where they still see before-images.
+- **Full-table `reconstruct` bounds its DuckDB memory** (#1098), scales the volume warning by parallelism, and marks output completeness.
+
+### Changed
+- **DuckDB bumped to v2.5.6 (DuckDB 1.4.5 LTS)** (#1103), pinned off the 1.5 line.
+- **`cmd/mcp-gateway` removed from the OSS module** (#1100): the hosted multi-tenant gateway is not part of the open-core product.
+- **CI gates hardened**: the MySQL integration matrix can no longer pass by skipping (#1093), and releases are gated on the integration matrix for the tagged ref (#1095).
+
 ## [0.45.0] - 2026-07-24
 
 ### Added
