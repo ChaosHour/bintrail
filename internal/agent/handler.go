@@ -11,6 +11,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/buffer"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -200,6 +201,23 @@ func (h *DefaultHandler) resolvePKFromArchive(ctx context.Context, item PKItem, 
 				idx[hash] = r.PKValues
 			}
 		}
+		// #1137 compat, second pass: a row persisted before the #1132 hex fix
+		// stores the RAW spelling of a binary PK, whose hash can never match a
+		// control-plane PKHash computed over the post-fix hex spelling. Index
+		// the canonical spelling's hash as an ALIAS too, still resolving to
+		// the stored value. Aliases are added only after every exact
+		// stored-spelling hash is in, so an exact match always beats an alias
+		// regardless of scan order (a raw row's alias could otherwise shadow
+		// another row literally storing that hex text). No second hash is
+		// computed when the spellings already match (the common case).
+		for _, r := range rows {
+			if canon := event.CanonicalPKValues(r.PKValues); canon != r.PKValues {
+				canonHash := byosPKHash(canon)
+				if _, seen := idx[canonHash]; !seen {
+					idx[canonHash] = r.PKValues
+				}
+			}
+		}
 		cache[key] = idx
 	}
 	return idx[item.PKHash], nil
@@ -302,8 +320,23 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 		}
 		filtered := rows[:0]
 		for _, r := range rows {
-			hash := byosPKHash(r.PKValues)
-			if _, ok := wanted[hash]; ok {
+			_, ok := wanted[byosPKHash(r.PKValues)]
+			if !ok {
+				// #1137 compat: an archive row persisted before the #1132 hex
+				// fix stores the RAW spelling of a binary PK; the caller's
+				// pk_hash is computed over the post-fix hex spelling. When the
+				// spellings differ, also try the canonical spelling's hash.
+				// In the residual collision formatPKValue's doc already
+				// accepts (a VARBINARY PK literally holding the ASCII text of
+				// another key's hex spelling), this OR of both hashes selects
+				// BOTH rows, so the reversal can include a row the caller did
+				// not name — that accepted ambiguity is made reachable here
+				// for pre-fix raw-spelling rows.
+				if canon := event.CanonicalPKValues(r.PKValues); canon != r.PKValues {
+					_, ok = wanted[byosPKHash(canon)]
+				}
+			}
+			if ok {
 				filtered = append(filtered, r)
 			}
 		}
