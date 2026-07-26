@@ -43,7 +43,7 @@ func TestAuditContract_MCP(t *testing.T) {
 					sqlmock.NewRows(recoverToolMockCols).AddRow(
 						int64(1), "bin.000001", int64(4), int64(40), ts,
 						nil, nil, "app", "users", int64(parser.EventInsert), "42",
-						nil, nil, []byte(`{"id":42}`), int64(0), nil, nil,
+						nil, nil, []byte(`{"id":42}`), int64(0), nil, nil, nil,
 					))
 				res, _, _ := MakeQueryTool(newRecoverToolTarget(db, 0))(ctx, nil, QueryArgs{Schema: "app", Table: "users"})
 				if res.IsError {
@@ -64,7 +64,7 @@ func TestAuditContract_MCP(t *testing.T) {
 					sqlmock.NewRows(recoverToolMockCols).AddRow(
 						int64(1), "bin.000001", int64(4), int64(40), ts,
 						nil, nil, "app", "users", int64(parser.EventInsert), "42",
-						nil, nil, []byte(`{"id":42,"email":"a@x"}`), int64(0), nil, nil,
+						nil, nil, []byte(`{"id":42,"email":"a@x"}`), int64(0), nil, nil, nil,
 					))
 				res, _, _ := MakeRecoverTool(newRecoverToolTarget(db, 0))(ctx, nil, RecoverArgs{Schema: "app", Table: "users"})
 				if res.IsError {

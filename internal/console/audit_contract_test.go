@@ -25,12 +25,13 @@ func auditEventRow(t *testing.T) *sqlmock.Rows {
 		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
 		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
 		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
+		"commit_ts_us",
 	}
 	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	return sqlmock.NewRows(cols).AddRow(
 		int64(1), "bin.000001", int64(4), int64(40), ts,
 		nil, nil, "app", "users", int64(parser.EventInsert), "42",
-		nil, nil, []byte(`{"id":42,"email":"a@x"}`), int64(0), nil, nil,
+		nil, nil, []byte(`{"id":42,"email":"a@x"}`), int64(0), nil, nil, nil,
 	)
 }
 
