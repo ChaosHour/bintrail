@@ -283,28 +283,40 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 
 		gtidSuffix := ""
 		if row.GTID != nil {
-			gtidSuffix = " gtid=" + *row.GTID
+			gtidSuffix = " gtid=" + SanitizeForComment(*row.GTID)
 		}
+		// Every interpolated value is sanitized (#1120): a line break in the table
+		// name or the PK would end this comment, and the remainder would begin a
+		// new line executing inside the BEGIN/COMMIT below. This is the site that
+		// ships today — a newline in a VARCHAR primary key is ordinary data.
 		fmt.Fprintf(&body, "-- [%d] reverse %s on %s.%s pk=%s at %s%s\n",
 			row.EventID,
 			eventTypeName(row.EventType),
-			row.SchemaName, row.TableName,
-			row.PKValues,
+			SanitizeForComment(row.SchemaName), SanitizeForComment(row.TableName),
+			SanitizeForComment(row.PKValues),
 			row.EventTimestamp.Format("2006-01-02 15:04:05"),
 			gtidSuffix,
 		)
 
 		stmt, cols, err := g.buildStatement(row)
 		if err != nil {
-			// Record the failure and keep the "-- ERROR ..." comment in the
-			// buffered body so the diagnosis lists EVERY un-generatable event,
-			// then refuse the whole script below (#784). Demoting the error to a
+			// Record the failure, then refuse the whole script below (#784).
+			//
+			// The "-- ERROR ..." line goes into the buffered body, which the
+			// refusal below DISCARDS before anything reaches w — the diagnosis is
+			// built from genFailures, not from this text, so this line can never
+			// reach an operator. It is kept for readability while debugging a
+			// rendered body, and sanitized (#1120) only as defense in depth: it
+			// is not a live injection vector the way the header above is.
+			//
+			// Demoting the error to a
 			// comment and returning success is a silent incomplete recovery: a
 			// SQL comment has no apply-time effect, so a partial script commits
 			// clean under BEGIN/COMMIT and the operator never learns an event
 			// was skipped. Same fail-loud stance as the schema-drift (#601) and
 			// script-budget (#654) refusals — refuse up front, write nothing.
-			fmt.Fprintf(&body, "-- ERROR generating reversal for event %d: %v\n", row.EventID, err)
+			fmt.Fprintf(&body, "-- ERROR generating reversal for event %d: %s\n",
+				row.EventID, SanitizeForComment(err.Error()))
 			genFailures = append(genFailures, genFailure{
 				eventID:    row.EventID,
 				schemaName: row.SchemaName,
@@ -464,7 +476,18 @@ func (g *Generator) writeAutoIncrementSection(w io.Writer, touched map[string]bo
 	fmt.Fprintln(w, "-- no-op, never data loss.")
 	for _, k := range keys {
 		schema, table, _ := strings.Cut(k, "\x00")
-		qualified := QuoteName(schema) + "." + QuoteName(table)
+		// Sanitized once here (#1120) because all three uses below are comment
+		// lines: this block's ENTIRE safety mechanism is the "--" prefix, and it
+		// sits after COMMIT, so a line-break-bearing identifier would run whatever
+		// followed it as a standalone statement.
+		//
+		// Unlike the header above, this block has no executable sibling carrying
+		// the exact bytes — the two commented statements ARE the deliverable, and
+		// the operator is told to uncomment and run them. For such a table the
+		// quoted rendering is not runnable as written, which is the intended
+		// outcome: it stops at a syntax error the operator must read, rather than
+		// naming a different table that might exist. See SanitizeForComment.
+		qualified := SanitizeForComment(QuoteName(schema) + "." + QuoteName(table))
 		fmt.Fprintln(w, "--")
 		fmt.Fprintf(w, "-- %s:\n", qualified)
 		fmt.Fprintf(w, "--   SELECT IFNULL(MAX(%s), 0) + 1 FROM %s;\n", QuoteName("<auto_increment_column>"), qualified)
@@ -1334,6 +1357,52 @@ func EscapeString(s string) string {
 // escaping any backticks in the name itself.
 func QuoteName(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
+}
+
+// SanitizeForComment makes s safe to interpolate into a "--" SQL comment line
+// (#1120). A "--" comment ends at the first line break; a value carrying one
+// closes the comment, and what follows begins a NEW line that the parser reads
+// as executable SQL.
+//
+// Both terminators are handled because this serves both dialects: MySQL ends the
+// comment at LF only, PostgreSQL at LF *or* a bare CR (its lexer defines the
+// comment body as [^\n\r]*). Nothing else terminates one — U+2028/U+2029 are not
+// line breaks to either lexer.
+//
+// No existing escaper defends against this: event.EscapePKValue escapes only `\`
+// and `|`, QuoteName only the backtick, quoteNamePG only the double quote — and a
+// line break is legal inside a quoted identifier in either dialect, while inside
+// a VARCHAR primary key it is ordinary data.
+//
+// A value holding a break is rendered with strconv.Quote, which is LOSSLESS
+// (reversible via strconv.Unquote) and provably single-line — it escapes every
+// non-printable, U+2028/U+2029 included. Flattening the break to a space is the
+// obvious alternative and is worse: it makes "a\nb" and the perfectly ordinary
+// value "a b" indistinguishable, so an operator who copies a mangled PK into a
+// follow-up WHERE gets zero rows — and mid-incident, zero rows reads as "the row
+// is already gone", the opposite of the truth. The surrounding quotes are
+// themselves the signal that the rendering is escaped, so no separate marker is
+// needed. Refusing outright would instead deny recovery to a table that is merely
+// oddly named.
+//
+// A value with no break is returned unchanged, so ordinary scripts stay
+// byte-identical and every golden-output test in this package still holds;
+// TestSanitizeForComment_lineBreakForms pins that identity case.
+//
+// The quoted form is deliberately NOT valid SQL to uncomment. At the two sites
+// where the commented text is itself the artifact — the AUTO_INCREMENT block
+// below and reconstruct's binlog-only schema placeholder — that is the safer
+// failure. MySQL has no escape for a line break inside a backtick identifier, so
+// no rendering there can be both faithful and runnable, and a syntax error the
+// operator must look at beats an identifier that silently reads as a different,
+// possibly existing, table.
+//
+// Callers apply this where a value meets a "--", never to the value itself.
+func SanitizeForComment(s string) string {
+	if !strings.ContainsAny(s, "\r\n") {
+		return s
+	}
+	return strconv.Quote(s)
 }
 
 // ─── Dialect dispatch (#533) ───────────────────────────────────────────────────

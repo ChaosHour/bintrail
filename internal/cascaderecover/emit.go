@@ -145,14 +145,16 @@ func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNu
 
 	var b strings.Builder
 	if hdr.Combined {
-		fmt.Fprintf(&b, "-- bintrail recover (cascade-aware): undo %s.%s, including the foreign-key\n", hdr.Schema, hdr.Table)
+		fmt.Fprintf(&b, "-- bintrail recover (cascade-aware): undo %s.%s, including the foreign-key\n",
+			recovery.SanitizeForComment(hdr.Schema), recovery.SanitizeForComment(hdr.Table))
 		b.WriteString("-- ON DELETE / ON UPDATE CASCADE / SET NULL side effects InnoDB ran below the\n")
 		b.WriteString("-- binlog (MySQL Bug #32506).\n")
 		fmt.Fprintf(&b, "-- Re-creates %d cascade-deleted child row(s), restores %d SET NULL'd FK(s) and %d\n", hdr.Children, len(setNullRows), len(keyUpdates))
 		b.WriteString("-- cascade-rewritten FK(s) alongside the reversal of the selected change(s).\n")
 		b.WriteString("-- NEVER auto-applied.\n")
 	} else {
-		fmt.Fprintf(&b, "-- bintrail recover-cascade: reverse ON DELETE / ON UPDATE CASCADE / SET NULL side effects on %s.%s\n", hdr.Schema, hdr.Table)
+		fmt.Fprintf(&b, "-- bintrail recover-cascade: reverse ON DELETE / ON UPDATE CASCADE / SET NULL side effects on %s.%s\n",
+			recovery.SanitizeForComment(hdr.Schema), recovery.SanitizeForComment(hdr.Table))
 		fmt.Fprintf(&b, "-- Reverses %d parent row change(s) and re-inserts %d cascade-deleted child row(s); restores\n", hdr.Parents, hdr.Children)
 		fmt.Fprintf(&b, "-- %d SET NULL'd FK(s) and %d cascade-rewritten FK(s) that InnoDB removed/nulled/rewrote\n", len(setNullRows), len(keyUpdates))
 		b.WriteString("-- below the binlog (MySQL Bug #32506). NEVER auto-applied.\n")
@@ -170,10 +172,18 @@ func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNu
 	b.WriteString("--\n")
 	b.WriteString("-- If you have already re-created a deleted parent, delete its INSERT below:\n")
 	b.WriteString("-- SET FOREIGN_KEY_CHECKS=0 does NOT suppress PRIMARY KEY violations.\n")
+	// Caveats and warnings are sanitized HERE, at the comment boundary, rather
+	// than at their construction sites (#1120) — of which there are many, spread
+	// across internal/cascade, internal/cli and internal/console, several
+	// formatting in a schema/table name or an error string. Two reasons: the same
+	// strings are also served as JSON by the console, where a line break is
+	// harmless, so the boundary is the only place the constraint actually
+	// applies; and a fix here cannot be bypassed by a future caveat added
+	// anywhere upstream.
 	if len(hdr.Caveats) > 0 {
 		b.WriteString("--\n-- !!! INCOMPLETE RECOVERY — the result is provably partial:\n")
 		for _, c := range hdr.Caveats {
-			fmt.Fprintf(&b, "--   - %s\n", c)
+			fmt.Fprintf(&b, "--   - %s\n", recovery.SanitizeForComment(c))
 		}
 	}
 	// Warnings are deliberately NOT folded into the block above (#618): they are
@@ -182,7 +192,7 @@ func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNu
 	if len(hdr.Warnings) > 0 {
 		b.WriteString("--\n-- NOTE — advisory, recovery below is COMPLETE (nothing is missing):\n")
 		for _, note := range hdr.Warnings {
-			fmt.Fprintf(&b, "--   - %s\n", note)
+			fmt.Fprintf(&b, "--   - %s\n", recovery.SanitizeForComment(note))
 		}
 	}
 	b.WriteString("\nSET FOREIGN_KEY_CHECKS=0;\n\n")
