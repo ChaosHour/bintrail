@@ -291,6 +291,12 @@ type ResultRow struct {
 	SchemaVersion  uint32         // snapshot_id at index time; 0 for pre-migration data
 	QueryText      *string        // original SQL statement (#699); nil unless the source logs ROWS_QUERY/ANNOTATE events
 	QueryHash      *string        // STATEMENT_DIGEST of QueryText computed at index time (#699); nil when text absent or digest unavailable
+	// CommitTsUS is the transaction's commit time in MICROSECONDS since epoch,
+	// from the source's GTID event (#18). nil for events indexed before the
+	// column existed, and for sources that never write it (MariaDB, MySQL <
+	// 8.0.1) — so a consumer must treat nil as "only the one-second
+	// EventTimestamp is known here", never as an ordering tie.
+	CommitTsUS *uint64
 }
 
 // OrderDirection normalises an Options.Order value to a SQL direction keyword
@@ -591,7 +597,8 @@ func buildQuery(opts Options) (string, []any) {
 	// match 1:1 and lets MySQL prune partitions on the eq_ref lookup.
 	cols := `be.event_id, be.binlog_file, be.start_pos, be.end_pos, be.event_timestamp,
 	         be.gtid, be.connection_id, be.schema_name, be.table_name, be.event_type, be.pk_values,
-	         be.changed_columns, be.row_before, be.row_after, be.schema_version, be.query_text, be.query_hash`
+	         be.changed_columns, be.row_before, be.row_after, be.schema_version, be.query_text, be.query_hash,
+	         be.commit_ts_us`
 
 	dir := OrderDirection(opts.Order)
 	whereSQL := ""
@@ -690,6 +697,7 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 			schemaVersion  sql.NullInt32
 			queryText      sql.NullString
 			queryHash      sql.NullString
+			commitTsUS     sql.NullInt64
 		)
 		var changedCols, rowBefore, rowAfter []byte
 
@@ -697,6 +705,7 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 			&r.EventID, &binlogFile, &startPos, &endPos, &eventTimestamp,
 			&gtid, &connID, &schemaName, &tableName, &eventType, &pkValues,
 			&changedCols, &rowBefore, &rowAfter, &schemaVersion, &queryText, &queryHash,
+			&commitTsUS,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan result row: %w", err)
 		}
@@ -739,6 +748,12 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 		}
 		if queryHash.Valid {
 			r.QueryHash = &queryHash.String
+		}
+		// BIGINT UNSIGNED microseconds scanned through NullInt64: epoch µs stays
+		// well inside int64 (year 294247), so the signed hop is lossless.
+		if commitTsUS.Valid && commitTsUS.Int64 > 0 {
+			v := uint64(commitTsUS.Int64)
+			r.CommitTsUS = &v
 		}
 		if changedCols != nil {
 			_ = json.Unmarshal(changedCols, &r.ChangedColumns)
@@ -840,6 +855,7 @@ type jsonRow struct {
 	RowAfter       map[string]any `json:"row_after"`
 	QueryText      *string        `json:"query_text"`
 	QueryHash      *string        `json:"query_hash"`
+	CommitTsUS     *uint64        `json:"commit_ts_us"`
 }
 
 func writeJSON(rows []ResultRow, w io.Writer) (int, error) {
@@ -862,6 +878,7 @@ func writeJSON(rows []ResultRow, w io.Writer) (int, error) {
 			RowAfter:       r.RowAfter,
 			QueryText:      r.QueryText,
 			QueryHash:      r.QueryHash,
+			CommitTsUS:     r.CommitTsUS,
 		}
 	}
 	enc := json.NewEncoder(w)
@@ -877,6 +894,7 @@ var csvHeaders = []string{
 	"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
 	"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
 	"changed_columns", "row_before", "row_after", "query_text", "query_hash",
+	"commit_ts_us",
 }
 
 func writeCSV(rows []ResultRow, w io.Writer) (int, error) {
@@ -917,6 +935,10 @@ func writeCSV(rows []ResultRow, w io.Writer) (int, error) {
 		if r.QueryHash != nil {
 			queryHash = *r.QueryHash
 		}
+		commitTsUS := ""
+		if r.CommitTsUS != nil {
+			commitTsUS = fmt.Sprintf("%d", *r.CommitTsUS)
+		}
 		record := []string{
 			fmt.Sprintf("%d", r.EventID),
 			r.BinlogFile,
@@ -934,6 +956,7 @@ func writeCSV(rows []ResultRow, w io.Writer) (int, error) {
 			after,
 			queryText,
 			queryHash,
+			commitTsUS,
 		}
 		if err := cw.Write(record); err != nil {
 			return i, err
