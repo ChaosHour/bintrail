@@ -3,6 +3,7 @@ package reconstruct
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -108,11 +109,15 @@ func ReadBaselineRows(ctx context.Context, path string, filter map[string]string
 		q += fmt.Sprintf(" LIMIT %d", limit)
 	}
 
-	args := make([]any, len(conds))
-	for i, c := range conds {
-		args[i] = c.value
+	args, err := bindFilterArgs(ctx, db, safePath, conds)
+	if err != nil {
+		return nil, err
 	}
+	return runBaselineQuery(ctx, db, q, args)
+}
 
+// runBaselineQuery executes a built baseline query and materializes its rows.
+func runBaselineQuery(ctx context.Context, db *sql.DB, q string, args []any) ([]map[string]any, error) {
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("baseline query: %w", err)
@@ -690,6 +695,124 @@ func pinDuckDBSessionUTC(ctx context.Context, db *sql.DB) error {
 type colCond struct {
 	col   string
 	value string
+}
+
+// bindFilterArgs turns the filter conditions into DuckDB bind arguments.
+//
+// Every value arrives as a string (that is the at-rest spelling of a
+// binlog_events.pk_values component, which is what callers hand us), and
+// binding it verbatim is correct for every column type DuckDB can cast a
+// VARCHAR into — including a BLOB column holding printable bytes, where
+// DuckDB's implicit VARCHAR→BLOB cast compares the raw characters and
+// matches.
+//
+// The one spelling that cast CANNOT resolve is the "0x"+hex form
+// event.formatPKValue produces for PK bytes that are not valid UTF-8 (#1132):
+// bound as a VARCHAR it compares the six literal characters "0xB281" against
+// the two bytes {0xB2,0x81} and silently matches nothing — a BINARY(16) UUID
+// primary key could not be reconstructed at all (#1155). For those, decode
+// the hex and bind the BYTES.
+//
+// The decode is gated on the value's shape AND on the column really being a
+// Parquet BYTE_ARRAY (BLOB), so a VARCHAR column whose value happens to read
+// "0xAB" keeps binding as literal text.
+//
+// Worth being precise about what the type gate does and does not buy, because
+// this is NOT the rule formatPKValue applies when PRODUCING the spelling —
+// that one is gated purely on content (valid UTF-8 → stored verbatim), this
+// one on content AND type. The asymmetry looks like it should strand a binary
+// column whose bytes are literally the ASCII text "0x<even-hex>": pk_values
+// holds that text, and decoding it would look for entirely different bytes.
+//
+// It does not, and the reason is that the WRITE side decodes identically.
+// internal/baseline's decodeBinaryLiteral is applied to every binary-family
+// column, and its doc records the same residual from the other end: a binary
+// value whose actual bytes are the ASCII text "0x…" is indistinguishable from
+// a --hex-blob literal and IS decoded on the way into the Parquet. So the
+// baseline never stores those characters as characters, and the two ends of
+// the ambiguity resolve the same way by construction rather than by agreement.
+// TestReadBaselineRow_binaryHexTextSymmetry pins that, because it is the
+// property this gate leans on and it lives in another package.
+func bindFilterArgs(ctx context.Context, db *sql.DB, safePath string, conds []colCond) ([]any, error) {
+	args := make([]any, len(conds))
+	decoded := make([][]byte, len(conds))
+	anyHex := false
+	for i, c := range conds {
+		args[i] = c.value
+		if b, ok := decodeHexPKLiteral(c.value); ok {
+			decoded[i] = b
+			anyHex = true
+		}
+	}
+	if !anyHex {
+		return args, nil
+	}
+
+	blobCols, err := parquetBlobColumns(ctx, db, safePath)
+	if err != nil {
+		// The probe only runs once a value already carries the 0x-hex spelling,
+		// which cannot match a BLOB column bound as text — so this fallback is
+		// a guaranteed miss for exactly the lookup the probe exists to serve,
+		// not graceful degradation. Warn (not Debug): downstream a miss is
+		// indistinguishable from a genuinely absent row.
+		slog.Warn("could not probe baseline column types; binding a 0x-hex filter value as text, which will not match a binary column",
+			"error", err)
+		return args, nil
+	}
+	for i, c := range conds {
+		if decoded[i] == nil {
+			continue
+		}
+		// Case-insensitive: DuckDB resolves the quoted identifier in the WHERE
+		// clause case-insensitively, so an exact-only match here would bind a
+		// differently-cased operator-typed column name as text against a BLOB
+		// and silently miss — making this the ONE link in the chain that cares
+		// about case.
+		if !blobCols[strings.ToLower(c.col)] {
+			continue
+		}
+		args[i] = decoded[i]
+	}
+	return args, nil
+}
+
+// decodeHexPKLiteral decodes the "0x"+uppercase-hex spelling
+// event.formatPKValue produces for non-UTF-8 PK bytes. Case-insensitive on
+// the hex digits so an operator who pasted a lowercase key still resolves;
+// an odd digit count is not a valid byte string and is rejected.
+func decodeHexPKLiteral(s string) ([]byte, bool) {
+	if len(s) < 4 || len(s)%2 != 0 || !strings.HasPrefix(s, "0x") {
+		return nil, false
+	}
+	b, err := hex.DecodeString(s[2:])
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
+// parquetBlobColumns reports which columns of the baseline file are stored as
+// a Parquet BYTE_ARRAY (DuckDB BLOB) — the binary/spatial family per
+// internal/baseline/schema.go. The LIMIT 0 query reads footer metadata only.
+func parquetBlobColumns(ctx context.Context, db *sql.DB, safePath string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, "SELECT * FROM parquet_scan('"+safePath+"') LIMIT 0")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	types, err := rows.ColumnTypes()
+	if err != nil {
+		return nil, err
+	}
+	// Keyed lowercase: the caller looks up an operator-typed column name and
+	// DuckDB itself resolves identifiers case-insensitively.
+	out := make(map[string]bool, len(types))
+	for _, t := range types {
+		if strings.EqualFold(t.DatabaseTypeName(), "BLOB") {
+			out[strings.ToLower(t.Name())] = true
+		}
+	}
+	return out, rows.Err()
 }
 
 // buildCondsList returns sorted column conditions for deterministic SQL + arg order.

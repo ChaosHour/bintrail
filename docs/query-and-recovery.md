@@ -54,10 +54,21 @@ Three things to know:
   hex, and the `--pks` filter (like the Parquet archive path) matches the
   stored string byte-for-byte with no hash-based guard — `0xab...` will not
   find a row stored as `0xAB...`. Type the hex exactly as `HEX()` prints it.
-- **Baseline-anchored `verify` and `reconstruct` do not support these PK
-  types** (binary/BLOB PKs are outside `reconstruct`'s supported PK set), so
-  the `0x` spelling helps with `query`/`recover`/`recover-cascade` but does
-  not unlock point-in-time reconstruction for such tables.
+- **`reconstruct` and baseline-anchored `verify` accept these PK types**
+  since [#1155](https://github.com/dbtrail/dbtrail/issues/1155) — the same
+  `0x` spelling works for `reconstruct --pk`, and `verify` checks such tables
+  instead of reporting them `inconclusive`. One wrinkle is handled for you: a
+  fixed `BINARY(n)` column is padded with `0x00` on storage but the binlog row
+  image drops that padding, so the two stores want the key spelled differently.
+  `bintrail reconstruct` reconciles both directions for you — it re-pads to the
+  declared width for the baseline lookup and trims back for the event fetch —
+  so either spelling resolves. Three surfaces do **not** have that reconciler
+  and need the exact spelling: `--baseline-only` (never opens the index, so
+  there is no column width to pad to — pass the full-width
+  `SELECT CONCAT('0x', HEX(pk_col))` form), and the console `/api/reconstruct`
+  and MCP `reconstruct` tool (which call the baseline reader directly — pass
+  the full-width form there too). `FLOAT`/`DOUBLE`, `BIT`, `JSON` and spatial
+  primary keys remain unsupported.
 
 ### `--column-eq` Filter
 
