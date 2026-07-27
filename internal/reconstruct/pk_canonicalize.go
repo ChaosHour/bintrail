@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
@@ -183,6 +184,127 @@ func pkValueBytes(raw any) ([]byte, bool) {
 	default:
 		return nil, false
 	}
+}
+
+// altFixedBinaryPK returns the ONE alternative spelling a baseline row's
+// primary key could carry, or ok=false when there is none.
+//
+// A fixed BINARY(n) key has at most two byte-forms: the padded n bytes MySQL
+// stores, and the trailing-0x00-stripped bytes the binlog ROW image carries
+// (see canonicalizePKValue's binary-family note). A value with no trailing zero
+// byte — most BINARY(16) UUIDs — has only ONE, which is why the loop below
+// skips it. canonicalizePKValue produces the stripped form so it matches
+// binlog_events.pk_values; an entry in the change map under the PADDED spelling
+// means the two sides are keyed differently and the join silently fails (#1158).
+//
+// Both byte-forms render under the same rule, so there is no third spelling to
+// search: formatPKValue is content-gated (valid UTF-8 → stored verbatim, no 0x
+// prefix), and padding with 0x00 cannot change UTF-8 validity in either
+// direction — appending NUL keeps valid input valid, and NUL is never a
+// continuation byte so it cannot repair invalid input.
+//
+// Direction, precisely: at the only production call site the input has already
+// been stripped by canonicalizePKMap, so this always runs strip→pad. The
+// pad→strip half is defensive for a caller handing over an uncanonicalized map
+// — mergeBaselineImages already does under PGTextPK, inert there only because
+// PostgreSQL column metas carry an empty DataType.
+//
+// Cost, measured per row on an M1 Pro rather than argued: 7.8 ns and zero
+// allocations for a non-binary PK (one DataType check per PK column, and
+// TrimSpace on a clean string does not allocate); 40.6 ns and zero allocations
+// for a BINARY(16) UUID with no padding; 291 ns and 5 allocations in the worst
+// case, where every key carries padding and each row builds a PK-sized map plus
+// the toggled key string. Ten million rows costs 78 ms in the common case, and
+// even the worst case is a few percent against the DuckDB Parquet scan and the
+// per-row SQL rendering that surround it. Hoisting the "does this table have a
+// fixed-binary PK" decision out of the scan would buy nothing measurable and
+// would add per-table state to a function whose current virtue is having none.
+// No index, no per-row state that outlives the row.
+//
+// It cannot fire on a healthy table: pk_values only ever holds the stripped
+// spelling, so no legitimate event is keyed under the padded one. And it cannot
+// invent a collision between two real rows. That reduces to one fact — an
+// alternate is only ever produced for a key that HAS padding, so it always ends
+// in 0x00, while a canonical spelling is stripped and so never does. Both
+// collision families die there, though the reasoning has to be about the
+// STRINGS rather than the bytes, since formatPKValue maps two byte domains into
+// one string space: in the verbatim branch the alternate carries a literal 0x00
+// byte no stripped spelling has, and in the hex branch a colliding verbatim key
+// would have to be the ASCII text "0x"+2n hex characters — 2n+2 bytes in an
+// n-byte column, which cannot be stored.
+//
+// Returns false when no PK column is a fixed BINARY(n) with a known width. Note
+// what that means for a pre-#212 snapshot with no COLUMN_TYPE: the CANONICAL
+// key is still correct (canonicalizePKValue trims unconditionally and never
+// reads the width) — it is only this detector that goes quiet, which is why
+// mergeBaselineImages warns once per table rather than letting it pass unsaid.
+//
+// Scope limit, stated rather than wished away: with several fixed-binary
+// components every togglable component is flipped together instead of
+// enumerating 2^k combinations. That detects a UNIFORM disagreement — a
+// canonicalization regression flips a rule, not one column — and misses a
+// partial one, including the partial toggle this function itself produces when
+// one component's width is unknown.
+func altFixedBinaryPK(pkCols []metadata.ColumnMeta, pkMap map[string]any) (string, bool) {
+	var alt map[string]any
+	for _, c := range pkCols {
+		if !strings.EqualFold(strings.TrimSpace(c.DataType), "binary") {
+			continue
+		}
+		width := FixedBinaryWidth(c.ColumnType)
+		if width == 0 {
+			continue
+		}
+		v, ok := pkMap[c.Name].([]byte)
+		if !ok {
+			continue
+		}
+		var flipped []byte
+		if len(v) < width {
+			flipped = make([]byte, width)
+			copy(flipped, v)
+		} else {
+			flipped = TrimFixedBinaryPad(v)
+		}
+		if bytes.Equal(flipped, v) {
+			continue // no padding either way: one spelling only
+		}
+		if alt == nil {
+			// PK columns only. canonicalizePKMap hands back a copy of the
+			// WHOLE row, and copying that per row would scale this with the
+			// table's column count for no benefit — BuildPKValues reads
+			// nothing but pkCols.
+			alt = make(map[string]any, len(pkCols))
+			for _, p := range pkCols {
+				alt[p.Name] = pkMap[p.Name]
+			}
+		}
+		alt[c.Name] = flipped
+	}
+	if alt == nil {
+		return "", false
+	}
+	return event.BuildPKValues(pkCols, alt), true
+}
+
+// FixedBinaryWidth extracts n from a "binary(n)" COLUMN_TYPE, returning 0 when
+// it is absent or unparseable (a pre-#212 snapshot carries no COLUMN_TYPE).
+//
+// Exported because internal/cli's padFixedBinaryFilter must agree with
+// altFixedBinaryPK about the pad width — a `--pk` filter and a merge join that
+// disagreed would resolve the same key differently. internal/verify/render.go
+// keeps its own equivalent for the #1135 render padding; the two must stay in
+// agreement, so change them together.
+func FixedBinaryWidth(columnType string) int {
+	s := strings.ToLower(strings.TrimSpace(columnType))
+	if !strings.HasPrefix(s, "binary(") || !strings.HasSuffix(s, ")") {
+		return 0
+	}
+	n, err := strconv.Atoi(s[len("binary(") : len(s)-1])
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // TrimFixedBinaryPad strips the trailing 0x00 bytes MySQL adds when storing a
