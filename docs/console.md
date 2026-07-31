@@ -730,9 +730,29 @@ Rules that differ from the standalone `bintrail-mcp` server:
   contract), its plaintext is shown exactly once at generation, and it is
   **scoped to `/mcp` alone** — it cannot drive the browser API (registry
   CRUD, monitor verbs, or its own rotation). Rotate/revoke from the same
-  card apply immediately, including to sibling console processes sharing the
-  file. Without any configured token the endpoint refuses every request with
-  an actionable error.
+  card take effect on the next request, including for sibling console
+  processes sharing the file: every `/mcp` request re-validates the
+  credential, so a rotated-away or revoked token stops authenticating
+  immediately. An MCP *session* is additionally bound to the credential that
+  created it — no other token can continue it, so a session opened by a
+  since-rotated token is orphaned outright (its already-open stream can idle
+  out but never be driven again) and is discarded after the idle timeout:
+  sessions with no request for **30 minutes** are closed (clients keep a
+  session alive with pings, or transparently re-initialize).
+- **A managed token carries the grants of the session that minted it.** Each
+  tool call requires the same permission as its `/api` counterpart — `query`
+  and `list_schema_changes` need `query:execute`, `recover` needs
+  `recover:execute`, `reconstruct` needs `reconstruct:execute`, `status`
+  needs `status:read` — checked against the permission set recorded into the
+  token file at mint time, so a session cannot mint its way past what the
+  API would refuse it directly. A call the token's grants do not cover fails
+  with a tool error naming the missing permission. Tokens minted by a
+  full-access session (the static token, a password login — every session in
+  a plain OSS install) record no cap and keep the full read surface, and
+  **tokens minted before grants were recorded behave the same** (they were
+  all minted by full-access sessions); rotate the token to stamp the current
+  session's grants. The static `--token` / `BINTRAIL_CONSOLE_TOKEN` is
+  environment-owned and always full-access.
 - **`index_dsn`, `profile`, `baseline_dir` and `baseline_s3` tool parameters are
   rejected.** Connections, the baseline location and the RBAC posture are all
   managed by the console process — an authenticated MCP client cannot point the
