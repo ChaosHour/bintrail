@@ -527,15 +527,27 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 				"baseline_pos", bmeta.BinlogPos,
 				"baseline_lsn", bmeta.LSN,
 				"flavor", flavor)
-		case reconstruct.GapDetected(flavor, first.BinlogFile, first.StartPos, bmeta.BinlogFile, bmeta.BinlogPos, bmeta.LSN):
-			slog.Warn("gap between baseline and first indexed event — reconstruction may be incomplete",
-				"baseline_file", bmeta.BinlogFile,
-				"baseline_pos", bmeta.BinlogPos,
-				"baseline_gtid", bmeta.GTIDSet,
-				"baseline_lsn", bmeta.LSN,
-				"first_event_file", first.BinlogFile,
-				"first_event_pos", first.StartPos,
-				"flavor", flavor)
+		default:
+			// Both anchors are present. The per-table first event alone
+			// cannot decide the question — on a healthy run it is EXPECTED
+			// to sit past the anchor (it is simply the table's next write),
+			// so file/pos ordering alone cries wolf (#1163). The index's
+			// earliest surviving event is the evidence that can: at-or-before
+			// the anchor proves capture was already running when the baseline
+			// was taken. See reconstruct.DecideBaselineGap.
+			start, startOK := query.OldestIndexedEvent(db)
+			if reconstruct.DecideBaselineGap(flavor, bmeta, first, start, startOK) == reconstruct.GapVerdictUnproven {
+				slog.Warn("possible gap between baseline and first indexed event — the index's earliest surviving event also starts past the baseline anchor, so coverage of the window between them cannot be proven (capture may have started after the baseline, or older events may have been rotated out)",
+					"baseline_file", bmeta.BinlogFile,
+					"baseline_pos", bmeta.BinlogPos,
+					"baseline_lsn", bmeta.LSN,
+					"first_event_file", first.BinlogFile,
+					"first_event_pos", first.StartPos,
+					"oldest_indexed_file", start.BinlogFile,
+					"oldest_indexed_pos", start.StartPos,
+					"oldest_indexed_known", startOK,
+					"flavor", flavor)
+			}
 		}
 	}
 
