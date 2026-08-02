@@ -122,6 +122,11 @@ var (
 	// upVerifyTables optionally narrows scheduled verification to a
 	// comma-separated schema.table list.
 	upVerifyTables string
+	// upNotifyWebhook (#1192) enables the outbound notification channel: a
+	// generic JSON POST to this URL on continuity gap_lost, verify problems,
+	// and rotation making no progress — edge-triggered with recovery events.
+	// Empty = off.
+	upNotifyWebhook string
 
 	upRotateRetain    string
 	upRotateInterval  string
@@ -217,6 +222,7 @@ func init() {
 	watchCmd.Flags().StringVar(&upRotateInterval, "rotate-interval", "1h", "Built-in rotation: how often to run a rotation cycle")
 	watchCmd.Flags().StringVar(&upVerifyInterval, "verify-interval", "", "Scheduled verification: how often to verify every registry server (e.g. 24h, 7d); empty disables")
 	watchCmd.Flags().StringVar(&upVerifyTables, "verify-tables", "", "Scheduled verification: comma-separated schema.table filter (default: all tables)")
+	watchCmd.Flags().StringVar(&upNotifyWebhook, "notify-webhook", "", "Webhook URL for JSON notifications on lost capture continuity, verify problems, and unhealthy rotation; empty disables")
 	watchCmd.Flags().IntVar(&upRotateAddFuture, "rotate-add-future", 3, "Built-in rotation: keep at least N future hourly partitions ready")
 	// --source-dsn is deliberately NOT required: the daemon may start
 	// source-less (zero-config install) and sources are added from the UI.
@@ -419,8 +425,15 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
 	}
-	if err := wireVerify(ctx, &cfg, registry, serversPath); err != nil {
+	notifier, err := newWatchNotifierFromFlags(ctx)
+	if err != nil {
 		return err
+	}
+	if err := wireVerify(ctx, &cfg, registry, serversPath, notifier); err != nil {
+		return err
+	}
+	if notifier != nil {
+		startContinuityWatch(ctx, notifier, registry, upIndexDSN)
 	}
 
 	// Built-in rotation covers the boot index plus every per-source database
@@ -429,7 +442,7 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	// retune retain/interval/add-future without a restart.
 	rotation.StartLoop(ctx, rotationSettingsProvider(registry), func() []rotation.RotateTarget {
 		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
-	})
+	}, rotationNotifyHooks(notifier)...)
 
 	// Reclaim local baseline snapshots that already have a durable S3 copy (#616):
 	// the global --baseline-dir plus every registry server's per-server dir.
@@ -574,8 +587,15 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
 	}
-	if err := wireVerify(ctx, &cfg, registry, serversPath); err != nil {
+	notifier, err := newWatchNotifierFromFlags(ctx)
+	if err != nil {
 		return err
+	}
+	if err := wireVerify(ctx, &cfg, registry, serversPath, notifier); err != nil {
+		return err
+	}
+	if notifier != nil {
+		startContinuityWatch(ctx, notifier, registry, upIndexDSN)
 	}
 
 	// Built-in rotation: boot index + every per-source database the control
@@ -583,7 +603,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// console can retune retain/interval/add-future without a restart.
 	rotation.StartLoop(ctx, rotationSettingsProvider(registry), func() []rotation.RotateTarget {
 		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
-	})
+	}, rotationNotifyHooks(notifier)...)
 
 	// Reclaim local baseline snapshots that already have a durable S3 copy (#616):
 	// the global --baseline-dir plus every registry server's per-server dir.
@@ -812,6 +832,11 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 			upVerifyTables = v
 		}
 	}
+	if !cmd.Flags().Changed("notify-webhook") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_NOTIFY_WEBHOOK"); v != "" {
+			upNotifyWebhook = v
+		}
+	}
 }
 
 // baselineStagingDir resolves the local staging base for baselines destined for
@@ -830,7 +855,7 @@ func baselineStagingDir() string {
 // supervisor (and with it the manual trigger endpoints) is enabled by either
 // opt-in — BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 or a schedule: scheduling verify
 // implies wanting verify.
-func wireVerify(ctx context.Context, cfg *console.Config, registry *console.Registry, serversPath string) error {
+func wireVerify(ctx context.Context, cfg *console.Config, registry *console.Registry, serversPath string, notifier *watchNotifier) error {
 	var interval time.Duration
 	if upVerifyInterval != "" {
 		var err error
@@ -850,7 +875,11 @@ func wireVerify(ctx context.Context, cfg *console.Config, registry *console.Regi
 		slog.Error("verify history unavailable; runs will NOT be recorded and the history endpoint will refuse — fix or move the file and restart", "error", err)
 		history = nil
 	}
-	sup := newVerifySupervisor(ctx, history)
+	var onFinish func(console.VerifyRunRecord)
+	if notifier != nil {
+		onFinish = notifier.VerifyFinished
+	}
+	sup := newVerifySupervisor(ctx, history, onFinish)
 	cfg.VerifyCtrl = sup
 	cfg.VerifyHistory = history
 	if interval > 0 {
@@ -878,39 +907,8 @@ func splitVerifyTables(raw string) []string {
 func startVerifyLoop(ctx context.Context, sup *verifySupervisor, registry *console.Registry, history *console.VerifyHistory, interval time.Duration, tables []string) {
 	slog.Info("scheduled verification enabled", "interval", interval)
 	go func() {
-		runCycle := func() {
-			// A panic must NEVER take down the daemon's primary capture — this
-			// background check shares the process with the stream. Mirrors the
-			// baseline-prune loop's guard.
-			defer func() {
-				if r := recover(); r != nil {
-					slog.Error("scheduled verify cycle panicked; verification continues next tick", "panic", r)
-				}
-			}()
-			var entries []console.ServerEntry
-			if registry != nil {
-				entries = registry.List()
-			}
-			if len(entries) == 0 {
-				// Loud, every cycle: "loop running, verifying nothing" must not
-				// look like "verifying everything". The schedule covers registry
-				// servers; the command-line boot stream is not in the registry.
-				slog.Warn("scheduled verify: no registry servers to verify — the schedule covers servers added in the console UI; a source configured only via command-line flags/env is not covered")
-				return
-			}
-			for _, e := range entries {
-				if ctx.Err() != nil {
-					return
-				}
-				err := sup.RunScheduled(scheduledVerifyRequest(e, tables, upConsoleBaselineDir, upConsoleBaselineS3))
-				if errors.Is(err, console.ErrVerifyRunning) {
-					slog.Info("scheduled verify: skipped, a run is already in flight", "server", e.Name)
-					recordVerifySkip(history, e, "a verify run was already in flight when the schedule fired")
-				}
-			}
-		}
 		if ctx.Err() == nil {
-			runCycle()
+			runScheduledVerifyCycle(ctx, sup, registry, history, tables)
 		}
 		t := time.NewTicker(interval)
 		defer t.Stop()
@@ -919,10 +917,45 @@ func startVerifyLoop(ctx context.Context, sup *verifySupervisor, registry *conso
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				runCycle()
+				runScheduledVerifyCycle(ctx, sup, registry, history, tables)
 			}
 		}
 	}()
+}
+
+// runScheduledVerifyCycle is one pass of the scheduled verification loop —
+// package-level so a unit test can drive registry→request→run→history without
+// the goroutine/ticker plumbing.
+func runScheduledVerifyCycle(ctx context.Context, sup *verifySupervisor, registry *console.Registry, history *console.VerifyHistory, tables []string) {
+	// A panic must NEVER take down the daemon's primary capture — this
+	// background check shares the process with the stream. Mirrors the
+	// baseline-prune loop's guard.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("scheduled verify cycle panicked; verification continues next tick", "panic", r)
+		}
+	}()
+	var entries []console.ServerEntry
+	if registry != nil {
+		entries = registry.List()
+	}
+	if len(entries) == 0 {
+		// Loud, every cycle: "loop running, verifying nothing" must not
+		// look like "verifying everything". The schedule covers registry
+		// servers; the command-line boot stream is not in the registry.
+		slog.Warn("scheduled verify: no registry servers to verify — the schedule covers servers added in the console UI; a source configured only via command-line flags/env is not covered")
+		return
+	}
+	for _, e := range entries {
+		if ctx.Err() != nil {
+			return
+		}
+		err := sup.RunScheduled(scheduledVerifyRequest(e, tables, upConsoleBaselineDir, upConsoleBaselineS3))
+		if errors.Is(err, console.ErrVerifyRunning) {
+			slog.Info("scheduled verify: skipped, a run is already in flight", "server", e.Name)
+			recordVerifySkip(history, e, "a verify run was already in flight when the schedule fired")
+		}
+	}
 }
 
 // scheduledVerifyRequest picks the check a scheduled cycle runs for one
@@ -960,8 +993,8 @@ func recordVerifySkip(history *console.VerifyHistory, e console.ServerEntry, rea
 		return
 	}
 	err := history.Append(console.VerifyRunRecord{
-		ServerID: e.ID, ServerName: e.Name, Trigger: "scheduled", SkipReason: reason,
-		VerifyStatus: console.VerifyStatus{State: "skipped", Since: nowStamp(), FinishedAt: nowStamp()},
+		ServerID: e.ID, ServerName: e.Name, Trigger: console.VerifyTriggerScheduled, SkipReason: reason,
+		VerifyStatus: console.VerifyStatus{State: console.VerifyStateSkipped, Since: nowStamp(), FinishedAt: nowStamp()},
 	})
 	if err != nil {
 		slog.Warn("scheduled verify: could not persist skip to history", "server", e.Name, "error", err)

@@ -444,6 +444,38 @@ console UI); a source configured only through command-line flags/env is not
 in the registry and is not covered — the daemon warns every cycle it finds
 nothing to verify.
 
+#### Webhook notifications
+
+`--notify-webhook <url>` (or `BINTRAIL_CONSOLE_NOTIFY_WEBHOOK`) makes the
+`watch` daemon POST a small JSON payload when something means "your safety
+net has a hole", so the operator hears about it instead of discovering it at
+restore time:
+
+- `continuity_gap_lost` (**critical**) — a stream stamped `gap_lost`: events
+  in the gap are permanently unrecoverable. Checked every few minutes for the
+  command-line index **and** every registry server.
+- `verify_problem` — a verify run (manual or scheduled) found mismatches
+  (**critical**) or errors / failed to run (**warning**).
+- `rotation_unhealthy` (**warning**) — a built-in rotation cycle failed or
+  kept deferring unarchived partitions; either way the index is not
+  shrinking when it should.
+
+The payload is `{event, severity, server, summary, details, timestamp}` —
+generic JSON, no per-vendor adapters: Slack, PagerDuty, ntfy etc. all accept
+it through their inbound-webhook integrations. Notifications are
+**edge-triggered**: one POST on the transition into a bad state, a reminder
+at most every 24 h while it persists (for verify problems: on the next run
+that still finds them), and one `resolved: true` event (severity
+`info`) on recovery. Delivery is best-effort — bounded retries off the hot
+path, never blocking capture. A dead or wrong endpoint surfaces as
+rate-limited log warnings, and an event that could not be delivered is not
+re-queued: the next 24 h edge repeat re-sends a still-active condition. Edge
+state is in-memory — after a daemon restart a still-active condition
+re-fires (loud side errs safe), but a recovery that happened *across* the
+restart produces no `resolved` event. For pull-based alerting on the same
+conditions, see the Prometheus rules in
+[observability.md](observability.md).
+
 - **AWS credentials** — which ambient credential signals the daemon process
   can see: env keys (presence only, never values), `AWS_PROFILE`,
   `AWS_REGION`, a shared `~/.aws` config, ECS task-role / EKS IRSA markers.
@@ -514,6 +546,10 @@ nothing to verify.
   combination doesn't fail cleanly, it crashes the pinned mydumper build). No
   effect unless `BINTRAIL_CONSOLE_BASELINE_TRIGGER` is also on, and no effect
   on PostgreSQL sources.
+- `BINTRAIL_CONSOLE_NOTIFY_WEBHOOK` (`watch` only) — same as
+  `--notify-webhook`: URL for JSON notifications on lost continuity, verify
+  problems, and unhealthy rotation (see
+  [Webhook notifications](#webhook-notifications)).
 - `BINTRAIL_CONSOLE_VERIFY_INTERVAL` (`watch` only) — same as
   `--verify-interval`: enables scheduled verification on that cadence
   (e.g. `24h`, `7d`; see
