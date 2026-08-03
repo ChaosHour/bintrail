@@ -622,3 +622,23 @@ The `watch` daemon's webhook channel sends a critical `baseline_stale`
 event on the transition into broken (see
 [console.md](console.md#webhook-notifications)). The fix is always the
 same: take a fresh baseline (`bintrail dump` + `bintrail baseline`).
+
+**Indexes capturing more than one source**: live partitions are shared by
+every source, so the live floor needs no attribution — but archived
+partitions are per-source, and a baseline snapshot carries no source
+identity. On a multi-source index the archives therefore do **not** extend
+the floor, and any snapshot older than the oldest live partition grades
+`unknown` instead of `ok` or `broken`: claiming one source's archive
+coverage for another would hide a genuinely broken restore window, and
+declaring it broken would page you over archives that are perfectly fine.
+The `watch` daemon reports those servers as *cannot be evaluated* (rate
+limited to one warning per day) and — deliberately — never resolves a
+standing `baseline_stale` alert on that basis. The way to get a graded
+verdict is to keep one source per index database.
+
+Do **not** read reconstruct's gap check as the source-exact fallback: its
+planner classifies an hour as covered when *any* source archived it
+(`archive_state` is scanned unscoped), so on a multi-source index it can
+pass a window the graded source does not actually have. The honest check
+there is to restore into a scratch target and compare — see
+[drill.md](drill.md).

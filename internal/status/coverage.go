@@ -44,9 +44,18 @@ func ContinuityStatus(stream *StreamStateInfo, streamErr error) string {
 // newestIndexedEvent) rather than a whole-table MAX — because it loads on
 // every server switch; CollectStatus stays the full report.
 type CoverageSummary struct {
-	// DeltaFrom is the delta-coverage floor (OldestDeltaFromDB — the #1213
-	// strict rule). Zero = unknown, never assumed.
-	DeltaFrom time.Time
+	// Floor is the delta-coverage floor (OldestDeltaFromDB — the #1213 strict
+	// rule); Floor.Hour zero = unknown, never assumed. The whole DeltaFloor
+	// travels, not just the hour: on a multi-source index Hour is the
+	// LIVE-partition floor and BelowIsUnknown says so, and a consumer that
+	// grades baselines against the hour ALONE turns this narrower floor into
+	// false "broken" verdicts (#1219). Grade through Floor, never through
+	// BaselineStalenessFor with Floor.Hour.
+	//
+	// Caveat that outlives this field: partition existence is the coverage
+	// rule, so a source that started capturing after the oldest live
+	// partition reads a wider window here than it can actually restore.
+	Floor DeltaFloor
 	// DeltaTo is the newest INDEXED event — never the wall clock: claiming
 	// restorability "up to now" while the stream is down would be unearned
 	// assurance. LagSeconds is what says how close to now the edge is.
@@ -60,9 +69,6 @@ type CoverageSummary struct {
 	// folded into this summary — they are a capture-plane verdict with their
 	// own surface (status Capture health, --fail-on-gap). The delta window
 	// here is about what the index CONTAINS.
-	//
-	// Multi-source caveat: like the staleness floor, the window is not
-	// scoped per bintrail_id (#1219).
 }
 
 // CollectCoverageSummary computes the summary against one index. The floor
@@ -75,7 +81,7 @@ func CollectCoverageSummary(ctx context.Context, db *sql.DB, dbName string, now 
 	if floor, err := OldestDeltaFromDB(ctx, db, dbName); err != nil {
 		slog.Warn("could not determine the delta-coverage floor; coverage window start is unknown", "db", dbName, "error", err)
 	} else {
-		sum.DeltaFrom = floor
+		sum.Floor = floor
 	}
 	latest, err := newestIndexedEvent(ctx, db, dbName)
 	if err != nil {
