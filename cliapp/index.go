@@ -23,6 +23,30 @@ import (
 	"github.com/dbtrail/dbtrail/internal/serverid"
 )
 
+// ddlAutoSnapshot is the file-mode DDL hook's snapshot step. It uses
+// metadata.TakeSnapshotExcludingInvalid — the stream DDL hook's degraded
+// validation semantics (#1051) — so one no-PK / non-InnoDB table in scope no
+// longer fails file-mode DDL handling (#1199), and it warns loudly about any
+// exclusions (same contract as the stream hook in internal/streamrun). Every
+// OTHER snapshot failure — source unreachable, index write error, nothing
+// valid left to capture — still errors.
+func ddlAutoSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (metadata.SnapshotStats, error) {
+	stats, err := metadata.TakeSnapshotExcludingInvalid(sourceDB, indexDB, schemas)
+	if err != nil {
+		return stats, err
+	}
+	if len(stats.ExcludedTables) > 0 {
+		// #1051: prominent, so the operator learns these tables are invisible
+		// to bintrail from the log rather than from a failed recovery attempt.
+		slog.Warn("auto-snapshot EXCLUDED tables that are not InnoDB or lack an explicit primary key — "+
+			"their row events are not captured and they are absent from this snapshot; "+
+			"add a primary key (and use InnoDB) to capture them",
+			"excluded_tables", strings.Join(stats.ExcludedTables, ", "),
+			"snapshot_id", stats.SnapshotID)
+	}
+	return stats, nil
+}
+
 var indexCmd = &cobra.Command{
 	Use:   "index",
 	Short: "Parse binlog files and populate the index",
@@ -165,6 +189,12 @@ func runIndex(cmd *cobra.Command, args []string) error {
 
 	// ── 6. Index each file ────────────────────────────────────────────────────────────
 	p := parser.New(idxBinlogDir, resolver, filters, nil)
+	// Run-scoped skip tally (#1199): validation-excluded tables no longer fail
+	// the file, so their skipped events need an aggregate end-of-run signal —
+	// file mode has no capture ledger to persist to (empty stream_state IS the
+	// no-capture marker), so the tally is summarized below instead.
+	runSkips := parser.NewSkipCounters(nil)
+	p.SetSkipCounters(runSkips)
 	idx := indexer.New(indexDB, idxBatchSize)
 
 	// DDL handler: auto-snapshot when --source-dsn is available; warn-only otherwise.
@@ -193,7 +223,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 			"file", ev.BinlogFile, "pos", ev.EndPos,
 			"ddl_type", ev.DDLType, "schema", ev.Schema, "table", ev.Table)
 
-		stats, snapErr := metadata.TakeSnapshot(sourceDB, indexDB, schemas)
+		stats, snapErr := ddlAutoSnapshot(sourceDB, indexDB, schemas)
 		var snapID *int
 		if snapErr != nil {
 			slog.Error("auto-snapshot after DDL failed; subsequent events may use stale schema",
@@ -235,6 +265,13 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		"files_processed", len(files),
 		"events_indexed", totalEvents,
 		"failed_files", failedFiles)
+	if total := runSkips.Total(); total > 0 {
+		snap, _ := runSkips.Snapshot()
+		slog.Warn("events were read from the binlogs but NOT indexed this run — a restore window over them is incomplete; "+
+			"see the per-event WARNs above for each table (validation-excluded tables need a PK + InnoDB and a re-snapshot, or exclude them via --schemas/--tables)",
+			"skipped_total", total,
+			"skipped_by_reason", snap)
+	}
 
 	if idxFormat == "json" {
 		if err := cliutil.OutputJSON(struct {
