@@ -24,6 +24,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/doctor"
 	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/observe"
 	"github.com/dbtrail/dbtrail/internal/rotation"
 	"github.com/dbtrail/dbtrail/internal/serverid"
 	"github.com/dbtrail/dbtrail/internal/streamdeps"
@@ -432,7 +433,10 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	if err := wireVerify(ctx, &cfg, registry, serversPath, notifier); err != nil {
 		return err
 	}
-	if notifier != nil {
+	// The continuity watch serves two channels: webhook events (notifier) and
+	// the Prometheus gauge (#1203). Either one being enabled starts it; with
+	// neither, nothing runs.
+	if notifier != nil || upMetricsAddr != "" {
 		startContinuityWatch(ctx, notifier, registry, upIndexDSN)
 	}
 
@@ -442,7 +446,7 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	// retune retain/interval/add-future without a restart.
 	rotation.StartLoop(ctx, rotationSettingsProvider(registry), func() []rotation.RotateTarget {
 		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
-	}, rotationNotifyHooks(notifier)...)
+	}, rotationCycleHooks(notifier)...)
 
 	// Reclaim local baseline snapshots that already have a durable S3 copy (#616):
 	// the global --baseline-dir plus every registry server's per-server dir.
@@ -594,7 +598,10 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	if err := wireVerify(ctx, &cfg, registry, serversPath, notifier); err != nil {
 		return err
 	}
-	if notifier != nil {
+	// The continuity watch serves two channels: webhook events (notifier) and
+	// the Prometheus gauge (#1203). Either one being enabled starts it; with
+	// neither, nothing runs.
+	if notifier != nil || upMetricsAddr != "" {
 		startContinuityWatch(ctx, notifier, registry, upIndexDSN)
 	}
 
@@ -603,7 +610,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// console can retune retain/interval/add-future without a restart.
 	rotation.StartLoop(ctx, rotationSettingsProvider(registry), func() []rotation.RotateTarget {
 		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
-	}, rotationNotifyHooks(notifier)...)
+	}, rotationCycleHooks(notifier)...)
 
 	// Reclaim local baseline snapshots that already have a durable S3 copy (#616):
 	// the global --baseline-dir plus every registry server's per-server dir.
@@ -875,17 +882,76 @@ func wireVerify(ctx context.Context, cfg *console.Config, registry *console.Regi
 		slog.Error("verify history unavailable; runs will NOT be recorded and the history endpoint will refuse — fix or move the file and restart", "error", err)
 		history = nil
 	}
-	var onFinish func(console.VerifyRunRecord)
-	if notifier != nil {
-		onFinish = notifier.VerifyFinished
-	}
-	sup := newVerifySupervisor(ctx, history, onFinish)
+	sup := newVerifySupervisor(ctx, history, verifyFinishObservers(notifier))
+	seedVerifyGauges(registry, history)
 	cfg.VerifyCtrl = sup
 	cfg.VerifyHistory = history
 	if interval > 0 {
 		startVerifyLoop(ctx, sup, registry, history, interval, splitVerifyTables(upVerifyTables))
 	}
 	return nil
+}
+
+// verifyFinishObservers composes the supervisor's finish hook: the health
+// gauges always (#1203), the webhook notifier when configured. Both observe
+// the same record history gets.
+func verifyFinishObservers(notifier *watchNotifier) func(console.VerifyRunRecord) {
+	return func(rec console.VerifyRunRecord) {
+		setVerifyGauges(rec, rec.ServerName)
+		if notifier != nil {
+			notifier.VerifyFinished(rec)
+		}
+	}
+}
+
+// verifyRunPublishable reports whether a record carries a verdict the gauges
+// may publish. Only a succeeded run that verified at least one table
+// conclusively counts — a failed run, a zero-table run ("only one baseline
+// yet"), or an all-inconclusive run must NOT overwrite the last real verdict:
+// zeroed counts would auto-resolve a live mismatch alert, and a refreshed
+// timestamp would keep the staleness alert quiet while verification is in
+// fact broken. It recognizes the same degenerate-run shapes as the webhook's
+// clean/problem split (watchNotifier.VerifyFinished) and Report.ExitError,
+// but the VERDICTS differ by design: the webhook still notifies on
+// failed/all-inconclusive runs, and the gauges publish mismatch runs (the
+// alert must fire) — do not extract one shared predicate.
+func verifyRunPublishable(rec console.VerifyRunRecord) bool {
+	s := rec.Summary
+	return rec.State == "succeeded" && s.Total > 0 && s.Inconclusive < s.Total
+}
+
+// setVerifyGauges publishes one finished run under the given server label
+// (the CURRENT display name — the seed path must not resurrect a pre-rename
+// name from an old record).
+func setVerifyGauges(rec console.VerifyRunRecord, server string) {
+	if !verifyRunPublishable(rec) {
+		return
+	}
+	finished, err := time.Parse(time.RFC3339, rec.FinishedAt)
+	if err != nil {
+		return
+	}
+	s := rec.Summary
+	observe.SetVerifyOutcome(server, finished, s.Match, s.Mismatch, s.Inconclusive, s.Error)
+}
+
+// seedVerifyGauges republishes each registry server's newest publishable run
+// at startup (#1203) — the pull path survives restarts, reading the same
+// history the console panel reads (the panel additionally shows failed runs;
+// the gauges only carry conclusive verdicts).
+func seedVerifyGauges(registry *console.Registry, history *console.VerifyHistory) {
+	if registry == nil || history == nil {
+		return
+	}
+	for _, e := range registry.List() {
+		for _, rec := range history.List(e.ID) {
+			if !verifyRunPublishable(rec) {
+				continue
+			}
+			setVerifyGauges(rec, e.Name)
+			break
+		}
+	}
 }
 
 // splitVerifyTables parses the comma-separated --verify-tables list; empty

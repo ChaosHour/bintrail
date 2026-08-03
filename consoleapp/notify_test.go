@@ -192,18 +192,64 @@ func testRegistryWithEntries(t *testing.T, entries ...console.ServerEntry) *cons
 	return reg
 }
 
-func TestRotationNotifyHooks(t *testing.T) {
-	if hooks := rotationNotifyHooks(nil); hooks != nil {
-		t.Fatalf("nil notifier must yield no hooks, got %d", len(hooks))
+func TestRotationCycleHooks(t *testing.T) {
+	// The gauge hook is always present (#1203) — it publishes only when a
+	// cycle actually runs; the notifier hook joins it when configured.
+	if hooks := rotationCycleHooks(nil); len(hooks) != 1 {
+		t.Fatalf("nil notifier must still yield the gauge hook, got %d", len(hooks))
 	}
 	n, f := testNotifier()
-	hooks := rotationNotifyHooks(n)
-	if len(hooks) != 1 {
-		t.Fatalf("want 1 hook, got %d", len(hooks))
+	hooks := rotationCycleHooks(n)
+	if len(hooks) != 2 {
+		t.Fatalf("want gauge + notifier hooks, got %d", len(hooks))
 	}
-	hooks[0](true, 0)
+	hooks[1](true, 0)
 	if len(f.events) != 1 {
-		t.Fatalf("hook is not wired to the notifier: %+v", f.events)
+		t.Fatalf("notifier hook is not wired: %+v", f.events)
+	}
+}
+
+// TestVerifyRunPublishable: only a succeeded run that conclusively verified
+// at least one table may reach the gauges — a failed, zero-table, or
+// all-inconclusive run overwriting the counts would auto-resolve a live
+// mismatch alert and keep the staleness alert quiet while verification is
+// broken (the gauge-path twin of the webhook's clean/problem split).
+func TestVerifyRunPublishable(t *testing.T) {
+	rec := func(state string, match, mismatch, inconclusive, total int) console.VerifyRunRecord {
+		return console.VerifyRunRecord{VerifyStatus: console.VerifyStatus{State: state,
+			Summary: console.VerifySummary{Match: match, Mismatch: mismatch, Inconclusive: inconclusive, Total: total}}}
+	}
+	cases := []struct {
+		name string
+		rec  console.VerifyRunRecord
+		want bool
+	}{
+		{"clean run", rec("succeeded", 5, 0, 0, 5), true},
+		{"mismatch run still publishes (the alert must fire)", rec("succeeded", 3, 2, 0, 5), true},
+		{"partially inconclusive publishes", rec("succeeded", 3, 0, 2, 5), true},
+		{"failed run must not publish", rec("failed", 0, 0, 0, 0), false},
+		{"zero-table run must not publish", rec("succeeded", 0, 0, 0, 0), false},
+		{"all-inconclusive must not publish", rec("succeeded", 0, 0, 5, 5), false},
+		{"skip record must not publish", rec(console.VerifyStateSkipped, 0, 0, 0, 0), false},
+	}
+	for _, tc := range cases {
+		if got := verifyRunPublishable(tc.rec); got != tc.want {
+			t.Errorf("%s: publishable = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestVerifyFinishObservers: gauges never panic without a notifier, and the
+// notifier still receives the record when configured.
+func TestVerifyFinishObservers(t *testing.T) {
+	rec := console.VerifyRunRecord{ServerID: "s1", ServerName: "wp",
+		VerifyStatus: console.VerifyStatus{State: "succeeded", FinishedAt: "2026-08-02T12:00:00Z",
+			Summary: console.VerifySummary{Mismatch: 1, Total: 1}}}
+	verifyFinishObservers(nil)(rec) // must not panic
+	n, f := testNotifier()
+	verifyFinishObservers(n)(rec)
+	if len(f.events) != 1 {
+		t.Fatalf("notifier must observe the record: %+v", f.events)
 	}
 }
 

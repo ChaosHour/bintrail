@@ -13,6 +13,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/notify"
+	"github.com/dbtrail/dbtrail/internal/observe"
 )
 
 // continuityPollInterval is how often the continuity watcher re-reads each
@@ -56,13 +57,15 @@ func newWatchNotifierFromFlags(ctx context.Context) (*watchNotifier, error) {
 	return newWatchNotifier(ctx, upNotifyWebhook), nil
 }
 
-// rotationNotifyHooks adapts an optional notifier to rotation.StartLoop's
-// variadic onCycle parameter.
-func rotationNotifyHooks(n *watchNotifier) []func(failed bool, deferred int) {
-	if n == nil {
-		return nil
+// rotationCycleHooks builds rotation.StartLoop's onCycle callbacks: the
+// health gauge always (#1203 — it publishes only once a cycle actually runs),
+// plus the webhook notifier when configured.
+func rotationCycleHooks(n *watchNotifier) []func(failed bool, deferred int) {
+	hooks := []func(bool, int){observe.SetRotationHealth}
+	if n != nil {
+		hooks = append(hooks, n.RotationCycle)
 	}
-	return []func(bool, int){n.RotationCycle}
+	return hooks
 }
 
 // VerifyFinished is the verifySupervisor.onFinish hook: it fires on runs that
@@ -191,6 +194,10 @@ func (n *watchNotifier) Continuity(server, edgeKey string, gapLost bool, detail 
 	n.send.Notify(ev)
 }
 
+// bootContinuityName labels the command-line boot index in continuity/verify
+// gauges and webhook events.
+const bootContinuityName = "cli index"
+
 // continuityTarget is one index DB the watcher polls.
 type continuityTarget struct {
 	name string
@@ -198,38 +205,22 @@ type continuityTarget struct {
 }
 
 // startContinuityWatch polls each index's stream_state for a stamped
-// gap_lost_at and edge-notifies transitions. Its own loop — deliberately NOT
-// piggybacked on rotation (rotation can be off) or the metrics scraper
-// (metrics can be off, and it lives in the capture plane).
+// gap_lost_at, publishes the verdict as a Prometheus gauge (#1203), and —
+// when a notifier is configured — edge-notifies transitions. Its own loop,
+// deliberately NOT piggybacked on rotation (rotation can be off) or the
+// metrics scraper (it lives in the capture plane). n may be nil: the watch
+// then serves the pull path only (started under --metrics-addr without
+// --notify-webhook).
 func startContinuityWatch(ctx context.Context, n *watchNotifier, registry *console.Registry, bootDSN string) {
+	w := &continuityWatcher{
+		n: n, registry: registry, bootDSN: bootDSN,
+		unknownEdge: notify.NewEdge(0),
+		prevNames:   make(map[string]bool),
+		readGap:     readGapLost,
+	}
 	go func() {
-		runCycle := func() {
-			defer func() {
-				if r := recover(); r != nil {
-					slog.Error("continuity watch cycle panicked; watching continues next tick", "panic", r)
-				}
-			}()
-			for _, t := range continuityTargets(registry, bootDSN) {
-				if ctx.Err() != nil {
-					return
-				}
-				gapLost, detail, err := readGapLost(ctx, t.dsn)
-				if err != nil {
-					// Unknown is never "no gap" — and never silent either: a
-					// watcher that cannot watch is itself a coverage hole. The
-					// edge keeps this to one warning per day per index.
-					if n.edge.Fire("continuity-unknown:"+t.dsn, "") {
-						slog.Warn("continuity watch cannot evaluate this index (unreachable, or a legacy schema without the gap columns) — gap_lost will NOT be detected for it",
-							"server", t.name, "error", err)
-					}
-					continue
-				}
-				n.edge.Resolve("continuity-unknown:" + t.dsn)
-				n.Continuity(t.name, t.dsn, gapLost, detail)
-			}
-		}
 		if ctx.Err() == nil {
-			runCycle()
+			w.runCycle(ctx)
 		}
 		tick := time.NewTicker(continuityPollInterval)
 		defer tick.Stop()
@@ -238,10 +229,87 @@ func startContinuityWatch(ctx context.Context, n *watchNotifier, registry *conso
 			case <-ctx.Done():
 				return
 			case <-tick.C:
-				runCycle()
+				w.runCycle(ctx)
 			}
 		}
 	}()
+}
+
+// continuityWatcher is the poller's state, split from the goroutine so a unit
+// test can drive cycles with an injected readGap — no ticker, no real DB.
+// All fields are touched only by the poller goroutine (or the test driving
+// runCycle directly).
+type continuityWatcher struct {
+	n        *watchNotifier // nil = gauge-only (started under --metrics-addr alone)
+	registry *console.Registry
+	bootDSN  string
+
+	// unknownEdge rate-limits the cannot-evaluate warning (one per day per
+	// index) — its own edge so it works with a nil notifier too.
+	unknownEdge *notify.Edge
+	// prevNames: every gauge label this watcher owned after the last cycle —
+	// the boot label plus ALL registry entry names (not the DSN-deduped poll
+	// targets: a second entry sharing a DSN still publishes verify gauges
+	// under its own name and must be cleaned up when it goes). A renamed or
+	// deleted server's gauges are UNPUBLISHED, not frozen at their last value
+	// (a stale gap_lost=1 would alert forever; a stale gap_lost=0 would read
+	// "evaluated, healthy" for an index nobody evaluates).
+	prevNames map[string]bool
+	readGap   func(ctx context.Context, dsn string) (gapLost bool, detail string, err error)
+}
+
+func (w *continuityWatcher) runCycle(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("continuity watch cycle panicked; watching continues next tick", "panic", r)
+		}
+	}()
+	curNames := w.ownedNames()
+	for name := range w.prevNames {
+		if !curNames[name] {
+			observe.ClearContinuity(name)
+			observe.DeleteVerifyOutcome(name)
+		}
+	}
+	w.prevNames = curNames
+	for _, t := range continuityTargets(w.registry, w.bootDSN) {
+		if ctx.Err() != nil {
+			return
+		}
+		gapLost, detail, err := w.readGap(ctx, t.dsn)
+		if err != nil {
+			// Unknown is never "no gap" — and never silent either: a watcher
+			// that cannot watch is itself a coverage hole. The gauge is
+			// UNPUBLISHED (never a healthy 0) and the edge keeps the warning
+			// to one per day per index.
+			observe.ClearContinuity(t.name)
+			if w.unknownEdge.Fire("continuity-unknown:"+t.dsn, "") {
+				slog.Warn("continuity watch cannot evaluate this index (unreachable, or a legacy schema without the gap columns) — gap_lost will NOT be detected for it",
+					"server", t.name, "error", err)
+			}
+			continue
+		}
+		w.unknownEdge.Resolve("continuity-unknown:" + t.dsn)
+		observe.SetContinuityGapLost(t.name, gapLost)
+		if w.n != nil {
+			w.n.Continuity(t.name, t.dsn, gapLost, detail)
+		}
+	}
+}
+
+// ownedNames is the full set of gauge labels this watcher is responsible
+// for cleaning up — see prevNames.
+func (w *continuityWatcher) ownedNames() map[string]bool {
+	out := make(map[string]bool)
+	if w.bootDSN != "" {
+		out[bootContinuityName] = true
+	}
+	if w.registry != nil {
+		for _, e := range w.registry.List() {
+			out[e.Name] = true
+		}
+	}
+	return out
 }
 
 // continuityTargets enumerates the boot index (when watch was given one) plus
@@ -251,7 +319,7 @@ func continuityTargets(registry *console.Registry, bootDSN string) []continuityT
 	var out []continuityTarget
 	seen := make(map[string]bool)
 	if bootDSN != "" {
-		out = append(out, continuityTarget{name: "cli index", dsn: bootDSN})
+		out = append(out, continuityTarget{name: bootContinuityName, dsn: bootDSN})
 		seen[bootDSN] = true
 	}
 	if registry != nil {
