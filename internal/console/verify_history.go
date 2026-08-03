@@ -3,16 +3,23 @@ package console
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"sync"
 )
 
-// verifyHistoryCap is how many runs are kept per server. Old records fall off
+// VerifyHistoryCap is how many runs are kept per server. Old records fall off
 // the front — the history answers "when did this last verify, and how has it
 // been trending", not "archive every run forever".
-const verifyHistoryCap = 20
+//
+// Exported because eviction is SILENT: a consumer summarizing the history has
+// no other way to tell "these are all the runs there ever were" from "these
+// are the newest VerifyHistoryCap of them". A server whose List is exactly
+// this long must be reported as a possibly-truncated window, or a summary
+// says "no failed runs" about a period whose failures fell off the front.
+const VerifyHistoryCap = 20
 
 // VerifyRunRecord is one completed (or skipped) verify run as stored in the
 // history file and served by GET /api/servers/{id}/verify/history. It embeds
@@ -42,6 +49,17 @@ const (
 	VerifyStateSkipped     = "skipped"
 )
 
+// The rest of the VerifyStatus.State vocabulary. Named alongside
+// VerifyStateSkipped because a consumer summarizing the history has to branch
+// on all of them: "not skipped" is NOT "verified" — it also admits failed,
+// and the two transient states a run can be caught in.
+const (
+	VerifyStateIdle      = "idle"
+	VerifyStateRunning   = "running"
+	VerifyStateSucceeded = "succeeded"
+	VerifyStateFailed    = "failed"
+)
+
 // verifyHistoryFile is the on-disk envelope: versioned like the server
 // registry so a future shape change can be detected instead of misparsed.
 type verifyHistoryFile struct {
@@ -63,6 +81,7 @@ const verifyHistoryVersion = 1
 type VerifyHistory struct {
 	mu      sync.Mutex
 	path    string
+	found   bool
 	servers map[string][]VerifyRunRecord
 }
 
@@ -85,6 +104,7 @@ func OpenVerifyHistory(path string) (*VerifyHistory, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read verify history %s: %w", path, err)
 	}
+	h.found = true
 	if len(data) == 0 {
 		return h, nil
 	}
@@ -112,8 +132,8 @@ func (h *VerifyHistory) Append(rec VerifyRunRecord) error {
 	// Clone before appending: an in-place append could write into old's spare
 	// capacity, which would corrupt the rollback below.
 	recs := append(slices.Clone(old), rec)
-	if len(recs) > verifyHistoryCap {
-		recs = recs[len(recs)-verifyHistoryCap:]
+	if len(recs) > VerifyHistoryCap {
+		recs = recs[len(recs)-VerifyHistoryCap:]
 	}
 	h.servers[rec.ServerID] = recs
 	if err := h.save(); err != nil {
@@ -141,6 +161,23 @@ func (h *VerifyHistory) List(serverID string) []VerifyRunRecord {
 		out[len(recs)-1-i] = r
 	}
 	return out
+}
+
+// Found reports whether a history file existed when this history was opened.
+// A consumer that reports on verification activity MUST keep this distinct
+// from an opened-but-empty history: the file is written only by
+// `bintrail-console watch`, so a CLI-only deployment has no history at all,
+// and rendering that absence like "no failed runs" would state a clean
+// verification record for a period nothing ever verified.
+func (h *VerifyHistory) Found() bool { return h.found }
+
+// ServerIDs returns the server ids present in the history, sorted, so a
+// consumer can enumerate what was recorded without access to the server
+// registry (a run's server may since have been removed from it).
+func (h *VerifyHistory) ServerIDs() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Sorted(maps.Keys(h.servers))
 }
 
 // save writes the file atomically. Callers hold h.mu. Same temp-file + fsync
