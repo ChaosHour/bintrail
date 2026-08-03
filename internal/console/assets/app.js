@@ -646,16 +646,76 @@ function setActiveNav(route) {
 
 // ── Overview ─────────────────────────────────────────────────────────────────
 
+// covCard renders the live RPO statement (#1194). The window's upper edge is
+// the last INDEXED event on purpose — "restorable up to now" with a dead
+// stream would be false assurance; the lag chip is what says "now". Degrades
+// loudly: gap_lost/unavailable red, unknown amber, empty index explicit.
+function covCard(c) {
+  const card = el("section", { class: "ov-panel cov-card" });
+  card.append(el("div", { class: "ov-panel-head" },
+    el("h2", { class: "ov-panel-title", text: "Restore coverage" })));
+  const cont = c.continuity || "unknown";
+  const bad = cont === "gap_lost" || cont === "unavailable";
+  const warn = cont === "unknown";
+  if (bad && !c.delta_to) {
+    // Unreachable/broken backend: say nothing about the window — "no events
+    // yet" would be a positive factual claim about an index we couldn't read.
+  } else if (!c.delta_to) {
+    card.append(el("p", { class: "cov-line warn", text: "No indexed events yet — nothing to restore from." }));
+  } else if (!c.delta_from) {
+    // Unknown floor: don't assert a bounded window whose start we don't know.
+    card.append(el("p", { class: "cov-line" },
+      "Restorable up to ", el("b", { text: c.delta_to }), "; the window start could not be determined."));
+  } else {
+    card.append(el("p", { class: "cov-line" },
+      "Any point between ", el("b", { text: c.delta_from }),
+      " and ", el("b", { text: c.delta_to }), " is restorable."));
+  }
+  const chips = el("div", { class: "cov-chips" });
+  if (typeof c.lag_seconds === "number") {
+    chips.append(el("span", { class: "cov-chip" + (c.lag_seconds > 300 ? " warn" : " ok"), text: "capture lag " + c.lag_seconds + "s" }));
+  }
+  // "none" (file-mode: no capture ran) stays NEUTRAL — green would paint a
+  // non-claim as assurance.
+  chips.append(el("span", { class: "cov-chip" + (bad ? " bad" : warn ? " warn" : cont === "ok" ? " ok" : ""), text: "continuity " + cont }));
+  card.append(chips);
+  if (cont === "gap_lost") {
+    card.append(el("p", { class: "cov-line bad", text: "Events were permanently lost — the window has a hole; points beyond the gap need a fresh baseline." }));
+  } else if (cont === "unavailable") {
+    card.append(el("p", { class: "cov-line bad", text: "Continuity could not be read — treat the window as unverified." }));
+  } else if (warn) {
+    card.append(el("p", { class: "cov-line warn", text: "Continuity is not evaluable on this index — the window may have undetected holes." }));
+  }
+  if (c.baseline_configured) {
+    if (c.full_table_status === "unknown") {
+      // An error must never render like "nothing broken" — the broken-table
+      // warning would silently vanish behind a failed listing.
+      card.append(el("p", { class: "cov-line warn", text: "Full-table coverage could not be evaluated — check the daemon log." }));
+    }
+    if (c.full_table_from) {
+      card.append(el("p", { class: "cov-line", text: "Full-table restore for tables with a baseline: any point from " + c.full_table_from + " onwards." }));
+    }
+    if (c.broken_tables && c.broken_tables.length) {
+      card.append(el("p", { class: "cov-line bad", text: "Not fully restorable (newest baseline predates coverage): " + c.broken_tables.join(", ") + " — take a fresh baseline." }));
+    }
+  }
+  return card;
+}
+
 async function renderOverview() {
   const gen = serverGen;
   viewLoading();
   try {
-    const [status, eventsData] = await Promise.all([
+    const [status, eventsData, coverage] = await Promise.all([
       api("/api/status").catch(() => null),
       api("/api/events?limit=200&order=DESC"),
+      // A failed fetch must render the same red "unavailable" card the
+      // nil-db path gets — a swallowed null would make a broken endpoint
+      // indistinguishable from a console without the feature.
+      api("/api/coverage").catch((err) => { console.error("coverage fetch failed", err); return { continuity: "unavailable" }; }),
     ]);
     if (gen !== serverGen) return;
-    buildOverview(status, eventsData); // render INSIDE the try: a throw here shows an error, never a stuck "Loading…"
+    buildOverview(status, eventsData, coverage); // render INSIDE the try: a throw here shows an error, never a stuck "Loading…"
   } catch (err) {
     if (gen !== serverGen) return;
     const v = VIEW(); clear(v); v.append(pageHead("Overview", null)); renderError(v, err);
@@ -665,7 +725,7 @@ async function renderOverview() {
 // buildOverview renders the dashboard from the two fetched payloads. status may
 // be null (its fetch is best-effort); when it is, we do NOT claim a global
 // total — `events` is only the fetched window (limit 200), never the index size.
-function buildOverview(status, eventsData) {
+function buildOverview(status, eventsData, coverage) {
   if (status) updateSideMeta(status);
 
   const events = (eventsData && eventsData.events) || [];
@@ -695,6 +755,10 @@ function buildOverview(status, eventsData) {
     el("b", { text: deletes + " delete(s)" }),
     " in the last " + events.length + " event(s): the ones worth a look first.");
   v.append(pageHead("Overview", sub));
+
+  // Restore coverage — the live RPO statement (#1194). Best-effort: no card
+  // when the fetch failed, never a fabricated window.
+  if (coverage) v.append(covCard(coverage));
 
   // stats
   const stats = el("div", { class: "ov-stats" });
