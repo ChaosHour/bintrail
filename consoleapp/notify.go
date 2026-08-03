@@ -7,13 +7,17 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/notify"
 	"github.com/dbtrail/dbtrail/internal/observe"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
+	"github.com/dbtrail/dbtrail/internal/status"
 )
 
 // continuityPollInterval is how often the continuity watcher re-reads each
@@ -197,6 +201,207 @@ func (n *watchNotifier) Continuity(server, edgeKey string, gapLost bool, detail 
 // bootContinuityName labels the command-line boot index in continuity/verify
 // gauges and webhook events.
 const bootContinuityName = "cli index"
+
+// BaselineStale reports one server's staleness verdict (#1193). Only broken
+// notifies — aging stays visible in status/console (pre-saturation aging is a
+// bootstrap artifact; alerting on it would cry wolf — see
+// status.baselineAgingFraction's comment); the channel carries the transition
+// that means "full-table restore is impossible NOW". edgeKey identifies the
+// (index DSN, baseline source) PAIR — never the display name (it can collide
+// with the reserved boot label), and never the DSN alone: staleness is a
+// property of the pair, so unlike the continuity poller (which dedups by DSN
+// because gap_lost is per-index) two sources graded against one index are
+// distinct conditions and must not Fire/Resolve against each other.
+// brokenTables must be a STABLE identity (sorted
+// table list) — never a clock- or floor-derived string: the coverage floor
+// advances with every rotation cycle, and a volatile edge detail would bypass
+// the repeat window and page every hour.
+func (n *watchNotifier) BaselineStale(server, edgeKey string, broken bool, brokenTables, coverageFloor string) {
+	key := "baseline:" + edgeKey
+	if !broken {
+		if n.edge.Resolve(key) {
+			n.send.Notify(notify.Event{
+				Event: notify.EventBaselineStale, Severity: notify.SeverityInfo, Server: server, Resolved: true,
+				Summary: "every table's newest baseline is inside delta coverage again — full-table restore is possible",
+			})
+		}
+		return
+	}
+	if !n.edge.Fire(key, brokenTables) {
+		return
+	}
+	n.send.Notify(notify.Event{
+		Event: notify.EventBaselineStale, Severity: notify.SeverityCritical, Server: server,
+		Summary: "the newest baseline predates available delta coverage — full-table restore through the missing window is impossible; take a fresh baseline (bintrail dump + bintrail baseline)",
+		Details: map[string]string{"tables": brokenTables, "coverage_floor": coverageFloor},
+	})
+}
+
+// stalenessPollInterval: staleness moves with rotation cycles (hourly by
+// default), and each check lists the baseline source — an S3 LIST every few
+// minutes would buy nothing.
+const stalenessPollInterval = time.Hour
+
+// stalenessWatcher evaluates each server's baseline staleness (#1193) and
+// feeds the webhook channel on the broken transition. Webhook-gated only:
+// status and the console carry the full ok/aging verdicts.
+type stalenessWatcher struct {
+	n         *watchNotifier
+	registry  *console.Registry
+	bootDSN   string
+	globalDir string
+	globalS3  string
+
+	// unknownEdge rate-limits the cannot-evaluate warnings to one per day per
+	// index — a watcher that cannot watch is itself a coverage hole and must
+	// never go silent (the continuity poller's rule).
+	unknownEdge *notify.Edge
+
+	// Injectable for tests — no ticker, no real DB, no real S3.
+	listBaselines func(ctx context.Context, source string) ([]reconstruct.BaselineFile, error)
+	oldestDelta   func(ctx context.Context, dsn string) (time.Time, error)
+}
+
+func startStalenessWatch(ctx context.Context, n *watchNotifier, registry *console.Registry, bootDSN, globalDir, globalS3 string) {
+	w := &stalenessWatcher{
+		n: n, registry: registry, bootDSN: bootDSN, globalDir: globalDir, globalS3: globalS3,
+		unknownEdge:   notify.NewEdge(0),
+		listBaselines: reconstruct.ListBaselines,
+		oldestDelta:   oldestDeltaByDSN,
+	}
+	go func() {
+		if ctx.Err() == nil {
+			w.runCycle(ctx)
+		}
+		tick := time.NewTicker(stalenessPollInterval)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				w.runCycle(ctx)
+			}
+		}
+	}()
+}
+
+// stalenessTarget is one server with a baseline source to grade.
+type stalenessTarget struct{ name, dsn, source string }
+
+// targets applies the same all-or-nothing baseline fallback as
+// withBaselineDefaults (#1010): an entry with its OWN dir or S3 chose its
+// location; only a fully unset entry inherits the process-wide one. Servers
+// with no baseline anywhere have nothing to grade and are skipped.
+func (w *stalenessWatcher) targets() []stalenessTarget {
+	globalSrc := w.globalDir
+	if globalSrc == "" {
+		globalSrc = w.globalS3
+	}
+	var out []stalenessTarget
+	if w.bootDSN != "" && globalSrc != "" {
+		out = append(out, stalenessTarget{name: bootContinuityName, dsn: w.bootDSN, source: globalSrc})
+	}
+	if w.registry != nil {
+		for _, e := range w.registry.List() {
+			src := e.BaselineDir
+			if src == "" {
+				src = e.BaselineS3
+			}
+			if src == "" {
+				src = globalSrc
+			}
+			if src == "" {
+				continue
+			}
+			out = append(out, stalenessTarget{name: e.Name, dsn: e.DSN, source: src})
+		}
+	}
+	return out
+}
+
+func (w *stalenessWatcher) runCycle(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("baseline staleness cycle panicked; checking continues next tick", "panic", r)
+		}
+	}()
+	for _, t := range w.targets() {
+		if ctx.Err() != nil {
+			return
+		}
+		// The edge identity is the (dsn, source) pair — see BaselineStale's
+		// doc. \x1f as separator: a control char no DSN or path contains.
+		edgeID := t.dsn + "\x1f" + t.source
+		files, err := w.listBaselines(ctx, t.source)
+		if err != nil {
+			// A configured-but-unreadable source (broken mount, revoked S3
+			// credentials, deleted bucket) disarms this whole check — that
+			// must never be silent: a broken window would go undetected, and
+			// an active alert freezes with a dead evaluator.
+			if w.unknownEdge.Fire("staleness-source:"+edgeID, "") {
+				slog.Warn("baseline staleness cannot be evaluated — the baseline source is unreadable; a broken restore window would go UNDETECTED for this server",
+					"server", t.name, "source", t.source, "error", err)
+			}
+			continue
+		}
+		w.unknownEdge.Resolve("staleness-source:" + edgeID)
+		if len(files) == 0 {
+			// Routine on fresh installs — but while a broken alert is ACTIVE
+			// it means the stale snapshots vanished without replacement
+			// (prune loop, lifecycle rule, emptied mount): restore is still
+			// impossible and the alert would silently freeze, so warn.
+			// Never a Resolve — nothing was fixed.
+			if w.n.edge.Active("baseline:"+edgeID) && w.unknownEdge.Fire("staleness-empty:"+edgeID, "") {
+				slog.Warn("baseline source lists NO snapshots while a baseline_stale alert is active — restore is still impossible and the alert is frozen; take a fresh baseline",
+					"server", t.name, "source", t.source)
+			}
+			continue
+		}
+		w.unknownEdge.Resolve("staleness-empty:" + edgeID)
+		oldest, err := w.oldestDelta(ctx, t.dsn)
+		if err != nil || oldest.IsZero() {
+			// Unknown floor is never a verdict — and must never RESOLVE an
+			// active broken alert either, so the target is skipped whole.
+			// Skipped, not silent: same rule as the unreadable source above.
+			if w.unknownEdge.Fire("staleness-floor:"+edgeID, "") {
+				slog.Warn("baseline staleness cannot be evaluated — the delta-coverage floor is unknown (index unreachable or unpartitioned)",
+					"server", t.name, "error", err)
+			}
+			continue
+		}
+		w.unknownEdge.Resolve("staleness-floor:" + edgeID)
+		now := time.Now().UTC()
+		newest := make(map[string]time.Time, len(files))
+		for _, f := range files {
+			k := f.Schema + "." + f.Table
+			if f.SnapshotTime.After(newest[k]) {
+				newest[k] = f.SnapshotTime
+			}
+		}
+		// ALL broken tables, sorted — the edge detail must be a stable
+		// identity, and a map-iteration-ordered single pick would flip
+		// between cycles and re-fire through the repeat window.
+		var brokenTables []string
+		for k, ts := range newest {
+			if status.BaselineStalenessFor(ts, oldest, now) == status.BaselineBroken {
+				brokenTables = append(brokenTables, k)
+			}
+		}
+		sort.Strings(brokenTables)
+		w.n.BaselineStale(t.name, edgeID, len(brokenTables) > 0,
+			strings.Join(brokenTables, ", "), oldest.UTC().Format(time.RFC3339))
+	}
+}
+
+func oldestDeltaByDSN(ctx context.Context, dsn string) (time.Time, error) {
+	db, err := config.Connect(dsn)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer db.Close()
+	return status.OldestDeltaFromDB(ctx, db, indexDBName(dsn))
+}
 
 // continuityTarget is one index DB the watcher polls.
 type continuityTarget struct {

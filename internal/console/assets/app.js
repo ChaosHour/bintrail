@@ -2104,11 +2104,24 @@ function baselinesPanel(b, servers) {
       el("code", { class: "stg-code", text: b.source }),
       el("p", { class: "stg-empty-sub", text: "Run bintrail dump and bintrail baseline to create your first snapshot. The path must point at the folder that contains the snapshots, not a specific file (<timestamp>/<schema>/<table>.parquet)." })));
   } else {
-    b.snapshots.forEach((sn) => {
+    // Panel headline: the newest-per-table rollup. Older snapshots being past
+    // coverage is routine (superseded) — only the headline and the newest
+    // row's verdict are actionable, so only those get a chip.
+    if (b.staleness && b.staleness !== "ok") {
+      list.append(el("div", { class: "vfy-summary" },
+        el("span", { class: "chip chip-mon", text: b.staleness === "broken"
+          ? "⚠ BASELINE STALE — full-table restore broken; take a fresh baseline"
+          : "BASELINE " + b.staleness.toUpperCase() })));
+    }
+    b.snapshots.forEach((sn, idx) => {
       const row = el("div", { class: "stg-row" });
       row.append(el("span", { class: "stg-name mono", text: sn.time }));
       row.append(el("span", { class: "stg-dest", text:
         (sn.tables || []).length + " table(s)" + (sn.binlog_file ? " · " + sn.binlog_file + ":" + sn.binlog_pos : "") }));
+      if (idx === 0 && sn.staleness && sn.staleness !== "ok") {
+        row.append(el("span", { class: "chip chip-mon", text:
+          sn.staleness === "broken" ? "⚠ STALE — restore broken" : sn.staleness.toUpperCase() }));
+      }
       row.append(el("span", { class: "stg-age", text: formatAge(sn.age_hours) + " ago" }));
       list.append(row);
     });
