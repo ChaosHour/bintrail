@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-08-03
+
+The **continuous backup assurance** epic (#1189). A recovery tool that is never
+exercised is a claim, not a capability: the index could be silently missing
+hours, the newest baseline could sit outside the window the deltas can bridge,
+and nothing would say so until a restore was already needed. This release adds
+the checks that run on their own, the channel that reports them, the rehearsal
+that proves a restore end to end, and the path back when the index itself is
+what was lost.
+
+### Added
+- **Scheduled verification with persisted run history** (#1191, #1200): `bintrail-console watch` verifies on a schedule and keeps every verdict, so "when did this last verify, and how has it been trending" has an answer. The history is a console-local file, never a table in the index database — scheduled verify covers registry servers and registry DSNs never receive DDL. A shutdown mid-run is recorded as such rather than persisted as a success, and a cycle that could not run a server records the skip instead of dropping it, so a schedule that never actually verifies is visible rather than silent.
+- **Webhook notification channel** (#1192, #1201): edge-triggered notifications for permanently-lost events, verify problems and unhealthy rotation, on the same contract shape as the audit sink. Severity is part of the notification key, so a warning cannot suppress a critical for the same target, and an all-inconclusive run never auto-resolves a standing mismatch alert.
+- **Baseline staleness verdict** (#1193, #1213): every baseline snapshot is graded — ok / aging / broken / unknown — against the oldest instant deltas are actually available from, which is what says whether a full restore is still possible. The floor has one strict implementation: partition existence is coverage, archives extend it backwards only when contiguous, and `aging` deliberately never alerts (until retention saturates it fires on every fresh install).
+- **Restore coverage as a live RPO card** (#1194, #1220): the console overview shows the reconstructable window, capture lag and the continuity verdict, backed by a new `GET /api/coverage`. The window's upper edge is a per-partition probe rather than a whole-table `MAX`, and the full-table half reports `unknown` on error so a failure can never render as "nothing is broken".
+- **`bintrail drill`** (#1195, #1222): an automated restore rehearsal into an operator-provided scratch MySQL — reconstruct, dump, load, and compare the loaded row count against exactly what was written. Per-table timings are real RTO data. It refuses a target holding any table in the drilled schemas, and a binlog-only fallback is a marked failure rather than a pass: a rehearsal without a baseline is never a PASS. See `docs/drill.md`.
+- **`bintrail restore-index`** (#1196, #1229): rebuild a lost index database from the Parquet archive tier. The fresh-index guard probes `stream_state` and `schema_snapshots` as well as the events table — a surviving `stream_state` would make a restarted stream resume at the old position and fake continuity — and the report is an honest inventory: rows already loaded from a file that later failed are named as such rather than folded into a clean total. See `docs/index-recovery.md`.
+- **`doctor --archive-s3`** (#1197, #1230): an advisory S3 Object Lock posture check — WARN, SKIP or PASS, never FAIL. It flags a bucket with lock disabled, one enabled without a default retention rule (uploads set no per-object retention, so archives land unlocked), and a default retention shorter than `--retain`. The audit behind it found no code path in bintrail that deletes archived data from S3 at all, and the SDK already sends the checksum a locked bucket requires. See `docs/object-lock.md`.
+- **Continuity, verify and rotation health as Prometheus gauges** (#1203, #1205).
+- **`assurance` package** (#1233, #1234): exported read-only accessors for the coverage, continuity, staleness and verify-history signals, for tooling and distributions that import the core as a module. Type aliases rather than restated structs, so a second implementation of any verdict cannot appear and an embedder's rendering cannot drift from `bintrail status`.
+- **MCP `list_schema_changes` gains `snapshot_id` and an `uncovered_only` filter** (#1050, #1190).
+- **PostgreSQL as a source is GA** (#597): docs updated, along with stale console claims.
+
+### Fixed
+- **Baseline staleness cried wolf on an index capturing more than one source** (#1219, #1231): live partitions are shared by every source, but `archive_state` rows are per-source and a baseline snapshot carries no source identity at all — so extending the floor backwards with the union handed one source's archive coverage to another. Taking the union is a missed alarm; refusing to extend is a false one on two sources that have both archived since day one. Unattributable archives now grade `unknown` instead of either, the watcher skips such a target rather than resolving a standing alert, and `bintrail status` says the check could not be evaluated instead of printing a bare verdict.
+- **Statement-format DML drops were counted but not attributed** (#999, #1204): the capture-skip tally could not say which reason discarded events, and `--fail-on-gap` did not fail on them.
+- **An unreadable capture-skip ledger was laundered into a clean "{}"** (#1206, #1208): a ledger that could not be read was rewritten as empty, erasing the record that anything had been skipped.
+- **Not every capture-skip reason failed `--fail-on-gap`** (#1207, #1209): the contract now covers all of them, failing closed.
+- **`query` overflowed on binlog positions above 2^63** (#1202, #1217): the scan is now `uint64`; the dead #986 type-matrix workaround is gone.
+- **File-mode `index` misdiagnosed validation-excluded tables** (#1199, #1216): the diagnosis now names the real reason, and the DDL hook degrades the way the stream's does instead of failing differently.
+- **A PostgreSQL-shaped snapshot on the MySQL path was diagnosed as corrupt** (#1198, #1215; #1009, #1188): `reconstruct`, the shim and `verify` now say the snapshot is for the other engine, which is the verdict that leads to the fix.
+- **A mismatched render-GUCs stamp went unwarned in the shim and console folds** (#921, #1214).
+- **A DDL auto-snapshot over invalid tables crash-looped the stream** (#1051, #1186): it degrades instead.
+- **The statement-format DML alarm fired for schemas that were never captured** (#1000, #1185).
+- **`status` reported by-design TRUNCATE rows as uncovered DDL** (#1049, #1187), and mislabeled the index as file mode while doing it.
+
 ## [0.48.0] - 2026-07-31
 
 ### Added
