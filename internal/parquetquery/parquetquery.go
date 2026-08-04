@@ -177,6 +177,7 @@ func FetchWithTuning(ctx context.Context, opts query.Options, source string, tun
 	if colErr != nil {
 		return nil, fmt.Errorf("read parquet schema: %w", colErr)
 	}
+	reportDigestCoverage(ctx, db, "'"+strings.ReplaceAll(glob, "'", "''")+"'", source, opts)
 	q, args := buildQueryForFile(glob, opts, cols)
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -243,6 +244,7 @@ func queryFileList(ctx context.Context, db *sql.DB, files []string, opts query.O
 	if err != nil {
 		return nil, fmt.Errorf("read parquet schema: %w", err)
 	}
+	reportDigestCoverage(ctx, db, fileArrayLiteral(files), "s3-direct", opts)
 	q, args := buildQueryFromFiles(files, opts, cols)
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -708,6 +710,7 @@ func queryLocalFile(ctx context.Context, db *sql.DB, path, srcURL string, opts q
 	if colErr != nil {
 		return nil, fmt.Errorf("read parquet schema %s: %w", srcURL, colErr)
 	}
+	reportDigestCoverage(ctx, db, "'"+strings.ReplaceAll(path, "'", "''")+"'", srcURL, opts)
 	q, args := buildQueryForFile(path, opts, cols)
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -834,7 +837,7 @@ func fileArrayLiteral(files []string) string {
 // connection_id when it is absent from every file, matching buildQueryForFile
 // so archives written before that column read back correctly.
 func buildQueryFromFiles(files []string, opts query.Options, cols map[string]bool) (string, []any) {
-	where, args := buildFilters(opts)
+	where, args := buildFilters(opts, cols)
 
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
 		" gtid, " + optionalCol(cols, "connection_id", "INT32") + ", schema_name, table_name, event_type, pk_values," +
@@ -875,7 +878,7 @@ func buildGlob(source string) string {
 // sorting after collecting all results. Skipping ORDER BY lets DuckDB stream
 // rows without buffering the full result set, dramatically reducing memory.
 func buildUnsortedQuery(path string, opts query.Options) (string, []any) {
-	where, args := buildFilters(opts)
+	where, args := buildFilters(opts, nil)
 	safePath := strings.ReplaceAll(path, "'", "''")
 
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
@@ -897,7 +900,7 @@ func buildUnsortedQuery(path string, opts query.Options) (string, []any) {
 // The glob is embedded directly in the SQL because DuckDB table functions do not
 // support bind parameters for the file path argument.
 func buildQuery(glob string, opts query.Options) (string, []any) {
-	where, args := buildFilters(opts)
+	where, args := buildFilters(opts, nil)
 
 	// Escape single quotes in the glob path to prevent SQL injection.
 	safeGlob := strings.ReplaceAll(glob, "'", "''")
@@ -937,7 +940,7 @@ func limitPerPKClause(opts query.Options) (string, []any) {
 }
 
 // buildFilters extracts WHERE clause fragments and bind args from query options.
-func buildFilters(opts query.Options) ([]string, []any) {
+func buildFilters(opts query.Options, cols map[string]bool) ([]string, []any) {
 	var where []string
 	var args []any
 
@@ -1017,6 +1020,32 @@ func buildFilters(opts query.Options) ([]string, []any) {
 		where = append(where, "json_contains(changed_columns, ?)")
 		args = append(args, string(needle))
 	}
+	if opts.QueryHash != "" {
+		if cols != nil && !cols["query_hash"] {
+			// The column exists in NONE of the scanned files, and parquet_scan
+			// errors on a predicate over a column it cannot resolve — the same
+			// trap optionalCol handles for the SELECT list, which is why this
+			// cannot be left to the projection. Such a file provably holds no
+			// event carrying any digest, so contributing nothing is the correct
+			// answer, not a dropped filter.
+			//
+			// Reporting deliberately does NOT live here. cols is a UNION over
+			// the scanned set on two of the three entry paths, so this branch
+			// says nothing about the case that actually matters — a set MIXED
+			// across the #699 upgrade, where the predicate IS emitted and the
+			// older files quietly pad to NULL. reportDigestCoverage is where
+			// that distinction is visible; see it for what the operator is told.
+			where = append(where, "1=0")
+		} else {
+			// Lowercased because DuckDB compares strings case-sensitively while
+			// MySQL's default collation does not: without this the same filter
+			// would return live rows and drop their archived counterparts,
+			// which reads as "the statement stopped touching rows" at exactly
+			// the rotation boundary.
+			where = append(where, "query_hash = ?")
+			args = append(args, strings.ToLower(opts.QueryHash))
+		}
+	}
 	for _, ce := range opts.ColumnEq {
 		// DuckDB does not bind JSON paths either, so the column name is
 		// interpolated; re-validate via the shared allowlist for the same
@@ -1069,6 +1098,56 @@ func parquetColumns(ctx context.Context, db *sql.DB, path string) (map[string]bo
 	return cols, nil
 }
 
+// digestCoverageWarning renders what an operator must be told when only part of
+// the scanned archive set can carry a statement digest. Pure so the wording and
+// the boundaries are testable without DuckDB.
+//
+// Both non-empty verdicts describe the SAME row-level outcome — those files
+// contribute nothing — and that outcome is correct. What is not acceptable is
+// it happening silently: a narrower answer that looks identical to "the
+// statement touched nothing" is the failure this whole filter is written
+// against. Returns "" when every scanned file can answer, which is the steady
+// state once every archive postdates the upgrade.
+func digestCoverageWarning(withDigest, total int) string {
+	switch {
+	case total == 0 || withDigest >= total:
+		return ""
+	case withDigest == 0:
+		return fmt.Sprintf("no archive file in this source has a statement-digest column (%d file(s), all written before statement capture); this source contributes no rows to a --query-hash answer", total)
+	default:
+		return fmt.Sprintf("%d of %d archive file(s) in this source predate statement capture and contribute no rows to a --query-hash answer", total-withDigest, total)
+	}
+}
+
+// reportDigestCoverage probes how many of the scanned parquet files carry
+// query_hash and warns when some or all of them cannot.
+//
+// scanTarget is the parquet_schema() argument the caller would pass to
+// parquet_scan (a quoted glob, or an array literal from fileArrayLiteral);
+// source names it in the warning, because a query can span several registered
+// archive sources and "some files are old" is useless without knowing which.
+//
+// Best-effort by construction: it reads footers only, it runs ONLY under a
+// digest filter, and a probe failure downgrades to a warning about the probe
+// rather than failing a query whose rows are already correct.
+func reportDigestCoverage(ctx context.Context, db *sql.DB, scanTarget, source string, opts query.Options) {
+	if opts.QueryHash == "" {
+		return
+	}
+	var total, withDigest int
+	err := db.QueryRowContext(ctx,
+		"SELECT count(DISTINCT file_name), count(DISTINCT CASE WHEN name = 'query_hash' THEN file_name END) FROM parquet_schema("+scanTarget+")").
+		Scan(&total, &withDigest)
+	if err != nil {
+		slog.Warn("could not determine statement-digest coverage of this archive source; a narrower answer would go unreported",
+			"source", source, "error", err)
+		return
+	}
+	if w := digestCoverageWarning(withDigest, total); w != "" {
+		slog.Warn("parquetquery: "+w, "source", source, "query_hash", opts.QueryHash)
+	}
+}
+
 // optionalCol returns the bare column name when the scanned parquet source has
 // it, or a typed-NULL alias when absent. This handles backward compatibility
 // when reading archive files written before a schema-adding release (e.g.
@@ -1085,7 +1164,7 @@ func optionalCol(cols map[string]bool, name, sqlType string) string {
 // buildQueryForFile constructs a DuckDB query for a single parquet file,
 // substituting typed NULLs for optional columns not present in the file.
 func buildQueryForFile(path string, opts query.Options, cols map[string]bool) (string, []any) {
-	where, args := buildFilters(opts)
+	where, args := buildFilters(opts, cols)
 	safePath := strings.ReplaceAll(path, "'", "''")
 
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +

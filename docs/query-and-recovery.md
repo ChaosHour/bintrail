@@ -127,6 +127,23 @@ When the source logs the original SQL statement alongside row events, `bintrail`
 - **`query_text`** — the literal statement that produced the row event (`UPDATE users SET ...`), as the application sent it (subject to the sanitization notes below). One statement covers all of its rows: a 500-row bulk `DELETE` yields 500 events sharing the same text, and each statement in a multi-statement transaction carries its own.
 - **`query_hash`** — MySQL's `STATEMENT_DIGEST()` of that text, computed against the **index** server at index time. Statements that differ only in literal values share one hash, so you can group by it to find the query patterns mutating a table ("which statement shape is behind this DELETE volume?").
 
+**Filtering by statement** — pass a digest you already have back as a filter to see everything that statement did:
+
+```bash
+# every event the statement produced, across every table it touched
+bintrail query --index-dsn "..." --query-hash 3f2a...e91 --format json
+```
+
+`--query-hash` is a **read** filter and exists only on `query` — not on `recover`. The digest names a statement *shape*, not one execution: `WHERE id=1` and `WHERE id=999` share it, so the filter returns every execution of that statement inside the window. That is the right answer for "what does this query pattern touch?" and the wrong basis for a reversal, which would undo executions you never named. Reverse a specific blast radius with the PK/time filters `recover` already has.
+
+Three more things it will not do:
+
+- It is refused, not silently ignored, when `--profile` is set. Under a profile the digest is blanked on every returned row, so filtering on it would confirm the statement the redaction hides — one guessed digest at a time.
+- Archives written before statement capture existed have no digest column and contribute no rows. That is reported per source (`predate statement capture`, with a file count when only *part* of a source is affected), rather than failing the query — but the report is a log line, not an error, so an answer over a half-upgraded archive is narrower than it looks.
+- **Statements over 16 KiB are unreachable by digest.** They are stored truncated and truncated statements are never digested (see the note below), so `query_hash` stays `NULL` on every row a giant bulk `UPDATE`/`DELETE` produced — which is often exactly the statement worth chasing after an incident. You can still see its `query_text`; you cannot filter by it.
+
+When a digest filter returns nothing from a window where **no** event carries a digest at all, `bintrail query` says so on stderr instead of leaving you with a bare empty table: an empty result there means "this source was not logging statements", not "that statement touched nothing".
+
 Capture is **opt-in at the source** — off by default on MySQL, on by default on MariaDB 10.2.4+:
 
 ```sql
