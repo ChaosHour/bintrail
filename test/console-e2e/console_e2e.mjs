@@ -50,6 +50,95 @@ try {
   }
   monitor ? ok("boot: monitor capability reported") : bad("boot: monitor capability reported", "capsCache.monitor !== true after caps load");
 
+  // Scenario 0b — the sidebar footer reports the running build (#1221). This
+  // harness builds the daemon without -ldflags, so the server reports "dev";
+  // the assertion is against the SERVER's own value, not a hardcoded string,
+  // so a CONSOLE_BIN=<released build> run still passes. What it really guards
+  // is the blank/garbage artifact: an empty row, or a label glued together as
+  // "v" + a missing value.
+  const sideVer = await page.evaluate(() => ({
+    label: (document.querySelector("#meta-version b") || {}).textContent || "",
+    reported: typeof capsCache !== "undefined" ? capsCache.version : undefined,
+  }));
+  const wantVer = /^v?\d+\.\d+\.\d+/.test(String(sideVer.reported || ""))
+    ? "v" + String(sideVer.reported).replace(/^v/, "")
+    : (String(sideVer.reported || "") || "dev");
+  sideVer.label === wantVer
+    ? ok("sidebar: running version shown")
+    : bad("sidebar: running version shown", `label=${JSON.stringify(sideVer.label)} want=${JSON.stringify(wantVer)} (capabilities version=${JSON.stringify(sideVer.reported)})`);
+
+  // Scenario 0c — the shapes the live daemon cannot produce, driven through the
+  // REAL function (same technique as the ext-view scenarios below: stub
+  // capsCache, call the production code, read the DOM). This harness builds
+  // without -ldflags, so the server always reports the literal "dev" and 0b
+  // above only ever exercises that branch; the released-build expectation has
+  // to come from a FIXED input with a HARDCODED expectation, or dropping the
+  // "v" prefix — or a regex that stops matching semver — ships green. (It does
+  // NOT cover the leading-"v" strip: that is classification-only and produces
+  // an identical string either way, which is why app.js says so in prose
+  // instead of pretending a test pins it.) The other two shapes: `version` is
+  // omitempty, so a Config with an empty Version sends no key at all and must
+  // read "dev", never "" or "vundefined"; and a capabilities fetch that FAILED
+  // is a different state — it must keep the "—" placeholder rather than report
+  // "dev" for a build it never read.
+  const degraded = await page.evaluate(() => {
+    const keep = capsCache.version;
+    const read = () => (document.querySelector("#meta-version b") || {}).textContent;
+    capsCache.version = "1.2.3";
+    updateSideVersion(true);
+    const semver = read();
+    delete capsCache.version;
+    updateSideVersion(true);
+    const unversioned = read();
+    updateSideVersion(false);
+    const unknown = read();
+    capsCache.version = keep;
+    updateSideVersion(true);
+    return { semver, unversioned, unknown, restored: read() };
+  });
+  degraded.semver === "v1.2.3"
+    ? ok("sidebar: a released version renders as vX.Y.Z")
+    : bad("sidebar: a released version renders as vX.Y.Z", `got ${JSON.stringify(degraded.semver)} for capabilities version "1.2.3"`);
+  degraded.unversioned === "dev"
+    ? ok("sidebar: unversioned build falls back to 'dev'")
+    : bad("sidebar: unversioned build falls back to 'dev'", `got ${JSON.stringify(degraded.unversioned)}`);
+  degraded.unknown === "—"
+    ? ok("sidebar: failed capabilities fetch never claims a version")
+    : bad("sidebar: failed capabilities fetch never claims a version", `got ${JSON.stringify(degraded.unknown)}`);
+  degraded.restored === wantVer
+    ? ok("sidebar: version restored after the degraded probes")
+    : bad("sidebar: version restored after the degraded probes", `got ${JSON.stringify(degraded.restored)}`);
+
+  // Scenario 0d — the WIRING, not the function. 0c calls updateSideVersion(false)
+  // directly, which proves the "—" branch exists but says nothing about the
+  // caller ever reaching it: hardcoding updateSideVersion(true), or initialising
+  // capsOK to true, passes 0b and 0c untouched and ships a console that reports
+  // "dev" for a build it never read. So drive the real gateCapabilities() with a
+  // FAILING /api/capabilities.
+  // Two traps this is shaped around. The stub must answer 500, never 401 —
+  // gateCapabilities RETHROWS a 401, and an unhandled rejection inside
+  // page.evaluate surfaces as a harness crash instead of a failed assertion. And
+  // it must restore with a real gateCapabilities() before returning: the failure
+  // path sets capsCache = {}, which strips every cap-on class and would break the
+  // control-plane scenarios below (scenario 10 models the same restore).
+  const wiring = await page.evaluate(async () => {
+    const realFetch = window.fetch;
+    window.fetch = (p, o) => (typeof p === "string" && p.startsWith("/api/capabilities")
+      ? Promise.resolve(new Response('{"error":"boom"}', { status: 500, headers: { "Content-Type": "application/json" } }))
+      : realFetch(p, o));
+    await gateCapabilities();
+    window.fetch = realFetch;
+    const onFailure = (document.querySelector("#meta-version b") || {}).textContent;
+    await gateCapabilities();
+    return { onFailure, restored: (document.querySelector("#meta-version b") || {}).textContent };
+  });
+  wiring.onFailure === "—"
+    ? ok("sidebar: a failing capabilities fetch actually reaches the '—' branch")
+    : bad("sidebar: a failing capabilities fetch actually reaches the '—' branch", `got ${JSON.stringify(wiring.onFailure)} — capsOK never false?`);
+  wiring.restored === wantVer
+    ? ok("sidebar: version repainted once capabilities recover")
+    : bad("sidebar: version repainted once capabilities recover", `got ${JSON.stringify(wiring.restored)}`);
+
   await page.evaluate(() => openServersModal());
   await page.waitForSelector("#servers-list", { timeout: 5000 });
   await page.waitForTimeout(400);
