@@ -107,7 +107,7 @@ Examples:
 }
 
 func init() {
-	verifyCmd.Flags().StringVar(&vfySourceDSN, "source-dsn", "", "DSN for the live source MySQL database; pass it for live-source mode, omit for baseline-anchored mode")
+	verifyCmd.Flags().StringVar(&vfySourceDSN, "source-dsn", "", "DSN for the live source database (MySQL DSN, or postgres:// for a PostgreSQL source); pass it for live-source mode, omit for baseline-anchored mode")
 	verifyCmd.Flags().StringVar(&vfyIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	verifyCmd.Flags().StringVar(&vfyBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots")
 	verifyCmd.Flags().StringVar(&vfyBaselineS3, "baseline-s3", "", "S3 URL prefix of baseline Parquet snapshots (e.g. s3://bucket/baselines/)")
@@ -176,18 +176,22 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
+	flavor := query.SourceFlavor(indexDB)
 	if vfyCheck == checkRecover {
-		// Index-only, source-family agnostic: it walks stored event images,
-		// so it needs neither the source flavor nor a baseline.
-		return runVerifyRecoverInputs(cmd, indexDB, resolver, indexDBName, duckTuning)
+		// Index-only: the chain walk reads stored event images, so it needs
+		// no baseline and no live source. The flavor still matters for ONE
+		// thing — table ENUMERATION: the default MAX(snapshot_id) lookup
+		// names a single relation on a PG index (see verifyTargetTablesForFlavor).
+		return runVerifyRecoverInputs(cmd, indexDB, resolver, indexDBName, duckTuning, flavor)
 	}
 
-	flavor := query.SourceFlavor(indexDB)
 	if vfySourceDSN != "" {
-		// Live-source verify fingerprints the source with MySQL-only SQL; refuse
-		// a PG source up front rather than reach a misleading inconclusive.
+		// The index's recorded flavor routes the live fingerprint: MySQL SQL
+		// (CONSISTENT SNAPSHOT + @@gtid_executed) or the PG-native checksum
+		// (REPEATABLE READ + pg_current_wal_lsn, #1024). The flag value itself
+		// is not sniffed — the index is truth, same rule as everywhere else.
 		if flavor == "postgres" {
-			return fmt.Errorf("live-source verify (--source-dsn) is not supported for PostgreSQL sources; omit it to run baseline-anchored verify")
+			return runVerifyLivePG(cmd, indexDB, resolver, indexDBName, baselineSrc, duckTuning)
 		}
 		return runVerifyLive(cmd, indexDB, resolver, indexDBName, baselineSrc, duckTuning)
 	}
@@ -449,6 +453,66 @@ func runVerifyLive(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resol
 	return emitVerifyReport(cmd, rep)
 }
 
+// runVerifyLivePG is live-source mode for a PostgreSQL source (#1024): the
+// same per-table loop and report as runVerifyLive, driving the engine's PG
+// sibling (verify.VerifyTablePG). Three deliberate differences:
+//   - the source is reached through the pgLiveVerifyConnect seam (a pinned
+//     PG connection — the render-GUC pin is what makes the live scan
+//     byte-comparable), opened ONCE and used serially across tables;
+//   - the core bintrail binary leaves the seam empty and refuses here with a
+//     pointer to bintrail-pg, keeping cmd/bintrail postgres-free;
+//   - target tables come from the resolver (verify.PGTargetTables), not the
+//     MAX(snapshot_id) query: a PG index stores one relation per snapshot_id,
+//     so that query would silently verify a single table.
+func runVerifyLivePG(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resolver, indexDBName, baselineSrc string, duckTuning duckdbutil.Tuning) error {
+	if pgLiveVerifyConnect == nil {
+		return fmt.Errorf("live-source verify for a PostgreSQL source is not available in this binary (it links no PostgreSQL driver); run it with `bintrail-pg verify --source-dsn ...`, or omit --source-dsn for baseline-anchored verify")
+	}
+	sourceChecksum, closeSource, err := pgLiveVerifyConnect(cmd.Context(), vfySourceDSN)
+	if err != nil {
+		return fmt.Errorf("connect to source database: %w", err)
+	}
+	defer func() { _ = closeSource() }()
+
+	var explicit []string
+	if vfyTables != "" {
+		explicit = splitAndTrim(vfyTables, ",")
+	}
+	tables, err := verify.PGTargetTables(resolver, explicit)
+	if err != nil {
+		return err
+	}
+	if len(tables) == 0 {
+		return fmt.Errorf("no tables to verify (empty --tables and no schema snapshot)")
+	}
+
+	cfg := verify.PGLiveConfig{
+		SourceChecksum: sourceChecksum,
+		IndexDB:        indexDB,
+		Resolver:       resolver,
+		BaselineSource: baselineSrc,
+		IndexDBName:    indexDBName,
+		NoArchive:      vfyNoArchive,
+		ArchiveFetcher: TunedArchiveFetcher(duckTuning),
+		DuckDBTuning:   duckTuning,
+	}
+
+	results := make([]verify.TableResult, 0, len(tables))
+	for _, st := range tables {
+		res, err := verify.VerifyTablePG(cmd.Context(), cfg, st.Schema, st.Table)
+		if err != nil {
+			// One table's hard error must not abort the run and hide the other
+			// tables' results (including real mismatches) — same isolation as
+			// runVerifyLive.
+			res = verify.TableResult{Schema: st.Schema, Table: st.Table, Status: verify.StatusError, Detail: err.Error()}
+		}
+		results = append(results, res)
+	}
+	rep := verify.NewReport(verify.ModeLive, results)
+	rep.BaselineSource = baselineSrc
+	return emitVerifyReport(cmd, rep)
+}
+
 // runVerifyRecoverInputs is the recover-input check (#1001): for each table,
 // walk the per-PK event chains and assert the before/after images `recover`
 // consumes are internally consistent.
@@ -456,7 +520,7 @@ func runVerifyLive(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resol
 // It shares the report, the renderer and — critically — Report.ExitError with
 // the content modes, so a recover-input mismatch fails a CI/cron gate exactly
 // like any other mismatch instead of going through a second exit path.
-func runVerifyRecoverInputs(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resolver, indexDBName string, duckTuning duckdbutil.Tuning) error {
+func runVerifyRecoverInputs(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resolver, indexDBName string, duckTuning duckdbutil.Tuning, flavor string) error {
 	lookback, err := cliutil.ParseRetain(vfyLookback)
 	if err != nil {
 		return fmt.Errorf("--lookback: %w", err)
@@ -465,7 +529,7 @@ func runVerifyRecoverInputs(cmd *cobra.Command, indexDB *sql.DB, resolver *metad
 		return fmt.Errorf("--max-events must be >= 0 (0 uses the default of %d)", verify.DefaultRecoverInputsMaxEvents)
 	}
 
-	tables, err := verifyTargetTables(cmd, indexDB)
+	tables, err := verifyTargetTablesForFlavor(cmd, indexDB, resolver, flavor)
 	if err != nil {
 		return err
 	}
@@ -544,6 +608,33 @@ func verifyTableFilter() (map[string]bool, error) {
 }
 
 type schemaTable struct{ schema, table string }
+
+// verifyTargetTablesForFlavor picks the table-enumeration strategy by the
+// index's source flavor: the MySQL default is the MAX(snapshot_id) lookup
+// (verifyTargetTables — one snapshot covers the whole schema), but on a
+// PostgreSQL index that same query silently names ONE relation
+// (WritePGSnapshot stores one relation per snapshot_id), so the PG branch
+// enumerates the per-table resolver instead (verify.PGTargetTables — the same
+// rule runVerifyLivePG applies). Without this split, `verify --check recover`
+// on a PG index verified a single table and reported green (#1024 review).
+func verifyTargetTablesForFlavor(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resolver, flavor string) ([]schemaTable, error) {
+	if flavor != "postgres" {
+		return verifyTargetTables(cmd, indexDB)
+	}
+	var explicit []string
+	if vfyTables != "" {
+		explicit = splitAndTrim(vfyTables, ",")
+	}
+	sts, err := verify.PGTargetTables(resolver, explicit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]schemaTable, len(sts))
+	for i, st := range sts {
+		out[i] = schemaTable{st.Schema, st.Table}
+	}
+	return out, nil
+}
 
 // verifyTargetTables returns the tables to verify: the explicit --tables list,
 // or every table in the latest schema snapshot.
