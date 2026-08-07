@@ -185,6 +185,16 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 				q.Type, c.Name, q.Schema, q.Table, c.DataType))
 		}
 	}
+	// A generated PK member — the MariaDB system-versioning shape (#1266) —
+	// refuses BOTH full-table paths, so no _flashback steer here: the baseline
+	// merge cannot canonicalize a column the baseline omits, and the
+	// binlog-only fold is the corrupt view (see checkGeneratedPKFullTable).
+	// After the type loop on purpose, same ordering as the CLI's
+	// ReconstructTable gate: an empty DataType must keep winning the #1009
+	// wrong-path verdict above.
+	if c, found := reconstruct.GeneratedPKColumn(pkCols); found {
+		return nil, generatedPKFullTableError(q.Type, q.Schema, q.Table, c)
+	}
 
 	ctx, cancel := h.queryContext()
 	defer cancel()
@@ -455,6 +465,51 @@ func (h *Handler) pkColumnMetas(schema, table string) ([]metadata.ColumnMeta, bo
 		return nil, false
 	}
 	return tm.PKColumnMetas(), true
+}
+
+// generatedPKFullTableError renders the wire refusal for a full-table
+// time-travel view of a table whose PK contains a generated column (#1266) —
+// the MariaDB system-versioning shape (PRIMARY KEY silently extended with the
+// ROW END period column). Deliberately NO _flashback steer, unlike the
+// refusals above: the binlog-only view is exactly the corrupt one here
+// (history-row inserts fold under their own full pk_values and render as
+// duplicate live rows, and a versioned DELETE is an Update_rows tombstone the
+// latest-event rule keeps as live — verified against MariaDB 11.4). And no
+// shim single-row steer either: the versioned PK is composite (id, row_end),
+// so PKColumnCheck refuses the `WHERE pk = v` shape on these tables — the one
+// single-row path that does work is the CLI's, with an explicit column list.
+func generatedPKFullTableError(qType QueryType, schema, table string, c metadata.ColumnMeta) error {
+	return mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE, fmt.Sprintf(
+		"resolve %s: primary-key column %s of %s.%s is a generated column (most commonly MariaDB system versioning, "+
+			"which extends the PK with its ROW END period column); neither the baseline merge nor a binlog-only fold "+
+			"can render this table faithfully — history rows and versioned deletes share the surviving key — so the "+
+			"full-table view is refused; use the CLI's single-row reconstruct with an explicit PK column list",
+		qType, c.Name, schema, table))
+}
+
+// checkGeneratedPKFullTable is the runFullTable-side entry of the #1266 gate:
+// it resolves the PK metas itself and returns the wire refusal when a
+// generated PK member is present, nil otherwise. Best-effort by design — an
+// unavailable resolver or unresolved table returns nil, the same degrade every
+// pkColumnMetas caller applies, so it can only ADD a refusal where the
+// metadata proves the corrupt shape, never block a table it cannot see.
+func (h *Handler) checkGeneratedPKFullTable(qType QueryType, schema, table string) error {
+	pkCols, ok := h.pkColumnMetas(schema, table)
+	if !ok {
+		// Blind spot, said out loud: with no snapshot metadata the corrupt
+		// shape is undetectable and the fold proceeds unchecked. Debug, not
+		// Warn — a snapshot-less deployment (plain _flashback use) hits this
+		// on every full-table query and has nothing to fix; resolver LOAD
+		// failures already get a rate-limited Warn in resolverCache.get.
+		h.logger.Debug("shim: cannot evaluate the generated-PK gate (no snapshot metadata); full-table fold proceeds unchecked",
+			"schema", schema, "table", table)
+		return nil
+	}
+	c, found := reconstruct.GeneratedPKColumn(pkCols)
+	if !found {
+		return nil
+	}
+	return generatedPKFullTableError(qType, schema, table, c)
 }
 
 // fullTableTextCell renders one merged-resultset value to a uniform text cell
