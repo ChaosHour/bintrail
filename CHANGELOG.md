@@ -7,8 +7,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.50.0] - 2026-08-08
+
+Three threads. **Availability lag**: knowing capture didn't lose data is not the
+same as knowing it is keeping up — this release measures the lag that decides
+whether a recovery would be current. **Open the archive tier**: the Parquet
+layout bintrail already writes becomes usable by your own OLAP tooling — view
+definitions, refreshable baseline snapshots, a sandboxed SQL panel — without
+bintrail becoming the query engine. **Name the remedy**: every gap error that
+used to stop at a diagnosis now says what command fixes it.
+
+### Added
+- **Read→queryable lag, the number that decides recovery readiness** (#1223;
+  #1240, #1242, #1244, #1248): the stream measures the time from reading a
+  binlog event to that event being queryable in the index, `bintrail status`
+  reports whether capture is keeping up (not just whether it lost data), the
+  console coverage card says whether capture is alive, and the alerting docs
+  center on what makes data recoverable.
+- **`reconstruct --output-format parquet`** (#1169, #1241): full-table
+  reconstruct can emit a discoverable baseline snapshot — `_SUCCESS`/`_MANIFEST`
+  markers plus the binlog anchor in the Parquet footer — so a reconstruction
+  becomes the next baseline. The cut is positional, never by timestamp: event
+  timestamps are execution times, and a transaction straddling a timestamp cut
+  would be lost between one fold and the next.
+- **`bintrail baseline refresh`** (#1170, #1245): a new baseline = the old
+  baseline + index deltas, with no mydumper run and without touching the source.
+  Publication is all-or-nothing (a snapshot mixing two instants under one anchor
+  is worse than none), refusals are verdict-typed (`refused-gap`,
+  `refused-ddl`), and `--allow-gaps` stamps the footer so every descendant
+  snapshot inherits the taint — a refresh cannot launder a gapped baseline.
+- **`bintrail views`** (#1172, #1243): emits DuckDB view definitions over the
+  Parquet archive layout (`events` plus one `state_<schema>_<table>` per table
+  of the newest snapshot). Pure text — bintrail executes nothing; point your own
+  DuckDB at your own lake.
+- **Console: periodic baseline refresh from the daemon, opt-in** (#1171, #1247)
+  and a **DuckDB-schema panel for external tooling** (#1246): `watch` can keep
+  baselines moving forward on an interval (conservative DuckDB budget, never
+  `--allow-gaps`), and the console offers the view definitions for copy-paste
+  instead of becoming the engine.
+- **Console: sandboxed server-side SQL panel** (#1177, #1254): read-only DuckDB
+  over the archive tier with `external_access=false` as the load-bearing
+  prohibition and a fail-closed directory/S3-prefix allowlist as the carve-out.
+- **Shim: opt-in per-tenant `allowed_schemas` authorization** (#824, #1255).
+- **Encrypted dumps are authenticated with an HMAC-SHA256 sidecar** (#960,
+  #1253): `openssl enc` CBC provides no integrity, so tampering was previously
+  undetectable; verification is refused-on-mismatch, not advisory.
+- **PostgreSQL-native live-source verify** (#1024, #1262): `verify
+  --source-dsn` against a PG source computes the consistency checksum with
+  PG-native semantics instead of assuming MySQL formatting.
+- **`query --query-hash`** (#1235): filter events by statement digest. Query-only
+  by design — a digest names a statement *shape*, so a `recover` filtered by it
+  would revert executions nobody named; it is also refused under `--profile`.
+- **`archive reconcile --trust-empty-scan`** (#1282): per-backend escape from
+  the prune dead end after a legitimate total wipe, where "empty scan" was
+  indistinguishable from "backend unreachable".
+- **Console shows the running version in the sidebar footer** (#1239).
+
+### Fixed
+- **MariaDB system versioning corrupted every downstream surface that touched a
+  versioned table** (#863, #1263; #1276; #1277; #1269): baselines now exclude
+  period columns from the parsed schema (mydumper emits their values; loading
+  them back is an error), snapshots synthesize the hidden period columns of
+  *implicitly* versioned tables so row images align, cascade synthesis gates
+  system-versioned child edges via a metadata probe in both phases, and
+  reconstruct/verify refuse generated PK members up front with a named verdict
+  instead of failing mid-run.
+- **Gap errors diagnosed without naming the remedy** (#961; #1268, #1271,
+  #1278, #1279): the CLI `GapError` hint, the MCP error rewrite, the console's
+  reconstruct 422 and the docs all now name `bintrail archive reconcile
+  --repair` — the bare `reconcile` everyone reached for first is a dry-run that
+  re-syncs nothing.
+- **`allow_gaps: true` silently widened beyond what the caller conceded**
+  (#1283, #1287, #1288): the console's `/api/reconstruct` now surfaces the two
+  blind spots the override also disables as explicit warnings, MCP query/recover
+  results name archive sources that were skipped rather than folding them into a
+  smaller answer, and a reconstruct boundary-probe error no longer leaks the CLI
+  `--at` flag to MCP clients.
+- **A corrupted S3 baseline read fine until it didn't** (#698, #1284):
+  `_MANIFEST` CRCs are now validated on the S3 baseline read paths; a mismatch
+  is a refusal, and a canceled validation is never cached as a verdict.
+- **`VALUES` found by substring broke baseline parsing of INSERTs containing the
+  word** (#502, #1267): the keyword is now found at statement level.
+- **Console events CSV export was a formula-injection vector** (#965, #1250):
+  cells starting with `=`, `+`, `-`, `@` are neutralized on export.
+
 ### Changed
 
+- **CI hardening** (#972, #1249; #973, #1251; #971, #1265): the `oss-firewall`
+  tripwire extends beyond Go sources; actions are pinned to commit SHAs with
+  write permissions scoped per job; and the demo image is boot-tested on both
+  architectures before its tag is created and signed — a failed smoke leaves no
+  public tag.
+- **Console e2e now covers the primary read workflows over a real fixture**
+  (#970, #686, #619; #1264).
 - **Repository root tidied so the README is reachable without scrolling.** Pure
   file moves, no behaviour change: `CONTRIBUTING.md`, `SECURITY.md` and `CLA.md`
   moved to `.github/`; `SUPPORT.md`, `TELEMETRY.md` and `bintrail-spec.md` moved
