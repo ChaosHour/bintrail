@@ -1061,7 +1061,8 @@ truncated prefix.
 > sources are configured and *any* of them fails to load, `query.FetchMerged`
 > aborts the strict-mode (`allow_gaps=false`) fetch — the request returns 500
 > naming the failed source — instead of folding an incomplete delta set into a
-> 200. Pass `allow_gaps=true` to fall back to warn-and-continue.
+> 200. Pass `allow_gaps=true` to fall back to warn-and-continue — with the
+> skipped source reported in the response `warnings` (#1281).
 
 ### Time-travel over the MySQL protocol (flashback port)
 
@@ -1089,10 +1090,13 @@ presented as complete.
 One residual limitation: a few failure modes are logged server-side but not
 surfaced to the browser (this matches the CLI `recover`, which warns to stderr
 and continues; both apply only to these permissive `AllowGaps=true` endpoints —
-the reconstruct endpoint fails loudly instead, see above):
+the reconstruct endpoint fails loudly by default, and when you opt into
+`allow_gaps` it reports these same conditions as response warnings instead):
 
 - some of several configured archive sources fail to load, and
 - the query planner itself fails to run (gap detection is skipped entirely).
 
 In both cases you get results without a coverage caveat in the response. Watch
-the server log when running with archives configured.
+the server log when running with archives configured. (One narrower reconstruct
+case remains log-only: the straddling-transaction probe re-fetches with gaps
+allowed, so a source failing only during that probe is logged server-side.)
