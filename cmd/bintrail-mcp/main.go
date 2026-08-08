@@ -318,10 +318,6 @@ func resolveDSN(override string) (string, error) {
 
 func errorResult(err error) *mcp.CallToolResult { return mcptools.ErrorResult(err) }
 
-func resolveArchiveSources(ctx context.Context, db *sql.DB) []string {
-	return mcptools.EnvArchiveSources(ctx, db)
-}
-
 const defaultMCPQueryMaxLimit = mcptools.DefaultQueryMaxLimit
 
 func mcpQueryMaxLimit() int { return mcptools.EnvQueryMaxLimit() }
