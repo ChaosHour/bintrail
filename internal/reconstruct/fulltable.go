@@ -1966,15 +1966,19 @@ func materializeBaselineLocal(ctx context.Context, path string, tuning duckdbuti
 	if !strings.HasPrefix(path, "s3://") {
 		// At-rest integrity (#636): validate the local file against its snapshot's
 		// _MANIFEST before any reader trusts it (DuckDB validates nothing). Fail
-		// loud on corruption; a legacy snapshot with no manifest is a no-op. S3
-		// baselines are not validated here yet — the COPY below re-encodes them, so
-		// the temp is not byte-identical to the object — a follow-up.
+		// loud on corruption; a legacy snapshot with no manifest is a no-op.
 		if err := baselineintegrity.ValidateLocalFile(path); err != nil {
 			return "", nil, err
 		}
 		return path, func() {}, nil
 	}
-	baselineintegrity.WarnS3IntegrityNotValidated() // #636 covers local baselines only (S3 re-encode → follow-up)
+	// At-rest integrity (#636/#698): validate the ORIGINAL S3 object bytes
+	// against the snapshot's _MANIFEST before the DuckDB COPY below re-encodes
+	// them — the temp copy is no longer byte-identical to the object, so this
+	// pre-pass is the only point where the manifest's raw-byte CRC applies.
+	if err := baselineintegrity.ValidateS3File(ctx, path); err != nil {
+		return "", nil, err
+	}
 	// Download via DuckDB httpfs. Keep the temp file around until cleanup().
 	tmpDir, err := os.MkdirTemp("", "bintrail-baseline-*")
 	if err != nil {
