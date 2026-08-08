@@ -401,8 +401,15 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var gapErr *query.GapError
 		if errors.As(err, &gapErr) {
+			// Non-lossy remedy first, lossy override second — same ordering
+			// as the CLI (#1268) and MCP (#1271) surfaces, and the same
+			// "have the operator" framing as MCP (only the CLI addresses the
+			// operator directly).
 			writeJSONError(w, http.StatusUnprocessableEntity,
-				"can't reconstruct across a gap in the captured history — "+err.Error()+" (check \"Continue even if some history is missing\" to proceed anyway)")
+				"can't reconstruct across a gap in the captured history — "+err.Error()+
+					" — gap detection reads archive_state, so a rebuilt index reports already-archived hours as gaps too; "+
+					"if archives exist in storage, have the operator run `bintrail archive reconcile --repair --index-dsn ... --archive-s3 s3://...` (or --archive-dir) and retry, "+
+					"or check \"Continue even if some history is missing\" to proceed with a possibly incomplete result")
 			return
 		}
 		writeFetchError(w, err)
