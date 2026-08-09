@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.50.1] - 2026-08-09
+
+A console usability release. Everything below was found by using the console on
+a real deployment rather than reading its code — including two things that had
+been broken in plain sight since the sidebar last grew.
+
+### Added
+- **Refresh control on the Restore coverage card** (#1289, #1292): capture lag is
+  the number an operator watches move, and it was fetched once per route load —
+  seeing a new value meant reloading the page. The control refetches
+  `/api/coverage` and rebuilds only that card, keeping the values on screen
+  until the response lands and stamping them `as of <time>` so a refreshed
+  reading is distinguishable from a stale one. A refresh that fails keeps the
+  numbers and labels them, rather than blanking the card or letting them pass
+  as current.
+- **`ext.ConsoleBootAuthPathReceiver`** (#1293): the console now hands a
+  credential backend the auth-file path it actually resolved. Installing a
+  backend supersedes that file for login, so a backend keeping the operator's
+  built-in credential working had to locate it independently — from inputs it
+  cannot all see, since a path given as `--auth-file` never leaves this
+  process's flag parsing. The two would open different files and the operator
+  would be locked out of a console they configured correctly. Optional in both
+  directions; the OSS build installs no backend and is unaffected.
+
+### Fixed
+- **The sidebar could not be scrolled, so its footer was unreachable** (#1290,
+  #1291): `#app`'s grid row was auto-sized, and an auto row takes the tallest
+  item's *content* height. `.main` is a scroll container and never stretched
+  the row, but the sidebar is not one — so a sidebar taller than the viewport
+  grew the row past `100vh` and `overflow: hidden` clipped the bottom off-screen
+  with nothing to scroll. **Log out** and the `stream`/`version` rows became
+  unreachable at normal zoom once an extension view and the Settings group were
+  present; zooming the browser out was the only way to reach them.
+- **Every dynamically-rendered icon was invisible** (#1292): icon constants are
+  parsed as `image/svg+xml`, which applies no default namespace, and none
+  carried an explicit `xmlns` — so each produced a namespace-less `<svg>` that
+  occupied its CSS box and painted nothing. Visible as the extension nav item
+  rendering label-only next to the icons inlined in the page. Fixed in the
+  parser rather than per-constant, so a newly added icon cannot reintroduce it.
+
 ## [0.50.0] - 2026-08-08
 
 Three threads. **Availability lag**: knowing capture didn't lose data is not the
