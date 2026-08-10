@@ -82,6 +82,11 @@ var apiRoutePerms = []routePerm{
 	// permission; it is an operator integrity action, tiered with baseline:create.
 	{"POST", "/api/servers/{}/baseline", ext.PermBaselineCreate},
 	{"POST", "/api/servers/{}/verify", ext.PermBaselineCreate},
+	// Refreshing the schema snapshot STOPS AND RESTARTS that server's capture
+	// stream, so it is tiered with the monitor verbs below (servers:write), not
+	// with baseline/verify. Those are maintenance actions that leave capture
+	// alone; this one can leave capture down if the restart fails, which is
+	// strictly the control-plane capability servers:write exists to gate.
 
 	// Server registry + control-plane. List/get/status/verify-read and the
 	// write-free test probe are reads; create/update/delete/monitor are writes.
@@ -90,7 +95,10 @@ var apiRoutePerms = []routePerm{
 	{"GET", "/api/servers/{}/monitor", ext.PermServersRead},
 	{"POST", "/api/servers/{}/monitor/start", ext.PermServersWrite},
 	{"POST", "/api/servers/{}/monitor/stop", ext.PermServersWrite},
+	// See the note above the maintenance block: this one restarts capture.
+	{"POST", "/api/servers/{}/schema-snapshot", ext.PermServersWrite},
 	{"GET", "/api/servers/{}/baseline", ext.PermServersRead},
+	{"GET", "/api/servers/{}/schema-snapshot", ext.PermServersRead},
 	{"GET", "/api/servers/{}/verify", ext.PermServersRead},
 	{"GET", "/api/servers/{}/verify/explain", ext.PermServersRead},
 	{"GET", "/api/servers/{}/verify/history", ext.PermServersRead},
