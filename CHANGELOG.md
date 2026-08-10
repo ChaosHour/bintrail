@@ -7,6 +7,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-08-09
+
+A second console release driven by using the product rather than reading it.
+Every item below started as an operator's complaint on a live deployment, and
+three of them turned out to be the console reporting something that was not
+true.
+
+### Added
+- **The Events view pages** (#1297, #1306): it rendered one window of the newest
+  100 events and event 101 was unreachable without inventing a filter. Paging is
+  **keyset**, not offset — an offset re-scans and re-sorts every skipped row, and
+  on a merged live+archive read it would re-download the archives for each page,
+  so page 40 costs what page 1 costs. The cursor carries
+  `(event_timestamp, event_id)` because `event_timestamp` has one-second
+  resolution and collides heavily under load: a timestamp-only cursor would
+  either re-serve or skip every event sharing the boundary second. The header
+  states position rather than a count that described the limit, and export
+  covers every match of the current search instead of the page on screen — an
+  operator four pages into an incident was getting a quarter of the evidence.
+- **`GET /api/activity`, and a scope on every Overview tile** (#1300, #1307): the
+  landing page derived four figures from a 200-event fetch (~700 kB of row
+  images) and labelled them as if they described the whole index. Counts now
+  come from a grouped query over a stated window, with a period picker, and each
+  tile says what it covers (`all time · estimate`, `last 24 h`, `point in
+  time`). The window is capped at 24 h on purpose: no index leads with
+  `event_timestamp`, so hourly partition pruning is the only lever, and a
+  week-long aggregate is a report, not a tile that loads on every visit. Hours
+  that have rotated to Parquet are reported as `partial` rather than silently
+  undercounted.
+- **`ext.ConsoleSettingsProvider`, and a registry instead of one view slot**
+  (#1299, #1305): an embedding distribution could contribute exactly one console
+  view, and its routes are refused wholesale while a data profile is active —
+  which locks out precisely the administrator an administration surface exists
+  for. Settings panels are a sibling surface: mounted at `/ext-settings/<id>/`,
+  authorized per HTTP method (`settings:read` to read, `settings:write` to
+  mutate, with unrecognized verbs failing closed to write), and handed no
+  database, so the redaction reasoning that withholds the view surface does not
+  reach them. `SetConsoleView` still works unchanged.
+- **A schema-snapshot action on each monitored server** (#1296, #1308):
+  `POST /api/servers/{id}/schema-snapshot`. The "capture degraded" banner told
+  operators to take a fresh snapshot on the source and offered no way to do it.
+  The action takes the snapshot **and restarts that server's capture stream** —
+  a stream holds its resolver in memory and swaps it only on a DDL event, so
+  writing a snapshot underneath a running stream changes nothing, and a refresh
+  button without the reload would look like a fix while being a no-op.
+
+### Changed
+- **Time-travel and Restore are one screen** (#1298, #1303, #1304): reading a
+  row as it stood at an instant is the step before deciding what to undo, and
+  splitting them across two destinations made the operator enter the same target
+  twice and carry a timestamp between screens by hand. The target is entered
+  once and drives both halves; `/timetravel` redirects, so old bookmarks land on
+  the merged page. The timeline gained **Use this moment**, which is the actual
+  friction: pointing at the change that broke things instead of leaving to read
+  its timestamp off Events and typing it back.
+
+### Fixed
+- **The full-table restore window reported the wrong start, and got worse the
+  more baselines you took** (#1294, #1301): it reduced over the *newest* anchor
+  per table, while baseline selection picks the newest snapshot **at or before**
+  the instant asked for. So a table with baselines going back months was
+  advertised as restorable only from the most recent one. It reduces over the
+  earliest usable anchor now. (`broken_tables` correctly keeps using the newest.)
+- **The Events view fanned out to S3 to serve a page live data already held**
+  (#1295, #1302): a newest-first request for 100 events took ~20 s and pulled
+  ~700 kB of archives that could not contribute. Under `DESC` with a filled
+  page the archives are provably irrelevant — but only when live coverage is one
+  contiguous range containing the cutoff. A restored index that interleaves
+  archived hours between live ones breaks that, so the skip is conditioned on
+  it.
+- **The timeline's "Restore to this state" aimed at the wrong end of the
+  window** (#1304): it set an upper bound, reversing everything *up to* that
+  instant and landing the row before its entire recorded history — the opposite
+  of what the button named, on the one screen whose job is deciding what to
+  undo. Both call sites share one bridge now: `since = instant + 1s`, upper
+  bound cleared. That is exact, not approximate — reconstruct applies events at
+  or before the instant while recover reverses events at or after `since`, and
+  `event_timestamp` is second-resolution, so nothing can hide in between.
+- **`GET /api/coverage` was never classified in the route-permission table**
+  (#1307): registered but unclassified, so it failed closed and every
+  policy-carrying session got a 403 on the Overview's own coverage card. The
+  completeness test's hand-maintained route mirror was missing it too, which is
+  why nothing caught it; both lists now carry it.
+- **"Capture degraded" could not be acted on, and stayed up after a working
+  fix** (#1296, #1308): the tally behind it is monotonic and re-seeded across
+  restarts on purpose, so a skip episode cannot be laundered by bouncing the
+  daemon — which also means a real fix leaves the banner exactly where it was.
+  It says so now, along with how to confirm a fix (the count stops rising) and
+  how to reset the tally deliberately. The message also names what was skipped
+  instead of describing the condition in the abstract.
+
 ## [0.50.1] - 2026-08-09
 
 A console usability release. Everything below was found by using the console on
