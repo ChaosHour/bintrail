@@ -97,7 +97,7 @@ Examples:
   bintrail reconstruct --index-dsn "..." \
     --tables mydb.orders,mydb.users --baseline-dir /data/baselines \
     --at "2026-04-01 15:30:00" \
-    --output-format mydumper --output-dir ./pitr-dump
+    --output-format mydumper --output-dir ./dump-at-1530
 
   # Refresh the baselines from the index itself — no mydumper, no source
   bintrail reconstruct --index-dsn "..." \

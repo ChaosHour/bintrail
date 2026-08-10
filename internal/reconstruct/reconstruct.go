@@ -347,8 +347,8 @@ func applyEvent(state map[string]any, ev query.ResultRow) map[string]any {
 		// scanRows in internal/query and internal/parquetquery when the
 		// row's event_type column is NULL (dbtrail/bintrail#318 drift).
 		// Without an explicit case the default branch would silently
-		// no-op, producing wrong PITR state with no operator signal.
-		slog.Warn("reconstruct: skipping drift row with NULL event_type — PITR state may be incomplete",
+		// no-op, producing wrong reconstructed state with no operator signal.
+		slog.Warn("reconstruct: skipping drift row with NULL event_type — reconstructed state may be incomplete",
 			"event_id", ev.EventID,
 			"schema", ev.SchemaName,
 			"table", ev.TableName,

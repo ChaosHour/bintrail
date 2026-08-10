@@ -11,7 +11,7 @@ import (
 // when the row's event_type column is NULL) must NOT mutate reconstructed
 // state. The case is wired explicitly so a future refactor that changes the
 // default-branch semantics (e.g. to "treat unknown as a delete") cannot
-// silently produce wrong PITR state for drift rows.
+// silently produce wrong reconstructed state for drift rows.
 func TestApplyEvent_driftRowPreservesState(t *testing.T) {
 	initial := map[string]any{"id": 1, "name": "Alice"}
 	drift := query.ResultRow{EventID: 99, EventType: 0}
