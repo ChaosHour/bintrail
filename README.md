@@ -2,7 +2,7 @@
 
 <img src="docs/img/dbtrail _ header.png" alt="dbtrail: the open-source time-travel flashback for MySQL. Every change leaves a trail. Follow it back." width="100%">
 
-**Point-in-time recovery for MySQL and PostgreSQL. No locks, no schema changes, no waiting for a restore.**
+**See every row change in MySQL and PostgreSQL, and undo the ones you didn't want. No restore, no locks, no schema changes.**
 
 [![Release](https://img.shields.io/github/v/release/dbtrail/dbtrail)](https://github.com/dbtrail/dbtrail/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
@@ -22,8 +22,10 @@ SELECT * FROM orders WHERE id = 123 AS OF '2026-05-20 14:00:00'
 
 ## What you get
 
-dbtrail tails the MySQL binary log or the Postgres WAL and keeps every row change,
-with full before and after images, in a searchable index:
+Point-in-time recovery restores the whole database and replays every log to
+reach one change. dbtrail keeps the changes themselves — it tails the MySQL
+binary log or the Postgres WAL and stores every row change, with full before and
+after images, in a searchable index:
 
 - **See every change.** What changed and when, for every row, with before/after diffs.
 - **Undo precisely.** Generate exact reversal SQL for just the damaged rows.
