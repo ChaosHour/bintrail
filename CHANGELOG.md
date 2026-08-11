@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.52.0] - 2026-08-11
+
+One isolation bug and one route. **Operators running `bintrail-pg flashback`
+with `allowed_schemas` in `shim.yaml` should read the Security item before
+upgrading**: the allowlist starts being enforced on that front-end, so a query
+that worked yesterday can now be refused — which is what the configuration
+asked for.
+
+### Security
+- **`allowed_schemas` is enforced on the PostgreSQL wire front-end** (#1261):
+  the allowlist landed in the MySQL front-end's two chokepoints (`UseDB` and
+  `HandleQuery`), and the PostgreSQL session reaches neither — it parses and
+  dispatches on its own. A tenant connecting over `bintrail-pg flashback` could
+  therefore read **every schema in the index** regardless of what `shim.yaml`
+  said. Silent, and in the direction that matters: the operator who configured
+  the isolation believed it was in force. The verdict now lives in one
+  protocol-neutral place (`shim.SchemaAuthzCheck`) that both front-ends call, so
+  the two cannot drift — a parity test asserts they never disagree. Denial is
+  SQLSTATE `42501` on the query, not a dropped connection, and a connect
+  database outside the allowlist is not a startup refusal either: the session
+  seeds and the first real query answers `42501`, which the client can read.
+
+### Added
+- **`GET /api/profiles`** (#1299 follow-up): the RBAC data-profile names for the
+  current index, sorted, names only. A settings surface that wants to offer the
+  profile vocabulary as a picker — instead of a free-text field the operator has
+  to already know — has no index access of its own, so the vocabulary needs a
+  route. Tiered `settings:read`, and pinned there by test: the route-table
+  guards check that every route *is* classified, never what it is classified
+  *as*, so a move to `query:execute` would keep every caller working while
+  handing access-control vocabulary to any analyst. An index predating the
+  profiles table lists empty rather than erroring (the `archive_state` 1146
+  precedent), and that swallow is deliberately narrow to 1146 — on a dead
+  connection, "no profiles exist" would render an empty picker, strictly worse
+  than the free-text fallback a real error produces.
+
+### Changed
+- **Point-in-time-recovery jargon dropped from the operator-facing
+  `reconstruct` strings and the README.** The term describes a database's own
+  log-replay restore; what `reconstruct` does is merge a baseline with indexed
+  deltas, and borrowing the phrase set an expectation about the mechanism that
+  the command does not meet.
+
 ## [0.51.0] - 2026-08-09
 
 A second console release driven by using the product rather than reading it.
