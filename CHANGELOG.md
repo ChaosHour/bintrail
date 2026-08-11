@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.53.0] - 2026-08-11
+
+### Fixed
+- **The capture-skip banner can now show that a fix worked** (#1312): the tally
+  in `stream_state.capture_skips` is monotonic — it counts skips that
+  *happened*, not skips still happening — so pressing the console's own
+  "Refresh schema snapshot" button left the orange alarm byte-identical. The
+  banner documented that in a paragraph, which is documentation standing in for
+  a missing feature, and the escape hatch it named (stop the daemon, hand-edit a
+  JSON column) is not something a console user can do from the console. The
+  schema snapshot's own timestamp is now the acknowledgement: `MAX(schema_snapshots.snapshot_time)`
+  against each reason's `last_at`, shipped as `capture_health.snapshot_at` and
+  `capture_health.skips_predate_snapshot`. Skips that all predate the current
+  snapshot render quietly instead of as a live alarm — quietly, **not** gone:
+  those events are permanently missing from the index and the box keeps saying
+  so.
+
+  Neither wording claims "resolved". `stream_state` does not record which
+  snapshot capture is running on, so a newer one proves it exists, not that the
+  stream reloaded onto it; and on a source with no writes, "nothing skipped
+  since" is true for the trivial reason. Both facts are in the text.
+  `capture_health.status` stays `"degraded"` in both states — `--fail-on-gap`
+  keys on it, and turning a permanent-loss record into `"ok"` would be a change
+  to exit semantics, not to rendering. A backend that sends no anchor (an older
+  daemon) stays loud and unchanged.
+
+### Changed
+- **The capture-skip explanation is collapsed by default in the console**
+  (#1312): ~250 words of cause, remedy and scope rendered flat inside an alarm
+  box, which is the reliable way to have none of it read. It moves behind a
+  disclosure — one click away, nothing deleted. `bintrail status` still prints
+  the full text, unchanged.
+
 ## [0.52.0] - 2026-08-11
 
 One isolation bug and one route. **Operators running `bintrail-pg flashback`
