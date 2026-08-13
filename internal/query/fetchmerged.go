@@ -494,7 +494,41 @@ func resolveMergeSources(ctx context.Context, db *sql.DB, o FetchMergedOptions) 
 	// detection for --no-archive callers (observability win for recover,
 	// correctness win for reconstruct under AllowGaps=false).
 	if o.DBName != "" && (len(src.archSources) > 0 || o.Opts.Since != nil || o.Opts.Until != nil) {
-		p, err := Plan(ctx, db, o.DBName, o.Opts.Since, o.Opts.Until, o.NoArchive)
+		// Scope coverage to the archives THIS read will open (#1232), so the
+		// planner and the fetch can no longer disagree about which archives
+		// exist.
+		//
+		// Be precise about what this closes HERE. resolveMergeSources always
+		// resolves via ResolveArchiveSources, which enumerates every non-NULL
+		// bintrail_id, so on this path the scope normally equals the full set
+		// and the filter is inert. What it is not inert for is the rows that
+		// set never contains: an archive_state row with a NULL bintrail_id,
+		// or one whose paths resolve to nothing on this host. Those used to
+		// count as coverage for a fetch that could not open them, and now
+		// classify as gaps. The subset case the scope really exists for lives
+		// on `bintrail query --archive-dir/--archive-s3 --bintrail-id`.
+		//
+		// nil (unscoped, the old behaviour) is deliberate on the
+		// discovery-failure path: we do not know the set, and inventing an
+		// empty one would report every rotated hour as a gap. AllowGaps=false
+		// has already refused above in that case, and AllowGaps=true asked
+		// for best-effort.
+		var scope []string
+		if !src.discoveryFailed {
+			// Non-nil even when discovery resolved NOTHING. This is the sharp
+			// edge of the nil/empty contract: ResolveArchiveSources builds its
+			// result with append, so "succeeded, found zero sources" comes
+			// back as a nil slice — which SourceIDsFromPaths faithfully maps
+			// to nil, which the planner reads as "every archive in the index".
+			// A successful discovery that found nothing means this read opens
+			// nothing, and it must not be spelled the same way as "opens
+			// everything".
+			scope = []string{}
+			if ids := SourceIDsFromPaths(src.archSources); ids != nil {
+				scope = ids
+			}
+		}
+		p, err := Plan(ctx, db, o.DBName, o.Opts.Since, o.Opts.Until, o.NoArchive, scope)
 		if err != nil {
 			if !o.AllowGaps {
 				return src, fmt.Errorf("query planner failed, cannot verify coverage: %w", err)
