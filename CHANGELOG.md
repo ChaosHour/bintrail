@@ -7,37 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- **`bintrail-console` no longer carries its own copy of the env-file loader**
-  (#963). `consoleapp/env.go` held `loadEnvFile`/`parseAndSetEnv` byte-for-byte
-  identical to `internal/cli/env.go`, plus its own `sync.Once`, so any change
-  to env-file semantics would land in one binary and silently not the other.
-  Both now call the exported `cli.LoadEnvFile`. Sharing the `sync.Once` is also
-  more correct: `consoleapp` imports `internal/cli`, so two of them in one
-  process meant the file could be read twice. A guard test fails if the
-  duplicate comes back — the previous marker was a code comment naming itself
-  a "consolidation candidate", and a comment cannot fail.
-
-### Fixed
-- **A duplicate event whose two copies disagree is no longer discarded in
-  silence** (#841). While a partition is archived but not yet dropped, the same
-  `event_id` arrives from both the index and the Parquet archive.
-  `MergeResults` kept the first appearance, and "MySQL first, MySQL wins" was a
-  comment with nothing enforcing it — the agent deliberately puts its buffer
-  first. If the copies genuinely differed (an index row mutated after
-  archiving, or two index generations writing under one `bintrail_id`) the
-  operator got an arbitrary one of two answers with no signal at all. A
-  collision now compares the copies and warns, naming the event, schema, table
-  and PK. Which copy wins is unchanged — this adds visibility, not a new
-  resolution rule.
-  - The comparison only runs on collision, so the normal path is unaffected.
-  - Columns added after the original schema (`connection_id`, `query_text`,
-    `query_hash`, `commit_ts_us`) are compared only when BOTH sides carry a
-    value: an archive written before a column existed loads it as NULL, and
-    treating that as divergence would fire on every legacy archive in the
-    fleet. Row images are compared with `reflect.DeepEqual` — `==` on an `any`
-    holding a nested JSON array or object panics.
-
 ### Added
 - **A capture-skip record can be acknowledged** (#1314). `stream_state.capture_skips`
   is monotonic, so a single skip episode kept the console's capture-health box
@@ -63,6 +32,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `"degraded"`: the events really are still missing, and a consumer keying on
     the verdict must not read a human's "seen it" as the loss being undone.
 
+### Changed
+- **`bintrail-console` no longer carries its own copy of the env-file loader**
+  (#963). `consoleapp/env.go` held `loadEnvFile`/`parseAndSetEnv` byte-for-byte
+  identical to `internal/cli/env.go`, plus its own `sync.Once`, so any change
+  to env-file semantics would land in one binary and silently not the other.
+  Both now call the exported `cli.LoadEnvFile`. Sharing the `sync.Once` is also
+  more correct: `consoleapp` imports `internal/cli`, so two of them in one
+  process meant the file could be read twice. A guard test fails if the
+  duplicate comes back — the previous marker was a code comment naming itself
+  a "consolidation candidate", and a comment cannot fail.
+
+### Fixed
+- **`status` no longer reports an unreadable archive tier as no archive tier**
+  (#816). `LoadCoverage` degraded every `archive_state` failure to live-only
+  coverage behind a `slog.Warn`, so "this index has no archives" and "I could
+  not read the archives" printed identically — a restore window SHORTER than
+  reality, which an operator reads as "that incident is beyond recovery" while
+  the Parquet covering it is still in the bucket. Only a genuinely missing
+  table now counts as no archive tier; any other outcome — including an
+  `archive_state` row whose `partition_name` will not parse, which left the
+  floor silently live-only — sets
+  `CoverageInfo.ArchiveUnavailable`, and both renderings say the window is a
+  lower bound (`⚠ NOT READ` in the text report, `coverage.archives_unavailable`
+  plus `archives_error` in JSON). The "(includes archives)" label is withheld
+  in that state rather than claiming coverage that was never read.
 ## [0.53.0] - 2026-08-11
 
 ### Fixed

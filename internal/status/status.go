@@ -202,6 +202,26 @@ type CoverageInfo struct {
 	// Archive-derived fields (from archive_state partition names and row counts).
 	ArchiveEarliestHour sql.NullTime // earliest hour derived from MIN(partition_name)
 	ArchiveTotalRows    int64
+	// ArchiveUnavailable marks archive coverage as UNREAD or UNPLACEABLE rather
+	// than absent
+	// (#816). Both states leave the two fields above zero, and reporting them
+	// the same way understates the restore window: an operator reads a
+	// too-recent "Earliest event" and concludes an old incident is beyond
+	// recovery while the Parquet that covers it is sitting in the bucket.
+	//
+	// Only a genuinely missing archive_state (ER_NO_SUCH_TABLE on an index
+	// that never archived) counts as "no archives"; every other outcome —
+	// a table-level permission denial, a corrupt table, a legacy shape
+	// missing a column, or a partition_name that will not parse — is
+	// unknown, and unknown is never rendered as a fact.
+	//
+	// Note the scope: a dead connection or a query timeout fails the
+	// binlog_events read at the top of LoadCoverage and never reaches here,
+	// so this flag is specific to archive_state. That outer failure drops
+	// the whole coverage section instead, which is its own gap (see the
+	// CoverageErr follow-up).
+	ArchiveUnavailable bool
+	ArchiveError       string
 
 	// IndexSizeBytes is the on-disk size of the binlog_events table
 	// (DATA_LENGTH + INDEX_LENGTH, an InnoDB estimate). Surfaced so an operator
@@ -336,14 +356,40 @@ func LoadCoverage(ctx context.Context, db *sql.DB) (*CoverageInfo, error) {
 		SELECT MIN(partition_name), COALESCE(SUM(row_count), 0)
 		FROM archive_state`).Scan(&minPartition, &c.ArchiveTotalRows)
 	if err != nil {
-		// archive_state may not exist in older indexes — treat as non-fatal.
-		slog.Warn("could not load archive coverage", "error", err)
+		// Non-fatal either way — coverage is a report, not a gate — but the
+		// two causes are NOT the same fact (#816). A missing table is an
+		// index with no archive tier, which the zeroed fields describe
+		// correctly. Anything else means the archives may exist and we could
+		// not see them, so the report must say the window it prints is a
+		// LOWER BOUND rather than quietly printing the live-only one.
+		if isMissingTableErr(err) {
+			slog.Debug("archive_state not present; reporting live-only coverage", "error", err)
+			return &c, nil
+		}
+		slog.Warn("could not load archive coverage; the restore window will be reported as a lower bound", "error", err)
+		c.ArchiveUnavailable = true
+		c.ArchiveError = err.Error()
 		return &c, nil
 	}
 	if minPartition.Valid {
-		if t, ok := parsePartitionName(minPartition.String); ok {
-			c.ArchiveEarliestHour = sql.NullTime{Time: t, Valid: true}
+		t, ok := parsePartitionName(minPartition.String)
+		if !ok {
+			// Same class as an unreadable table, reached three lines later:
+			// the archives exist, we read the row, and we still cannot place
+			// them in time — so the floor below is live-only and the window
+			// is a lower bound. Dropping this silently printed a too-recent
+			// "Earliest event" as fact, which is the whole of #816.
+			//
+			// staleness.go's OldestDeltaFromDB hard-errors on the identical
+			// parse of the identical value ("our own naming scheme failing to
+			// parse is drift"). Two readers of one value must not take
+			// opposite stances, and the silent one was the one an operator
+			// reads mid-incident.
+			c.ArchiveUnavailable = true
+			c.ArchiveError = fmt.Sprintf("archive_state MIN(partition_name) %q is not a partition name", minPartition.String)
+			return &c, nil
 		}
+		c.ArchiveEarliestHour = sql.NullTime{Time: t, Valid: true}
 	}
 
 	return &c, nil
@@ -912,10 +958,16 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 		}
 		if earliest.Valid {
 			label := earliest.Time.Format(TSFmt)
-			if hasArchive {
+			switch {
+			case coverage.ArchiveUnavailable:
+				// Never "(includes archives)" here: we could not read them.
+				label += " (LIVE INDEX ONLY — archives not read, see below)"
+			case hasArchive:
 				label += " (includes archives)"
 			}
 			fmt.Fprintf(w, "  Earliest event: %s\n", label)
+		} else if coverage.ArchiveUnavailable {
+			fmt.Fprintln(w, "  Earliest event: (none live; archives not read, see below)")
 		} else {
 			fmt.Fprintln(w, "  Earliest event: (none)")
 		}
@@ -934,6 +986,16 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 		}
 		if coverage.IndexSizeBytes > 0 {
 			fmt.Fprintf(w, "  Index size:     %s (MySQL binlog_events)\n", formatBytes(coverage.IndexSizeBytes))
+		}
+		if coverage.ArchiveUnavailable {
+			fmt.Fprintln(w, "  Archives:       ⚠ NOT READ — archive_state could not be queried, so any")
+			fmt.Fprintln(w, "                  archived hours are missing from the figures above. The")
+			fmt.Fprintln(w, "                  restore window is a LOWER BOUND, not the real reach:")
+			fmt.Fprintln(w, "                  data older than the earliest event shown may still be")
+			fmt.Fprintln(w, "                  recoverable from Parquet.")
+			for _, line := range wrapAt("Error: "+coverage.ArchiveError, 60) {
+				fmt.Fprintf(w, "                  %s\n", line)
+			}
 		}
 		fmt.Fprintf(w, "  Schema changes: %d\n", coverage.SchemaChanges)
 		if coverage.UncoveredDDLs > 0 {
@@ -1155,6 +1217,14 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		IndexSizeHuman       string  `json:"index_size_human,omitempty"`
 		SchemaChanges        int     `json:"schema_changes"`
 		UncoveredDDLs        int     `json:"uncovered_ddls"`
+		// ArchivesUnavailable says the archive tier could NOT be read (#816),
+		// so every figure above is live-index-only and earliest_event is a
+		// LOWER BOUND on the restore reach rather than the reach itself.
+		// Absent (omitted) means the figures are complete: an index with no
+		// archives at all reports zeros without this flag, because "no
+		// archive tier" is a fact and "could not look" is not.
+		ArchivesUnavailable bool   `json:"archives_unavailable,omitempty"`
+		ArchivesError       string `json:"archives_error,omitempty"`
 	}
 	type jsonServer struct {
 		BintrailID       string  `json:"bintrail_id"`
@@ -1455,6 +1525,11 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 			IndexSizeBytes: coverage.IndexSizeBytes,
 			SchemaChanges:  coverage.SchemaChanges,
 			UncoveredDDLs:  coverage.UncoveredDDLs,
+			// #816: the figures above are live-only and a LOWER BOUND when
+			// this is set. A monitor that treats earliest_event as the
+			// recovery horizon must be able to tell the difference.
+			ArchivesUnavailable: coverage.ArchiveUnavailable,
+			ArchivesError:       coverage.ArchiveError,
 		}
 		if coverage.IndexSizeBytes > 0 {
 			jc.IndexSizeHuman = formatBytes(coverage.IndexSizeBytes)
