@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.54.0] - 2026-08-14
+
 ### Added
 - **A capture-skip record can be acknowledged** (#1314). `stream_state.capture_skips`
   is monotonic, so a single skip episode kept the console's capture-health box
@@ -32,40 +34,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `"degraded"`: the events really are still missing, and a consumer keying on
     the verdict must not read a human's "seen it" as the loss being undone.
 
-- **A capture-skip record can be acknowledged** (#1314). `stream_state.capture_skips`
-  is monotonic, so a single skip episode kept the console's capture-health box
-  on screen and `status --fail-on-gap` exiting non-zero forever. The only escape
-  the product documented — stop the daemon and clear the column — is impossible
-  from the console and *destroys the loss record*, which is the one thing that
-  should survive. An alert nobody can clear is an alert everybody removes, and
-  the next real loss then lands in silence.
-  - `bintrail status --ack-capture-skips` and the console's **Mark as read**
-    button (`POST /api/capture-skips/ack`, `servers:write`) record the count and
-    the moment in a new `stream_state.capture_skips_ack` column. Nothing is
-    erased: the tally stays, `status` keeps printing it (`⚠ ON RECORD` instead
-    of `⚠ DEGRADED`), and the console renders it muted rather than as an alarm.
-  - An acknowledgement covers a **count**, not a fact, so a later skip lifts the
-    tally above it and the alarm — and the `--fail-on-gap` failure — return with
-    no operator action. It can retire a record; it cannot mute the next
-    incident.
-  - The console endpoint takes the total the page rendered and refuses with 409
-    if the live tally is higher, so a tab left open cannot acknowledge skips
-    nobody looked at.
-  - `status --format json` gains `capture_health.acknowledged` and
-    `capture_health.acknowledged_at`. `capture_health.status` deliberately stays
-    `"degraded"`: the events really are still missing, and a consumer keying on
-    the verdict must not read a human's "seen it" as the loss being undone.
+- **The compose stack ships observable by default** (#975). The `bintrail`
+  service now serves Prometheus metrics (`BINTRAIL_METRICS_ADDR`, published on
+  host loopback `127.0.0.1:9090`, override with `METRICS_ADDR`) and carries a
+  real healthcheck, so a wedged-but-alive `watch` daemon is visible —
+  previously deployment.md's observability story pointed at a port the default
+  stack never opened, and `restart: unless-stopped` fires on process exit only.
+
+- **Two copies of one event that disagree are now a surfaced finding** (#841,
+  #1325). While a partition is archived but not yet dropped, the same
+  `event_id` legitimately arrives from both the live index and the Parquet
+  archive. The copies agreeing is an invariant (the archive is written from
+  the index), so a divergence means something real — an index row mutated
+  after archiving, or a damaged archive. The merge now resolves
+  deterministically in favor of the live index instead of by argument order,
+  counts the divergences, and the finding travels: a `slog.Warn` at the merge
+  layer plus a warning in the console and MCP responses — including on the
+  recover path, where the chosen copy's row images become the `SET` clauses of
+  the generated reversal SQL.
+
+- **SBOM coverage extends to every shipped artifact** (#976). deb/rpm packages
+  get syft SPDX `*.sbom.json` sidecars on the release page like the archives
+  always did, and the GHCR images (`bintrail` / `bintrail-console` /
+  `bintrail-pg`) get per-architecture SBOMs attached as cosign attestations on
+  the pushed manifest lists (GoReleaser's sboms pipe cannot catalog container
+  images, so a publish-phase script does).
+
+- **`bintrail agent` gains `--source-flavor`** (mysql | mariadb; #623). The
+  BYOS agent was the last capture surface with a hardwired `"mysql"` flavor;
+  MariaDB sources now stream through the agent with the same flag and
+  `BINTRAIL_SOURCE_FLAVOR` env binding as `stream`. Existing invocations are
+  unchanged (default `mysql`).
+
+- **PG extension-type capture is evidence now, not "should work"** (#1210).
+  Composite types join the shared PG type matrix on every plain
+  `postgres:14–17` CI cell — through both the recover round-trip and the
+  baseline+delta reconstruct fold — and PostGIS geometry + pgvector vectors
+  get their own image-gated integration coverage.
 
 ### Changed
-- **`bintrail-console` no longer carries its own copy of the env-file loader**
-  (#963). `consoleapp/env.go` held `loadEnvFile`/`parseAndSetEnv` byte-for-byte
-  identical to `internal/cli/env.go`, plus its own `sync.Once`, so any change
-  to env-file semantics would land in one binary and silently not the other.
-  Both now call the exported `cli.LoadEnvFile`. Sharing the `sync.Once` is also
-  more correct: `consoleapp` imports `internal/cli`, so two of them in one
-  process meant the file could be read twice. A guard test fails if the
-  duplicate comes back — the previous marker was a code comment naming itself
-  a "consolidation candidate", and a comment cannot fail.
+- **Release signatures are Sigstore bundles now** (#1350). `checksums.txt` is
+  signed as `checksums.txt.sigstore.json` — certificate, signature and
+  transparency-log entry in one file, the cosign v3+ default — INSTEAD of the
+  former `checksums.txt.sig` + `checksums.txt.pem` pair. Verifying needs
+  cosign v3.0 or newer; the recipe is in docs/install.md ("Verify a
+  download"). A new CI `signing` job replays the exact goreleaser signs
+  cmd/args against a throwaway file on every push and same-repo PR — signing
+  otherwise only ever executed on tag push, so a breaking cosign or config
+  change could merge green and surface mid-release — and asserts the
+  ci/release installer-pin lockstep executably.
+
+- **The MCP `recover`/`query` tool filters are aligned with the CLI, and the
+  parity is pinned** (#962). `changed_column` is removed from the `recover`
+  tool: `bintrail recover` refuses `--changed-column` by design (a
+  changed-column filter names row *versions*, and reversing a filtered subset
+  of a row's history can produce a state that never existed). A client still
+  sending it gets a loud schema-validation error naming the property —
+  `additionalProperties: false` — instead of a silently ignored filter.
 
 - **`bintrail-console` no longer carries its own copy of the env-file loader**
   (#963). `consoleapp/env.go` held `loadEnvFile`/`parseAndSetEnv` byte-for-byte
@@ -76,6 +101,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process meant the file could be read twice. A guard test fails if the
   duplicate comes back — the previous marker was a code comment naming itself
   a "consolidation candidate", and a comment cannot fail.
+
+- **MariaDB multi-domain GTID resume is ratified as per-domain** (#621, with
+  the #517 alpha residuals). Live empirical validation on a real multi-domain
+  topology plus the docs stance; the validation immediately exposed a real
+  data race in go-mysql's MariaDB GTID handling, fixed by pinning go-mysql
+  v1.16.0. From the residuals: the `--no-gap-fill` MariaDB-GTID refusal has a
+  regression test driving the same cmd-layer entry point the CLI uses, a dead
+  wrapper is gone, and unhandled-row drops are counted instead of silent.
+
+- CI: the two batches of major GitHub-Actions bumps dependabot could not land
+  are taken deliberately (#1316, #1333), and the MariaDB-source integration
+  job is a matrix across 10.6 LTS, 10.11 LTS and 11.4 (#1339).
 
 ### Fixed
 - **The query planner no longer plans an unreadable `archive_state` as "no
@@ -97,6 +134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`AllowGaps=false`) `reconstruct` still refuses — but the real cause now
     reaches the operator instead of sitting at `Debug` under a message that
     blames rotation.
+
 - **The query planner no longer counts archives the read will never open**
   (#1232). Rotation is per-process, so an index capturing more than one source
   has more than one archive destination and nothing makes them archive the same
@@ -121,6 +159,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     source's rows for it. `archive_state.bintrail_id` records who archived a
     partition, not whose rows are inside — scoping by data ownership would
     report gaps over data that is present.
+
 - **A console session with an RBAC data profile now says it reads the live
   index only** (#1311). Such a session is served with `NoArchive` because the
   Parquet path cannot apply per-column redaction — the right call, and it fails
@@ -141,7 +180,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A console started with `--no-archive` announces itself only once the plan
     actually finds hours it could not read, so a whole-deployment setting does
     not become a permanent banner on every response — which is read by nobody,
-including on the day it matters.
+    including on the day it matters. A session profile is announced regardless,
+    because it is the one the reader cannot otherwise discover.
+  - The events view now renders the response's `warnings`, and Preview no
+    longer clears the notice Generate-undo rendered. The server had been
+    computing the right sentence for `/api/events` and the browser was dropping
+    it, so the flagship case — a profiled session's default browse — stayed
+    silent on screen.
+
 - **`status` no longer reports an unreadable archive tier as no archive tier**
   (#816). `LoadCoverage` degraded every `archive_state` failure to live-only
   coverage behind a `slog.Warn`, so "this index has no archives" and "I could
@@ -155,13 +201,39 @@ including on the day it matters.
   lower bound (`⚠ NOT READ` in the text report, `coverage.archives_unavailable`
   plus `archives_error` in JSON). The "(includes archives)" label is withheld
   in that state rather than claiming coverage that was never read.
-    including on the day it matters. A session profile is announced regardless,
-    because it is the one the reader cannot otherwise discover.
-  - The events view now renders the response's `warnings`, and Preview no
-    longer clears the notice Generate-undo rendered. The server had been
-    computing the right sentence for `/api/events` and the browser was dropping
-    it, so the flagship case — a profiled session's default browse — stayed
-    silent on screen.
+
+- **A `status` coverage or archives read failure no longer deletes its
+  section** (#1323). One frame above #816's fix, `CollectStatus` swallowed a
+  `LoadCoverage` error with a `slog.Warn` — and the `binlog_events` full scan
+  is the statement in that package most likely to hit `max_execution_time` or
+  a lost connection — so the report printed no restore window, no error, and
+  exited 0; a monitor keyed on the new `coverage.archives_unavailable` saw
+  nothing rather than `true`. `LoadArchiveStats` swallowed the identical
+  failure on the identical table. Both failures now surface in the section
+  they would have filled.
+
+- **Binlog positions past 2^63 archive correctly** (#1218). Pre-#1180 builds
+  stored the MariaDB underflow shape (`StartPos = 2^64 − EventSize`) in real
+  indexes, and `ArchivePartition` scanned `start_pos`/`end_pos` through
+  `sql.NullInt64` — any partition holding such a row failed to archive
+  forever, so rotation could never drop it. Positions are now unsigned end to
+  end (the Parquet columns included, so nothing is written silently wrapped),
+  and one scan reads both schema generations.
+
+- **A schema-scoped publication's UNLOGGED tables are warned about** (#1211).
+  The UNLOGGED-table coverage guard evaluated capture scope only for
+  `FOR ALL TABLES` publications; an UNLOGGED table pulled into scope by a
+  `FOR TABLES IN SCHEMA` publication (PostgreSQL 15+) was silently uncaptured
+  with no warning — the exact silent-loss shape the guard exists to close.
+  The shared probe now enumerates published schemas too, on both the stream
+  startup preflight and doctor.
+
+- **A profiled console session's schema dropdown no longer offers schemas its
+  every query answers zero rows for** (#1326). The session is served
+  archive-excluded, but `/api/schemas` listed snapshot-only (archive-only)
+  schemas anyway — promising a target the session cannot reach and
+  contradicting the #1311 warning on the very results it produced.
+
 ## [0.53.0] - 2026-08-11
 
 ### Fixed
