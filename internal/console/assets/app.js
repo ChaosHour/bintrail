@@ -612,6 +612,17 @@ function renderWarnings(node, warnings) {
   ));
 }
 
+// renderNotes is renderWarnings' quiet sibling (#1365): the response `notes`
+// list carries benign informational audit facts (the archive-elision record,
+// #1353) whose job is auditability, not attention. Muted ink, no icon, no
+// amber — rendering these through the alert component is exactly the bug
+// #1365 fixed (a note saying "nothing is missing" read as an incident).
+function renderNotes(node, notes) {
+  if (!node) return;
+  clear(node);
+  (notes || []).forEach((n) => node.append(el("div", { class: "note-item", text: n })));
+}
+
 // ── badge / page-head builders ────────────────────────────────────────────────
 
 function badge(type) { return el("span", { class: "badge " + badgeClass(type), text: type }); }
@@ -1273,6 +1284,11 @@ function renderEvents(params) {
   // threw it away at the browser. Above the list on purpose: a caveat about
   // what a result does NOT include is worthless below the result.
   v.append(el("div", { id: "ev-warnings", class: "warnings" }));
+  // Info notes (#1365) under the result-count line, BELOW the warnings:
+  // alerts render first in both views (Recover has the same order). The muted
+  // register for the response `notes` list (benign audit facts like the
+  // archive-elision record) — never the alert component.
+  v.append(el("div", { id: "ev-notes", class: "notes" }));
 
   // events list
   const list = el("div", { class: "events", id: "events-list" });
@@ -1619,6 +1635,10 @@ async function runEventsQuery(form, keepPage) {
   } catch (err) {
     if (gen !== serverGen) return;
     clear(rowsEl); renderError(rowsEl, err);
+    // Clear stale advisories along with the rows: a lingering "nothing is
+    // missing here" (or an old warning) beside an error is misleading (#1365).
+    renderWarnings($("#ev-warnings", VIEW()), []);
+    renderNotes($("#ev-notes", VIEW()), []);
     if (countEl) countEl.textContent = "0";
     return;
   } finally {
@@ -1626,6 +1646,7 @@ async function runEventsQuery(form, keepPage) {
   }
   if (gen !== serverGen) return;
   renderWarnings($("#ev-warnings", VIEW()), data.warnings);
+  renderNotes($("#ev-notes", VIEW()), data.notes);
 
   // Client-side refine: unscoped pk/col + free terms.
   const events = refineEvents(data.events || [], refine);
@@ -1901,6 +1922,7 @@ function renderRecover(params) {
 
   v.append(stateSection(form));
   v.append(el("div", { id: "recover-warnings", class: "warnings" }));
+  v.append(el("div", { id: "recover-notes", class: "notes" }));
   v.append(el("div", { id: "recover-preview" }));
   v.append(el("div", { id: "recover-out" }));
 
@@ -2138,11 +2160,18 @@ async function previewRecover(form) {
     // alongside its truncation note -- not clear the box. Clearing it made the
     // caveat vanish the moment an operator adjusted a filter and re-previewed,
     // which is exactly when it is most load-bearing.
-    const notes = (data.warnings || []).slice();
+    const warnList = (data.warnings || []).slice();
     if (data.count >= data.limit) {
-      notes.push("Only the newest " + data.limit + " events are shown. The actual undo script may include more if you increase the limit.");
+      warnList.push("Only the newest " + data.limit + " events are shown. The actual undo script may include more if you increase the limit.");
     }
-    renderWarnings(warns, notes);
+    renderWarnings(warns, warnList);
+    // The info half (#1365): /api/events carries `notes` (the archive-elision
+    // record among them) — muted register, same container the undo response
+    // fills, so a re-preview updates rather than duplicates it. Rendered on
+    // the same success path as the warnings (past the isConnected guard), and
+    // like #recover-warnings it is deliberately NOT cleared on a failed
+    // preview (#1311: server notices must survive a re-preview).
+    renderNotes($("#recover-notes", VIEW()), data.notes);
     busy.close(true); // success: back to the button that started the preview
   } catch (err) {
     // Cancel/ESC = a WITHDRAWN request: the modal is already closed and the
@@ -2185,6 +2214,7 @@ async function generateUndo(form) {
       return;
     }
     renderWarnings(warns, data.warnings);
+    renderNotes($("#recover-notes", VIEW()), data.notes);
     lastSQL = data.sql || "";
     clear(out);
     // When the target is auto-detected as a foreign-key parent, the script also
@@ -2234,6 +2264,9 @@ async function generateUndo(form) {
     // the error IN the modal (with a Dismiss), never as a silently vanished
     // overlay.
     clear(warns);
+    // The info notes are cleared with the warnings (#1365): a lingering
+    // "nothing is missing here" would caption a script that no longer exists.
+    clear($("#recover-notes", VIEW()));
     clear(out);
     lastSQL = "";
     busy.showError(err);

@@ -229,12 +229,14 @@ func (s *Server) applySessionProfile(ctx context.Context, r *http.Request, b *bu
 // archivesElided reports the newest-first short-circuit (#1353): registered
 // archives were deliberately not read because the live index filled the page
 // and every archived hour sits below the live rotation floor — they could not
-// have changed the answer. The handlers surface it as a response notice
-// (appendArchiveElisionNotice) so the skip is auditable, per the #1311/#1321
-// contract that a result always says what scope was read. Structurally always
-// false for a profiled session or a --no-archive console: there the archives
-// are EXCLUDED (excl says so and its notice speaks), not elided — nothing was
-// resolved that could have been skipped.
+// have changed the answer. The handlers surface it as a response info note
+// (archiveElisionNotes → the `notes` list, #1365) so the skip is auditable,
+// per the #1311/#1321 contract that a result always says what scope was read;
+// it is a note and not a warning because the skip is correctness-preserving
+// ("nothing is missing"), while warnings stay for cautionary facts. The flag
+// is structurally always false for a profiled session or a --no-archive
+// console: there the archives are EXCLUDED (excl says so and its notice
+// speaks), not elided — nothing was resolved that could have been skipped.
 func (s *Server) fetchRestricted(ctx context.Context, r *http.Request, b *bundle, opts query.Options) ([]query.ResultRow, *query.QueryPlan, archiveExclusion, int, bool, error) {
 	excl := archiveExclusionFor(r, b)
 	rows, plan, _, diverged, archivesElided, err := query.FetchMergedFull(ctx, b.db, b.engine, query.FetchMergedOptions{
