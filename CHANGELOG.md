@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.55.1] - 2026-08-15
+
+### Fixed
+- **The vendored console fonts now ship with their SIL Open Font License
+  obligations met** (#1360). v0.55.0 embedded three OFL-1.1 typeface families
+  but carried neither the license text nor the copyright notices: the
+  THIRD-PARTY-NOTICES generator only sees Go modules, and the subsetting
+  pipeline had stripped the fonts' own license name records. The notices file
+  that travels in every artifact now includes the full OFL-1.1 text with the
+  three families' copyright lines, the embedded woff2 files carry their
+  license metadata again (name IDs 13/14), and two CI guards pin both — a
+  notices regeneration or a font swap that loses either fails the build.
+
 ## [0.55.0] - 2026-08-15
 
 ### Changed
