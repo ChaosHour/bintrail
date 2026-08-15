@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"os"
 	"os/signal"
 	"strings"
 	"sync"
@@ -279,16 +278,25 @@ func runShim(cmd *cobra.Command, args []string) error {
 		"tenants_with_default_schema", len(userSchemas),
 	)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// SIGINT/SIGTERM or parent-context cancellation (an embedding caller, a
+	// wiring test) → ctx done → close listener → accept loop returns. The
+	// signal-bound context is the sibling daemons' pattern (`serve`,
+	// bintrail-pg flashback), and NotifyContext un-registers the handler when
+	// runShim returns.
+	ctx, cancel := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// SIGINT / SIGTERM → cancel ctx → close listener → accept loop returns.
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	// Usage telemetry for a months-lived process (#1362): Init's drain runs
+	// once, at startup, so without this loop a daemon's beacons would spool
+	// and age out undelivered. Own goroutine — never on a client connection's
+	// path. The client arrives through the package seam (processClient): shim
+	// is the one daemon implemented in this shared package, and each binary's
+	// hook publishes the client it resolved at Start.
+	go processClient.RunDaemon(ctx, cmd.Name())
+
 	go func() {
-		<-sigs
+		<-ctx.Done()
 		slog.Info("shim shutting down")
-		cancel()
 		listener.Close()
 	}()
 

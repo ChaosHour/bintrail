@@ -273,9 +273,24 @@ func (c *Client) drainOnce() {
 // accumulated. Beacons are capped at one per UTC day regardless, so this
 // governs delivery latency rather than beacon frequency.
 //
-// A var rather than a const so tests can shorten it; nothing in production
-// writes it.
-var daemonTick = time.Hour
+// Mutable so tests can shorten it; nothing in production writes it. Stored
+// atomically because the per-daemon WIRING tests (#1362) live in OTHER
+// packages and restore the tick while the RunDaemon goroutine their daemon
+// started may still be winding down — with a plain var that restore would be
+// a data race.
+var daemonTick atomic.Int64
+
+func init() { daemonTick.Store(int64(time.Hour)) }
+
+// ShortenDaemonTickForTest overrides the daemon loop's tick and returns a
+// restore func. Test support ONLY (the ext.ResetForTest pattern): it exists so
+// the per-daemon wiring tests in cliapp/consoleapp/cmd/bintrail-pg/internal/cli
+// can drive a REAL daemon run function and observe a beacon without waiting an
+// hour. Production code never calls it.
+func ShortenDaemonTickForTest(d time.Duration) (restore func()) {
+	prev := daemonTick.Swap(int64(d))
+	return func() { daemonTick.Store(prev) }
+}
 
 // RunDaemon keeps telemetry alive for a long-running process. Run it in its own
 // goroutine; it returns when ctx is done.
@@ -290,12 +305,27 @@ var daemonTick = time.Hour
 // beaconed on start would emit one per restart, bounded only by the spool cap.
 // Waiting an hour means a crash loop never beacons at all, and "alive for at
 // least an hour" is the more honest liveness signal anyway.
+//
+// One beacon per PROCESS: the daily cap lives on the Client and is blind to
+// the daemon name, so a process must run exactly ONE RunDaemon loop — a
+// second loop under a different name would race it for the single daily slot
+// and corrupt both series. That is why the supervised per-source streams
+// under `watch` deliberately do NOT beacon as "stream": the process already
+// beacons as "watch".
+//
+// Wired daemons (keep in sync with docs/TELEMETRY.md "Which surfaces
+// report"): stream, agent, up (delegates to runStream), watch (both run
+// paths), bintrail-console serve, bintrail shim, bintrail-pg stream, and
+// bintrail-pg flashback. A new long-running daemon must start this loop AND
+// add a wiring guard test (see internal/telemetry/telemetrytest) — nothing
+// fails on its own when the launch line is missing.
 func (c *Client) RunDaemon(ctx context.Context, daemon string) {
 	// Exit only when this build/environment can NEVER report — an inert build
 	// must not spin a ticker forever. A daemon that is merely consent-off keeps
 	// the loop so a runtime opt-in (the console toggle) resumes beaconing
 	// without a restart; Beacon and drainOnce no-op while consent is off.
 	if !c.canEverReport() {
+		debugf("daemon %q: telemetry can never report in this build/environment; loop not started", daemon)
 		return
 	}
 	defer func() {
@@ -312,13 +342,24 @@ func (c *Client) RunDaemon(ctx context.Context, daemon string) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(daemonTick):
+		case <-time.After(time.Duration(daemonTick.Load())):
 		}
 		if !c.Enabled() {
 			continue // consent off right now; a runtime opt-in resumes us
 		}
-		c.Beacon(daemon)
-		c.drainOnce()
+		// Per-tick recovery: a panic in one tick's beacon or drain must cost
+		// that tick, not every future beacon of a months-lived process (the
+		// outer recover alone would end the loop for good, signalled only at
+		// debug level).
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					debugf("daemon telemetry tick panicked")
+				}
+			}()
+			c.Beacon(daemon)
+			c.drainOnce()
+		}()
 	}
 }
 
