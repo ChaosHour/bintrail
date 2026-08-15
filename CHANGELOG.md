@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-08-15
+
+### Changed
+- **The console Overview paints in seconds on archive-heavy sources** (#1352).
+  The activity aggregate is now materialized per server — computed once,
+  served from a cache with a ~30-minute refresh, and every tile disclosing
+  its own `as of …` freshness stamp instead of re-scanning the index on every
+  page load. The Overview now reads exclusively the live index, and its
+  window IS the live retention (derived from the oldest live partition; the
+  fixed 1h/6h/24h picker is gone). Window == live coverage by construction,
+  so archived-only hours can no longer fall inside it and the per-request
+  archive completeness pass is deleted with the ambiguity it guarded.
+- **The default Events browse answers from the live index when archives
+  cannot change it** (#1353). Archives only ever hold partitions older than
+  the rotation boundary, so a newest-first page that the live index fills
+  completely cannot gain anything from opening them — but the default browse
+  (no time range) never had that proof and opened every archive source per
+  request. On an archive-heavy fixture this took the default browse from
+  93ms (local archives) / 259ms (S3) to ~8ms with zero S3 reads. The skip is
+  auditable: the response `warnings` say when archives were elided and why,
+  and any query whose window reaches archived hours still reads them. The
+  Events view shows skeleton rows while loading — never a blank list.
+- **Every time the console renders now states its timezone** (#1354). The
+  "as of" clock was the browser's local time, unlabeled, directly above data
+  timestamps that are all UTC — the same instant read hours apart on one
+  page. Everything rendered is now declared UTC (section-level chips,
+  labeled headers, labeled freshness stamps), with the viewer's local
+  equivalent as a hover tooltip. Displayed data timestamps stay the exact
+  wire text, so they remain copy-pasteable into `--since`/`--until`/`AS OF`
+  unchanged.
+- **The console adopts the dbtrail.com brand palette and typography**
+  (#1355). Colors are mapped by role in oklch keeping the console's
+  lightness relationships — every text/background pair in use passes WCAG AA
+  (the old ramp failed seven of them). The semantic INSERT/UPDATE/DELETE/diff
+  colors keep their meanings. The declared brand fonts now actually ship:
+  subsetted woff2 files (~123 KB, OFL) embedded in the binary and served
+  same-origin, keeping the console's zero-external-requests posture.
+
 ## [0.54.0] - 2026-08-14
 
 ### Added
