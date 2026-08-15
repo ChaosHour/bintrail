@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.56.0] - 2026-08-15
+
+### Added
+- **Every long-running daemon now emits the daily `daemon_beacon`** (#1362).
+  The beacon machinery existed and was documented, but `bintrail-console
+  serve`, `bintrail shim`, and `bintrail-pg flashback` never emitted it — a
+  fleet of read-only consoles and time-travel shims read as zero installed
+  base. All eight daemon entry points now run the beacon loop, each pinned by
+  a wiring test that delivers a real beacon end-to-end and fails if the loop
+  is ever unwired. The payload, consent gates, and TELEMETRY.md claims are
+  unchanged — the documented event finally fires everywhere.
+  - Fixed alongside, because wiring serve exposed it: serve's telemetry
+    opt-out endpoint could report `reporting: false` while the new beacon
+    loop kept delivering. The console's opt-out now flips the live client in
+    `serve` exactly as it does in `watch`.
+- **The Restore form got both hands** (#1363, #1364). Generate undo SQL and
+  Preview rows open a progress dialog the instant they're clicked — it names
+  what's being generated, blocks double-submits, and Cancel/Escape genuinely
+  abort the in-flight request. The Table field offers the selected schema's
+  tables as suggestions (a typed name still always submits — recovering a
+  dropped table stays possible), and a failed Generate no longer leaves the
+  previous run's script on screen with a live Download button.
+
+### Changed
+- **The archive-elision record is an info note, not a warning** (#1365).
+  Skipping archives that could not change a page (#1353) was rendered through
+  the same amber ⚠ banner as real coverage gaps, so a benign audit fact read
+  as an incident. Responses now split advisories: `warnings` keeps cautionary
+  facts (gaps, session exclusions, divergence findings), a new additive
+  `notes` list carries benign audit facts, and the console renders notes in a
+  muted register with plain-words copy. The fact itself still travels on
+  every response — auditability was the requirement; the alarm was the bug.
+
 ## [0.55.1] - 2026-08-15
 
 ### Fixed
