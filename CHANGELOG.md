@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.57.1] - 2026-08-16
+
+### Fixed
+- **The console's verify "Explain" button no longer looks dead** (#1375). The
+  row-level drill-down RE-RECONSTRUCTS the table in order to diff it — minutes
+  of DuckDB work on a large one — and it was answered synchronously with no
+  progress indication of any kind. The console itself tolerates a long
+  response (it sets no `WriteTimeout`, and clears the read deadline for the
+  handlers that legitimately run long), but a fronting reverse proxy at its
+  stock read timeout — 60s on nginx — does not. Behind one, the only possible
+  outcome was a request that died in the proxy and a toast that faded: a
+  button that appeared to do nothing at all. The work now runs on the daemon
+  like a verify run does. The request returns immediately with
+  `202 {"state":"running"}`, the console polls behind a busy dialog that says
+  what it is doing and can be cancelled, and a failure is rendered *in* that
+  dialog rather than as a toast.
+  - Closing the dialog only stops the waiting — the drill-down keeps
+    computing, and reopening **Explain** picks up the finished result if it is
+    still held. It is not held indefinitely: the first read consumes it, and a
+    new verify run discards *and cancels* the previous run's drill-downs,
+    since each explains the snapshot pair its own run compared. Only a
+    baseline-anchored run can produce a replacement, so after a live-source or
+    check-recovery-inputs run Explain stays unavailable until the next
+    baseline-anchored one reports the table as a mismatch again.
+  - A drill-down failure is now logged by the daemon whether or not anyone is
+    still polling. Previously the HTTP response was the only delivery path for
+    that error, so a reconstruction that failed after the operator closed the
+    dialog left no trace anywhere.
+
 ## [0.57.0] - 2026-08-15
 
 ### Added
