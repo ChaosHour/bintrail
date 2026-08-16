@@ -20,6 +20,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/mydumperlock"
 )
 
 var dumpCmd = &cobra.Command{
@@ -42,6 +43,7 @@ var (
 	dmpMydumperPath  string
 	dmpMydumperImage string
 	dmpThreads       int
+	dmpLockMode      string
 	dmpFormat        string
 	dmpEncrypt       bool
 	dmpEncryptKey    string
@@ -59,6 +61,8 @@ func init() {
 	dumpCmd.Flags().StringVar(&dmpMydumperPath, "mydumper-path", "mydumper", "Path to the mydumper binary")
 	dumpCmd.Flags().StringVar(&dmpMydumperImage, "mydumper-image", "mydumper/mydumper:latest", "Docker image for mydumper (used when no local binary is found)")
 	dumpCmd.Flags().IntVar(&dmpThreads, "threads", 4, "Number of mydumper dump threads")
+	dumpCmd.Flags().StringVar(&dmpLockMode, "lock-mode", string(baseline.DefaultLockMode),
+		"How mydumper syncs its threads onto one instant: ftwrl (default, point-consistent, needs RELOAD/FLUSH_TABLES and BACKUP_ADMIN on MySQL 8.0+), safe-no-lock (no extra privilege, ABORTS rather than emit a torn snapshot), no-lock (accepts a torn snapshot)")
 	dumpCmd.Flags().StringVar(&dmpFormat, "format", "text", "Output format: text or json")
 	dumpCmd.Flags().BoolVar(&dmpEncrypt, "encrypt", false, "Encrypt dump files at rest using AES-256-CBC and write an HMAC-SHA256 integrity sidecar (<file>.enc.hmac) per file (requires openssl on $PATH)")
 	dumpCmd.Flags().StringVar(&dmpEncryptKey, "encrypt-key", "", "Path to encryption key file (default: ~/.config/bintrail/dump.key; generate with 'bintrail generate-key')")
@@ -220,6 +224,55 @@ func runDump(cmd *cobra.Command, args []string) error {
 	schemas := cliutil.ParseSchemaList(dmpSchemas)
 	tables := cliutil.ParseSchemaList(dmpTables)
 
+	// Lock mode is resolved and its privileges probed BEFORE the dump lock and
+	// before prepareDumpOutputDir moves a previous dump aside. Step 2b states
+	// the rule (#809): a wrong credential must fail before the previous,
+	// only-good dump is disturbed — and a missing RELOAD grant is that same
+	// failure class. CheckPrivileges opens its own connection, so leaving it
+	// below the rename would put a multi-second network round trip inside the
+	// window where the good dump exists only under a .old-<pid>-<nanos> name
+	// the operator has never seen.
+	lockMode, lmErr := baseline.ParseLockMode(dmpLockMode)
+	if lmErr != nil {
+		return lmErr
+	}
+	supportsLockMode := true
+	if res.mode == dumpModeLocal {
+		major, minor, patch, verErr := mydumperVersion(res.path)
+		if verErr != nil {
+			slog.Warn("could not determine mydumper version; omitting --sync-thread-lock-mode and --trx-tables for safety",
+				"error", verErr)
+			supportsLockMode = false
+		} else if !mydumperSupportsLockMode(major, minor) {
+			slog.Warn("mydumper version is older than 0.18; omitting --sync-thread-lock-mode and --trx-tables — the dump may hold heavier locks",
+				"version", fmt.Sprintf("%d.%d.%d", major, minor, patch))
+			supportsLockMode = false
+		}
+	}
+	// Refuse rather than silently ignore an explicit choice. Dropping the flag
+	// is safe for the DEFAULT (pre-0.18 mydumper locks by default anyway, which
+	// is why the omission is only a warning above), but an operator who typed
+	// --lock-mode has a reason: safe-no-lock because they lack the privileges
+	// FTWRL needs, or no-lock because they knowingly accept skew. Honouring
+	// neither while reporting success is the silent-wrong-answer this whole
+	// change exists to remove.
+	if !supportsLockMode && cmd.Flags().Changed("lock-mode") {
+		return fmt.Errorf("--lock-mode %s needs mydumper 0.18 or newer (this build does not accept --sync-thread-lock-mode); "+
+			"upgrade mydumper, or point --mydumper-image at a newer pinned image", lockMode)
+	}
+	// Probe privileges BEFORE launching mydumper. Granting BACKUP_ADMIN without
+	// RELOAD/FLUSH_TABLES does not make mydumper fail cleanly — the pinned build
+	// SEGFAULTS (#800) — so the crash has to be made unreachable rather than
+	// reported. This check used to live only on the console because the CLI
+	// always passed NO_LOCK and could not reach the crash; #1377 made the
+	// point-consistent mode the default here too, so the guard has to come
+	// with it. Skipped when the flag is not being sent at all.
+	if supportsLockMode && lockMode.NeedsElevatedPrivileges() {
+		if err := mydumperlock.CheckPrivileges(cmd.Context(), dmpSourceDSN, mydumperlock.RemedyCLI); err != nil {
+			return err
+		}
+	}
+
 	// 4. Acquire dump lock — only one dump at a time.
 	lockFile, err := acquireDumpLock()
 	if err != nil {
@@ -255,19 +308,6 @@ func runDump(cmd *cobra.Command, args []string) error {
 	// unconditionally or the dump fails (#219, #460). Docker mode is NOT
 	// version-probed: a pinned --mydumper-image older than 0.18 fails with
 	// "unknown option", which is why the docs' pin examples stay >= 0.18.
-	supportsLockMode := true
-	if res.mode == dumpModeLocal {
-		major, minor, patch, verErr := mydumperVersion(res.path)
-		if verErr != nil {
-			slog.Warn("could not determine mydumper version; omitting --sync-thread-lock-mode and --trx-tables for safety",
-				"error", verErr)
-			supportsLockMode = false
-		} else if !mydumperSupportsLockMode(major, minor) {
-			slog.Warn("mydumper version is older than 0.18; omitting --sync-thread-lock-mode and --trx-tables — the dump may hold heavier locks",
-				"version", fmt.Sprintf("%d.%d.%d", major, minor, patch))
-			supportsLockMode = false
-		}
-	}
 	// The source password must never reach mydumper's argv (visible in
 	// `ps aux` / /proc/<pid>/cmdline and, under Docker, in `docker inspect`).
 	// Docker mode delivers it via a 0600 defaults-file bind-mounted read-only;
@@ -282,7 +322,7 @@ func runDump(cmd *cobra.Command, args []string) error {
 		}
 		defer cleanup()
 	}
-	mydumperArgs := buildMydumperArgs(host, port, user, defaultsFile, dmpOutputDir, dmpThreads, schemas, tables, encryptKeyPath, supportsLockMode)
+	mydumperArgs := buildMydumperArgs(host, port, user, defaultsFile, dmpOutputDir, dmpThreads, schemas, tables, encryptKeyPath, supportsLockMode, lockMode)
 
 	// 7. Build the final command depending on resolution mode.
 	var c *exec.Cmd
@@ -564,7 +604,8 @@ func mydumperSupportsLockMode(major, minor int) bool {
 // non-empty its path is referenced with --defaults-file so mydumper reads the
 // password from it (#811).
 func buildMydumperArgs(host string, port uint16, user, defaultsFile, outputDir string,
-	threads int, schemas, tables []string, encryptKeyPath string, supportsLockMode bool) []string {
+	threads int, schemas, tables []string, encryptKeyPath string, supportsLockMode bool,
+	lockMode baseline.LockMode) []string {
 
 	args := []string{
 		"--host", host,
@@ -576,7 +617,7 @@ func buildMydumperArgs(host string, port uint16, user, defaultsFile, outputDir s
 	}
 
 	if supportsLockMode {
-		args = append(args, "--sync-thread-lock-mode", "NO_LOCK", "--trx-tables")
+		args = append(args, "--sync-thread-lock-mode", lockMode.MydumperValue(), "--trx-tables")
 	}
 
 	if defaultsFile != "" {

@@ -101,14 +101,19 @@ var (
 	// upBaselineStageDir is the local staging base for S3-destined baselines
 	// (BINTRAIL_CONSOLE_BASELINE_STAGING); default a temp subdir.
 	upBaselineStageDir string
-	// upConsoleBaselinePointConsistent opts a console-triggered MySQL/MariaDB
-	// baseline into mydumper's FTWRL sync mode instead of the NO_LOCK default,
-	// trading the least-privilege requirement (no BACKUP_ADMIN/RELOAD needed) for
-	// a single point-in-time snapshot across every transactional table (#800).
-	// Env-only (BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT=1) — off by default,
-	// same shape as upConsoleBaselineTrigger; has no effect unless baseline-trigger
-	// is also on.
-	upConsoleBaselinePointConsistent bool
+	// upConsoleBaselineLockMode selects how a console-triggered MySQL/MariaDB
+	// baseline synchronizes mydumper's threads onto one instant (#800, #1377).
+	// Defaults to baseline.DefaultLockMode (FTWRL, point-consistent): a
+	// baseline is the seed state reconstruct merges deltas onto, so a snapshot
+	// that can be torn is not a backup, and that must not be something an
+	// operator has to opt IN to. Env-only
+	// (BINTRAIL_CONSOLE_BASELINE_LOCK_MODE); has no effect unless
+	// baseline-trigger is also on.
+	upConsoleBaselineLockMode = baseline.DefaultLockMode
+	// upConsoleBaselineLockModeErr holds an invalid BINTRAIL_CONSOLE_BASELINE_LOCK_MODE
+	// so the baseline supervisor can refuse with it. Startup is NOT failed:
+	// see the parse site in resolveUpConsoleEnv.
+	upConsoleBaselineLockModeErr error
 	// upConsoleVerifyTrigger opts into in-process bintrail verify runs from the
 	// console (#677). Env-only (BINTRAIL_CONSOLE_VERIFY_TRIGGER=1) — off by
 	// default for a bare `watch` invocation; unlike baseline-trigger it starts
@@ -385,7 +390,9 @@ func waitForIndexMySQL(ctx context.Context, dsn string, timeout time.Duration) e
 // (and resumed at boot, via Reconcile) from the UI. Mirrors
 // runUpStreamWithConsole minus the main stream.
 func runUpConsoleOnly(cmd *cobra.Command) error {
-	resolveUpConsoleEnv(cmd)
+	if err := resolveUpConsoleEnv(cmd); err != nil {
+		return err
+	}
 
 	db, err := config.Connect(upIndexDSN)
 	if err != nil {
@@ -442,7 +449,7 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	// feature the operator did not enable.
 	var baselineSup *baselineSupervisor
 	if upConsoleBaselineTrigger || upBaselineRefreshEvery != "" {
-		baselineSup = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
+		baselineSup = newBaselineSupervisorFromConfig(ctx, baselineStagingDir())
 	}
 	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = baselineSup
@@ -577,7 +584,9 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "Auto-derived server-id from source DSN: %d\n", serverID)
 	}
 
-	resolveUpConsoleEnv(cmd)
+	if err := resolveUpConsoleEnv(cmd); err != nil {
+		return err
+	}
 
 	db, err := config.Connect(upIndexDSN)
 	if err != nil {
@@ -639,7 +648,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// feature the operator did not enable.
 	var baselineSup *baselineSupervisor
 	if upConsoleBaselineTrigger || upBaselineRefreshEvery != "" {
-		baselineSup = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
+		baselineSup = newBaselineSupervisorFromConfig(ctx, baselineStagingDir())
 	}
 	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = baselineSup
@@ -816,7 +825,19 @@ func mainSourceJobInfo(sourceDSN, indexDSN, streamFlavor string) ext.SourceJobIn
 // console-only vars whose flags (--baseline-dir/--baseline-s3) also exist on
 // core bintrail commands, and the direct read keeps the precedence dance in
 // one unit-testable place.
-func resolveUpConsoleEnv(cmd *cobra.Command) {
+// newBaselineSupervisorFromConfig builds the supervisor from the resolved
+// console configuration. It exists so the two watch entry points cannot drift
+// on the one wiring that matters: carrying an invalid-lock-mode error into the
+// supervisor. Dropping that assignment is invisible at either call site — the
+// daemon still boots and baselines still run, in a mode the operator did not
+// ask for — so it is asserted here rather than duplicated there.
+func newBaselineSupervisorFromConfig(ctx context.Context, stagingDir string) *baselineSupervisor {
+	sup := newBaselineSupervisor(ctx, stagingDir, upConsoleBaselineLockMode)
+	sup.configErr = upConsoleBaselineLockModeErr
+	return sup
+}
+
+func resolveUpConsoleEnv(cmd *cobra.Command) error {
 	if !cmd.Flags().Changed("console-listen") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_LISTEN"); v != "" {
 			upConsoleListen = v
@@ -894,8 +915,27 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 	if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_STAGING"); v != "" {
 		upBaselineStageDir = v
 	}
-	if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT"); v == "1" || v == "true" {
-		upConsoleBaselinePointConsistent = true
+	// Lock mode defaults to point-consistent (baseline.DefaultLockMode). The
+	// pre-#1377 BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT opt-in is gone: it
+	// selected what is now the default, so an operator who set it keeps the
+	// behaviour they asked for and needs no migration. Only this variable can
+	// select a WEAKER mode — a snapshot that can be torn has to be asked for.
+	if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_LOCK_MODE"); v != "" {
+		m, err := baseline.ParseLockMode(v)
+		if err != nil {
+			// Refuse BASELINES, not the daemon. Under `watch` this process is
+			// also the capture plane, so failing startup over a baseline
+			// setting would turn a typo into permanently lost events — the
+			// same trap that made a refresh-only daemon refuse to boot. The
+			// error is carried to the baseline supervisor, which returns it
+			// from every Trigger, so it lands in baseline status where the
+			// operator is looking.
+			upConsoleBaselineLockModeErr = fmt.Errorf("BINTRAIL_CONSOLE_BASELINE_LOCK_MODE: %w", err)
+			slog.Error("console: MySQL baseline DUMPS disabled by an invalid lock mode; capture and the periodic refresh are unaffected",
+				"error", upConsoleBaselineLockModeErr)
+		} else {
+			upConsoleBaselineLockMode = m
+		}
 	}
 	// Verify trigger is env-only (no flag), same shape as baseline trigger.
 	if v := os.Getenv("BINTRAIL_CONSOLE_VERIFY_TRIGGER"); v == "1" || v == "true" {
@@ -916,6 +956,7 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 			upNotifyWebhook = v
 		}
 	}
+	return nil
 }
 
 // baselineStagingDir resolves the local staging base for baselines destined for
