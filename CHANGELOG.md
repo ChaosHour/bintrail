@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.57.0] - 2026-08-15
+
+### Added
+- **A console sign-in now carries to new tabs** (#1370). The session lived only
+  in `sessionStorage`, which browsers scope per tab, so opening any console
+  link in a new tab — middle-click, "open in new tab", pasting a URL — landed
+  on the login panel while the original tab stayed signed in. It read as
+  "the console logged me out"; it never had. Logging in now also sets an
+  `HttpOnly; Secure; SameSite=Lax` session cookie whose value IS the session
+  token, so a fresh tab authenticates against the same store, same expiry and
+  same policy. Signing out revokes the session server-side and clears the
+  cookie, so it ends every tab at once, not just the one that clicked.
+  - **The `Authorization: Bearer` path is untouched**: `--token`, the
+    `?token=` bootstrap, `/mcp`, and every scripted client behave exactly as
+    before. When a Bearer header is present it is judged alone and never
+    falls back to the cookie.
+  - Cookies bring CSRF exposure that a header-only scheme does not have, so
+    a request authenticated *by cookie* must carry `Content-Type:
+    application/json` to change state — a marker no cross-site HTML form can
+    send. Bearer-authenticated requests are exempt. The belt runs after the
+    credential check, so an invalid cookie is still a plain 401 and the
+    actionable 403 only ever reaches someone genuinely signed in.
+
+### Changed
+- **BREAKING (embedders only) — `ext.ConsoleSessionIssuer` takes the
+  `http.ResponseWriter`** (#1370): `func(w http.ResponseWriter, identity
+  string, policy *AccessPolicy) (token string, expiresAt time.Time, err
+  error)`. The issuer sets the session cookie at the moment it mints the
+  session, which requires the in-flight response. There is no in-repo
+  implementor, so the break is absorbed in one release by the external
+  authentication provider that plugs into the console login surface; a
+  compile-time pin in `ext/consoleauth_test.go` keeps the shape from drifting
+  silently. Passing `w` through only to satisfy the type — without letting
+  the issuer set the cookie — compiles and leaves SSO logins tab-scoped,
+  which is the behavior this change exists to fix.
+- **The console wears the site's sunset in its brand moments** (#1371).
+  0.55.0 adopted dbtrail.com's ink ramp, typefaces and product accents but
+  kept brand color to two micro-moments, so the console read as a different
+  product from the site that introduces it. The sign-in gate is now a
+  full-screen hero canvas with the panel floating on it, empty states carry a
+  faint sunrise wash and a sunset hairline, the Restore progress dots animate
+  on the pink→orange arm, and the active nav rail extends the accent gradient
+  into the sunset. **No data surface changed**: event tables, badges, diffs
+  and the INSERT/UPDATE/DELETE semantic colors are untouched, and brand color
+  never encodes data. Every new text-over-brand pairing was measured against
+  WCAG AA (21 of 21 pass), which is why the canvas stops sit slightly darker
+  than the site's — at site lightness the white panel would land at 2.05:1.
+
+### Fixed
+- **The Restore filter row no longer stair-steps** (#1369). The Table
+  combobox added in 0.56.0 carries a hint line below the input, and because
+  the filter row aligns fields by their bottom edge, the space that hint
+  reserved — even while empty — pushed the Table label and input above every
+  other field. The hint is now positioned out of flow, so the field's box
+  matches its siblings whether the hint is empty, loading or showing a note,
+  and a hint appearing mid-load no longer shifts the row.
+
 ## [0.56.0] - 2026-08-15
 
 ### Added
