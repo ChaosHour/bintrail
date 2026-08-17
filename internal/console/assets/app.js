@@ -608,14 +608,117 @@ async function submitPasswordChange(form, msg, firstSet) {
 
 // ── toast / errors / warnings ─────────────────────────────────────────────────
 
+// toast shows a transient notice. Use it for things that went RIGHT, or for
+// neutral progress. Failures must not fade — see toastError.
+//
+// It writes to its OWN node, never the error node. An earlier attempt shared
+// one element and had toast() yield to a visible error, which silently dropped
+// messages this function also carries: "rotate your MCP token" after a display
+// interruption (the token is already unrecoverable by then), "capture did NOT
+// restart onto the new snapshot", export-truncation warnings. Each is reported
+// nowhere else, and one undismissed error would have suppressed them all for
+// the rest of the session. Two nodes, no contention.
 function toast(msg) {
   const t = document.getElementById("toast");
   if (!t) return;
+  clearTimeout(toast._t);
   t.textContent = msg;
   t.hidden = false;
-  clearTimeout(toast._t);
   toast._t = setTimeout(() => { t.hidden = true; }, 2200);
 }
+
+// toastError shows a failure that stays until the operator dismisses it.
+//
+// A failure that disappears on its own is a failure nobody saw. The baseline
+// privilege refusal is ~550 characters of remediation — which privilege to
+// grant, the exact GRANT statement, and the alternative modes — and at the
+// 2.2s auto-hide it was not merely easy to miss, it was unreadable. The
+// operator was left with a button that did nothing and no way to recover the
+// reason. Nothing here starts a timer.
+function toastError(msg) {
+  const t = document.getElementById("toast-error");
+  if (!t) return;
+  // A second failure STACKS rather than replaces. These never auto-hide, so a
+  // silent overwrite would destroy an unread failure with nothing to hint one
+  // existed — two servers' baselines refusing together is the ordinary case.
+  //
+  // A REPEAT of a message already showing gets a count, not a dropped call.
+  // Dropping it was wrong: several of these messages carry no server name
+  // ("Startup checks failed", "Copy failed."), so failing on server B after
+  // server A produced NO change on screen — indistinguishable from success.
+  const prior = t.hidden ? [] : $all(".toast-msg", t).map((n) => ({
+    text: n.dataset.msg || n.textContent,
+    n: Number(n.dataset.count || "1"),
+  }));
+  const dupe = prior.find((p) => p.text === msg);
+  if (dupe) dupe.n += 1;
+  else prior.push({ text: msg, n: 1 });
+  // role=alert so a screen reader announces it; the visual persistence is
+  // useless to someone who cannot see it fade. The node is unhidden BEFORE the
+  // text lands: a live region that appears with its content already in place
+  // is the shape screen readers routinely fail to announce.
+  t.setAttribute("role", "alert");
+  t.replaceChildren();
+  t.hidden = false;
+  const body = el("div", { class: "toast-body" });
+  for (const m of prior) {
+    const span = el("span", { class: "toast-msg", text: m.n > 1 ? m.text + "  (\u00d7" + m.n + ")" : m.text });
+    span.dataset.msg = m.text;
+    span.dataset.count = String(m.n);
+    body.append(span);
+  }
+  t.append(body);
+  const close = el("button", { class: "toast-close", type: "button", "aria-label": "Dismiss all" });
+  close.textContent = "\u2715";
+  close.addEventListener("click", () => dismissToast());
+  t.append(close);
+}
+
+function dismissToast() {
+  const t = document.getElementById("toast-error");
+  if (!t) return;
+  t.hidden = true;
+  t.removeAttribute("role");
+  t.textContent = "";
+}
+
+// ESC dismisses a persistent error, matching every other dismissible surface
+// in this console — but only as the LAST of them.
+//
+// cmdkKeydown closes the ⌘K palette WITHOUT stopping propagation
+// (deliberately, see globalKeydown), so the same Escape reaches the document
+// and would also destroy an unread error — the failure this whole change
+// exists to prevent, arriving through a different door.
+//
+// Hence the CAPTURE phase (registered with `true` in init). Deciding on the
+// bubble phase cannot work: by then globalKeydown has already emptied #modal
+// and cmdkKeydown has already emptied #cmdk-mount, so the very state this
+// guard reads to yield the key has been erased by the handlers it is yielding
+// to, and it would dismiss the notice anyway. Verified in a browser: on the
+// bubble phase one Escape closes a modal AND wipes the notice behind it.
+//
+// It never calls preventDefault or stopPropagation, so yielding is all it does
+// — the dialog handlers still run normally on the same event.
+function toastEscape(e) {
+  if (e.key !== "Escape") return;
+  if (loginGateRaised) return;
+  const cmdk = document.getElementById("cmdk-mount");
+  if (cmdk && cmdk.firstChild) return;
+  const modalMount = document.getElementById("modal");
+  if (modalMount && modalMount.firstChild) return;
+  // Every surface that consumes Escape must be listed here, including ones
+  // that are NOT inside #modal. The date picker renders into document.body
+  // (see toggleDatePicker) and closes itself on Escape without stopping
+  // propagation, so closing a calendar popover used to destroy the notice —
+  // the same defect as the ⌘K palette, through a third door. A fourth surface
+  // will not announce itself; if you add one that handles Escape, add it here.
+  if (document.querySelector(ESCAPE_OWNING_POPOVERS)) return;
+  const t = document.getElementById("toast-error");
+  if (t && !t.hidden) dismissToast();
+}
+
+// Popovers that live outside #modal and consume Escape themselves.
+const ESCAPE_OWNING_POPOVERS = ".dt-pop";
 
 function renderError(container, err) {
   if (!container) return;
@@ -1804,7 +1907,7 @@ async function exportEvents(kind, btn) {
       toast("Exported the newest " + rows.length + " matches — the search has more. Narrow it with a time range to export the rest.");
     }
   } catch (err) {
-    toast("Export failed: " + (err && err.message ? err.message : String(err)));
+    toastError("Export failed: " + (err && err.message ? err.message : String(err)));
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = label; }
   }
@@ -1899,7 +2002,7 @@ function downloadBlob(filename, content, mime) {
     const a = el("a", { href: url, download: filename });
     document.body.append(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
-  } catch (err) { toast("download failed: " + ((err && err.message) || err)); }
+  } catch (err) { toastError("download failed: " + ((err && err.message) || err)); }
 }
 function csvCell(v) {
   if (v === null || v === undefined) return "";
@@ -2149,7 +2252,7 @@ function openBusyModal(form, opts) {
         // vanished failure this modal exists to prevent. Tear down and
         // surface the error where it can be seen.
         teardown();
-        toast(opts.errTitle + ": " + msg);
+        toastError(opts.errTitle + ": " + msg);
         return;
       }
       panel.setAttribute("aria-busy", "false");
@@ -2341,7 +2444,7 @@ function codePanel(sql, metaLabel) {
   return panel;
 }
 function copySQL() {
-  navigator.clipboard.writeText(lastSQL).then(() => toast("SQL copied to clipboard"), () => toast("Copy failed."));
+  navigator.clipboard.writeText(lastSQL).then(() => toast("SQL copied to clipboard"), () => toastError("Copy failed."));
 }
 function downloadSQL() { downloadBlob("dbtrail-undo.sql", lastSQL, "application/sql"); }
 
@@ -2442,7 +2545,7 @@ async function runState(form, history) {
 // and quietly restore to the wrong place.
 function aimUndoAtInstant(form, at) {
   const since = shiftSeconds(at, 1);
-  if (!since) { toast("Could not read the selected instant."); return; }
+  if (!since) { toastError("Could not read the selected instant."); return; }
   form.elements.since.value = since;
   form.elements.until.value = "";
   previewRecover(form);
@@ -2854,7 +2957,7 @@ async function acknowledgeCaptureSkips(total, btn) {
   } catch (err) {
     // The 409 here is the stale-tab refusal, and its message already says to
     // reload — surfacing the server's own text keeps the two in one voice.
-    toast("Could not mark as read: " + ((err && err.message) || err));
+    toastError("Could not mark as read: " + ((err && err.message) || err));
     if (btn) { btn.disabled = false; btn.textContent = "Mark as read"; }
     return;
   }
@@ -2894,7 +2997,7 @@ async function refreshSchemaSnapshot(id, btn) {
   try {
     await api("/api/servers/" + encodeURIComponent(id) + "/schema-snapshot", { method: "POST", body: {} });
   } catch (err) {
-    toast("Schema snapshot failed: " + ((err && err.message) || err));
+    toastError("Schema snapshot failed: " + ((err && err.message) || err));
     restore();
     return;
   }
@@ -2903,7 +3006,7 @@ async function refreshSchemaSnapshot(id, btn) {
   restore();
   if (!done) { toast("Schema snapshot still running — check back shortly."); return; }
   if (done.state !== "succeeded") {
-    toast("Schema snapshot failed: " + (done.last_error || "unknown error"));
+    toastError("Schema snapshot failed: " + (done.last_error || "unknown error"));
     return;
   }
   let msg = "Schema snapshot updated: " + (done.tables || 0) + " table(s).";
@@ -3182,7 +3285,7 @@ function duckdbCard() {
       downloadBlob("views.sql", sql, "text/plain");
       toast("views.sql downloaded — run it with: duckdb lake.db < views.sql");
     } catch (err) {
-      toast("could not generate views: " + ((err && err.message) || err));
+      toastError("could not generate views: " + ((err && err.message) || err));
     } finally {
       btn.disabled = false;
     }
@@ -3339,7 +3442,7 @@ async function setTelemetry(enabled) {
   try {
     await api("/api/telemetry", { method: "POST", body: JSON.stringify({ enabled: enabled }) });
   } catch (e) {
-    toast("Could not change telemetry: " + ((e && e.message) || e));
+    toastError("Could not change telemetry: " + ((e && e.message) || e));
     return;
   }
   toast(enabled ? "Telemetry turned on." : "Telemetry turned off — this daemon stops beaconing now.");
@@ -3518,7 +3621,7 @@ async function createBaseline(id, btn) {
   try {
     await api("/api/servers/" + encodeURIComponent(id) + "/baseline", { method: "POST", body: {} });
   } catch (err) {
-    toast("Baseline failed: " + ((err && err.message) || err));
+    toastError("Baseline failed: " + ((err && err.message) || err));
     restore();
     return;
   }
@@ -3529,7 +3632,7 @@ async function createBaseline(id, btn) {
     toast("Baseline complete: " + (done.tables || 0) + " table(s)" +
       (done.uploaded ? ", " + done.uploaded + " file(s) uploaded" : ""));
   } else if (done) {
-    toast("Baseline failed: " + (done.last_error || "unknown error"));
+    toastError("Baseline failed: " + (done.last_error || "unknown error"));
   } else {
     toast("Baseline still running — check back shortly.");
   }
@@ -3637,7 +3740,7 @@ async function createVerify(id, mode, btn, resultsEl) {
   try {
     status = (await api("/api/servers/" + encodeURIComponent(id) + "/verify", { method: "POST", body: { mode } })).verify;
   } catch (err) {
-    toast("Verify failed: " + ((err && err.message) || err));
+    toastError("Verify failed: " + ((err && err.message) || err));
     restore();
     return;
   }
@@ -3654,7 +3757,7 @@ async function createVerify(id, mode, btn, resultsEl) {
     toast(done.note || ("Verification complete: " + s.match + " match, " + s.mismatch + " mismatch, " +
       s.inconclusive + " inconclusive, " + s.error + " error"));
   } else if (done) {
-    toast("Verification failed: " + (done.last_error || "unknown error"));
+    toastError("Verification failed: " + (done.last_error || "unknown error"));
   } else {
     toast("Verification still running — check back shortly.");
   }
@@ -4062,7 +4165,7 @@ async function loadTables(form) {
     // A failed listing leaves the combo as usable free text with its value
     // intact — we cannot know whether the value belongs to the new schema,
     // and a dead or emptied field would be worse than a stale suggestion.
-    toast("failed to load tables: " + ((err && err.message) || err));
+    toastError("failed to load tables: " + ((err && err.message) || err));
     return;
   }
   if (combo) combo.removeAttribute("aria-busy");
@@ -4132,13 +4235,13 @@ async function renderConnect() {
   if (gen !== serverGen) {
     // The consumed plaintext cannot be re-shown; say so instead of losing it
     // silently (the user must rotate to get a usable value).
-    if (minted) toast("Token display interrupted — rotate to get a fresh value");
+    if (minted) toastError("Token display interrupted — the plaintext token is gone; rotate to get a fresh value");
     return;
   }
   try {
     buildConnect(servers, tokStatus, minted);
   } catch (err) {
-    if (minted) toast("Token display interrupted — rotate to get a fresh value");
+    if (minted) toastError("Token display interrupted — the plaintext token is gone; rotate to get a fresh value");
     const v = VIEW(); clear(v); v.append(pageHead("Connect AI", null)); renderError(v, err);
   }
 }
@@ -4167,7 +4270,7 @@ function mcpURL(servers) {
 }
 
 function copyText(text, what) {
-  navigator.clipboard.writeText(text).then(() => toast(what + " copied to clipboard"), () => toast("Copy failed."));
+  navigator.clipboard.writeText(text).then(() => toast(what + " copied to clipboard"), () => toastError("Copy failed."));
 }
 
 function buildConnect(servers, tokStatus, minted) {
@@ -4198,7 +4301,7 @@ async function mintMCPToken(rotate) {
   try {
     res = await api("/api/mcp-token", { method: "POST" });
   } catch (err) {
-    toast("Token generation failed: " + (err.message || err));
+    toastError("Token generation failed: " + (err.message || err));
     return;
   }
   mcpMintedOnce = (res && res.token) || null;
@@ -4211,7 +4314,7 @@ async function revokeMCPToken() {
   try {
     await api("/api/mcp-token", { method: "DELETE" });
   } catch (err) {
-    toast("Revoke failed: " + (err.message || err));
+    toastError("Revoke failed: " + (err.message || err));
     return;
   }
   toast("Managed MCP token revoked");
@@ -4645,7 +4748,7 @@ async function showRotationDialog() {
   if (loginGateRaised) return;
   let cur;
   try { cur = await api("/api/rotation"); }
-  catch (err) { toast("Could not load rotation settings: " + ((err && err.message) || err)); return; }
+  catch (err) { toastError("Could not load rotation settings: " + ((err && err.message) || err)); return; }
 
   const mount = document.getElementById("modal");
   const scrim = el("div", { class: "modal-scrim show" });
@@ -4969,7 +5072,7 @@ async function editServer(id) {
   // as an uncaught error, not masquerade as "failed to load server".
   let s;
   try { s = await api("/api/servers/" + encodeURIComponent(id)); }
-  catch (err) { toast("Could not load server: " + ((err && err.message) || err)); return false; }
+  catch (err) { toastError("Could not load server: " + ((err && err.message) || err)); return false; }
   showServerForm(s);
   return true;
 }
@@ -5002,7 +5105,7 @@ async function saveServer(form) {
 async function deleteServer(s) {
   if (!window.confirm('Remove server "' + s.name + '"? This only removes the saved connection — nothing happens to the server itself.')) return;
   try { await api("/api/servers/" + encodeURIComponent(s.id), { method: "DELETE" }); }
-  catch (err) { toast("Could not remove server: " + ((err && err.message) || err)); return; }
+  catch (err) { toastError("Could not remove server: " + ((err && err.message) || err)); return; }
   if (currentServer === s.id) { await switchServer(""); const sel = document.getElementById("server-select"); if (sel) sel.value = defaultServerId; }
   await refreshServersList();
   toast("Server removed");
@@ -5066,7 +5169,7 @@ function renderDoctor(report) {
 
 async function startMonitor(id) {
   try { return await api("/api/servers/" + encodeURIComponent(id) + "/monitor/start", { method: "POST", body: {} }); }
-  catch (err) { toast("Could not start: " + ((err && err.message) || err)); return null; }
+  catch (err) { toastError("Could not start: " + ((err && err.message) || err)); return null; }
 }
 
 async function startMonitorRow(id) {
@@ -5080,12 +5183,13 @@ async function startMonitorRow(id) {
   if (opened) {
     renderDoctor(res.doctor);
     formMsg(res.started ? "Monitoring started — review the warnings below" : "Startup checks failed — fix the items below, save, and start again", !res.started);
-  } else { toast(res.started ? "Monitoring started — with warnings" : "Startup checks failed"); }
+  } else if (res.started) { toast("Monitoring started — with warnings"); }
+  else { toastError("Startup checks failed"); }
 }
 
 async function stopMonitorRow(id) {
   try { await api("/api/servers/" + encodeURIComponent(id) + "/monitor/stop", { method: "POST", body: {} }); toast("Monitoring stopped"); }
-  catch (err) { toast("Could not stop: " + ((err && err.message) || err)); }
+  catch (err) { toastError("Could not stop: " + ((err && err.message) || err)); }
   await refreshServersList();
 }
 
@@ -5232,7 +5336,7 @@ async function bootSequence() {
   // error when its fetch fails.
   try { servers = await loadServers(); } catch (err) {
     if (err && err.status === 401) return null;
-    toast("Could not load servers: " + ((err && err.message) || err));
+    toastError("Could not load servers: " + ((err && err.message) || err));
   }
   try { await gateCapabilities(); } catch (err) {
     if (err && err.status === 401) return null;
@@ -5248,6 +5352,10 @@ async function init() {
   document.getElementById("open-cmdk").addEventListener("click", openCmdk);
   document.getElementById("logout-btn").addEventListener("click", doLogout);
   document.addEventListener("keydown", globalKeydown);
+  // Capture phase on purpose — see toastEscape. An Escape that closes a dialog
+  // must not also dismiss an error notice behind it, and only the capture phase
+  // still sees that the dialog was open.
+  document.addEventListener("keydown", toastEscape, true);
 
   // Sidebar nav (real hrefs upgraded to in-place swaps). A manual nav starts
   // fresh — clear any carried "Undo" context so the sidebar's Recover link
@@ -5282,7 +5390,7 @@ async function init() {
     // password): raise the gate with the SSO entry instead of toasting about
     // a printed token link that never existed in that deployment.
     if (auth.sso_start) { showLoginOverlay({ passwordLogin: false, ssoName: auth.sso_name, ssoStart: auth.sso_start }); return; }
-    toast("No token in URL — open the link printed by `bintrail-console`.");
+    toastError("No token in URL — open the link printed by `bintrail-console`.");
   }
 
   const servers = await bootSequence();

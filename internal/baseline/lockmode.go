@@ -25,18 +25,50 @@ import "fmt"
 //     the backup to be consistent. Stopping backup due to the use of
 //     SAFE_NO_LOCK." Verified: under sustained concurrent writes it aborts.
 //     So it never lies, but on a write-active source it mostly refuses.
+//   - LOCK_ALL synchronizes workers by locking the exported tables instead of
+//     the instance, so it needs only LOCK TABLES — at any scope covering the
+//     dumped tables, not necessarily globally. mydumper names it itself: "We
+//     support LOCK_ALL and SAFE_NO_LOCK modes for RDS/Aurora" (string in the
+//     pinned v1.0.3-1 binary). Measured separately from the users above, on an
+//     RDS MySQL 8.4 master account and on a local user granted only
+//     `SELECT, LOCK TABLES, SHOW VIEW` on the dumped schema: FTWRL fails for
+//     both ("ERROR 1227 ... you need the RDSADMIN USER privilege" when granting
+//     BACKUP_ADMIN on RDS), LOCK_ALL succeeds for both.
 //   - NO_LOCK always succeeds and is the only mode that can silently produce a
-//     torn snapshot. mydumper's own docs describe it as the choice for when
-//     "you don't need a consistent backup", and DEPRECATED it in v0.18.1.
+//     torn snapshot. mydumper's help presents it as the choice for when "you
+//     don't need a consistent backup"; it is also the one value NOT in the help
+//     text's list of sync modes ("SAFE_NO_LOCK, FTWRL, LOCK_ALL and GTID"),
+//     which is the closest thing to a deprecation the pinned build states.
 //
-// Hence the default is FTWRL: SAFE_NO_LOCK is unusable as a default on the
-// sources that most need a baseline, and NO_LOCK is not a backup.
+// Two properties are NOT mode-specific and catch people out:
+//
+//   - Every point-consistent mode — LOCK_ALL included, verified — REFUSES the
+//     whole dump when it meets a non-transactional table, because bintrail
+//     passes --trx-tables: "Non transactional table found: `db`.`t` on a
+//     consistent backup attempt". Switching FTWRL→LOCK_ALL does not avoid it.
+//   - LOCK TABLES also implies SELECT on the locked tables, which mydumper
+//     needs regardless, so "needs only LOCK TABLES" is relative to that floor.
+//
+// The default stays FTWRL for the reason #1377 chose it: it is the one
+// point-consistent mode that needs no per-object privilege, so it works on a
+// self-hosted source with a single global grant and on every flavor including
+// MariaDB and MySQL 5.7. LOCK_ALL is not a worse mode — the locking-cost
+// comparison between the two has NOT been measured here, and no claim is made
+// either way — it is simply the one that requires knowing which objects will be
+// dumped. It is the right answer where FTWRL cannot run, which the refusal in
+// internal/mydumperlock names first. SAFE_NO_LOCK is unusable as a default on
+// the sources that most need a baseline, and NO_LOCK is not a backup.
 type LockMode string
 
 const (
 	// LockModeFTWRL holds one global read lock only long enough for every
 	// worker to open its snapshot at the same instant, then releases it.
 	LockModeFTWRL LockMode = "ftwrl"
+	// LockModeLockAll locks the exported tables long enough for every worker to
+	// open its snapshot together. Needs LOCK TABLES and no more, which makes it
+	// the point-consistent mode available on managed MySQL where BACKUP_ADMIN
+	// cannot be granted.
+	LockModeLockAll LockMode = "lock-all"
 	// LockModeSafeNoLock needs no elevated privilege and refuses rather than
 	// emit a torn snapshot. Expect it to abort on a write-active source.
 	LockModeSafeNoLock LockMode = "safe-no-lock"
@@ -49,9 +81,9 @@ const (
 const DefaultLockMode = LockModeFTWRL
 
 // LockModeValues lists the accepted spellings. Test-only today: the flag
-// help, ParseLockMode's error and the compose case statement each spell the
-// three names out, so adding a mode means updating all of them by hand.
-var LockModeValues = []LockMode{LockModeFTWRL, LockModeSafeNoLock, LockModeNoLock}
+// help, ParseLockMode's error and the compose case statement each spell all
+// four names out, so adding a mode means updating every one of them by hand.
+var LockModeValues = []LockMode{LockModeFTWRL, LockModeLockAll, LockModeSafeNoLock, LockModeNoLock}
 
 // ParseLockMode maps an operator-supplied string to a LockMode. It is
 // deliberately strict: a typo must not silently land on a weaker mode, because
@@ -60,6 +92,8 @@ func ParseLockMode(s string) (LockMode, error) {
 	switch LockMode(s) {
 	case LockModeFTWRL:
 		return LockModeFTWRL, nil
+	case LockModeLockAll:
+		return LockModeLockAll, nil
 	case LockModeSafeNoLock:
 		return LockModeSafeNoLock, nil
 	case LockModeNoLock:
@@ -67,13 +101,15 @@ func ParseLockMode(s string) (LockMode, error) {
 	case "":
 		return DefaultLockMode, nil
 	}
-	return "", fmt.Errorf("unknown lock mode %q: want one of %s, %s, %s",
-		s, LockModeFTWRL, LockModeSafeNoLock, LockModeNoLock)
+	return "", fmt.Errorf("unknown lock mode %q: want one of %s, %s, %s, %s",
+		s, LockModeFTWRL, LockModeLockAll, LockModeSafeNoLock, LockModeNoLock)
 }
 
 // MydumperValue is the --sync-thread-lock-mode argument for this mode.
 func (m LockMode) MydumperValue() string {
 	switch m {
+	case LockModeLockAll:
+		return "LOCK_ALL"
 	case LockModeSafeNoLock:
 		return "SAFE_NO_LOCK"
 	case LockModeNoLock:
