@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.58.0] - 2026-08-16
+
 ### Changed
 - **BREAKING (operators without `RELOAD`, or with any non-transactional table)
   — baseline dumps are point-consistent by default** (#1377). `bintrail dump` and the console's **Create baseline**
