@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.59.0] - 2026-08-17
+
 ### Fixed
 - **Point-consistent baselines were impossible on managed MySQL** (#1381).
   v0.58.0 made them the default; on RDS the button then failed for every
