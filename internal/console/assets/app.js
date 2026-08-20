@@ -1318,6 +1318,12 @@ function buildOverview(status, eventsData, coverage, activity) {
 // all-time total from a window count — which is precisely how "53 deletes" got
 // read as a share of "3121 changes indexed" (#1300).
 function ovStat(value, key, mod, scope) {
+  // Tiles animate their ARRIVAL (a rise, in style.css), never their VALUE. A
+  // count-up was tried and removed: it writes intermediate numbers into the
+  // DOM, so for the length of the animation the tile states something untrue —
+  // the console-e2e read "0" from the deletes tile mid-flight. A forensics
+  // surface that briefly reports zero deletions is a small lie, and the
+  // entrance animation already supplies the sense of arrival without one.
   return el("div", { class: "ov-stat" },
     el("div", { class: "ov-stat-v" + (mod ? " " + mod : ""), text: value }),
     el("div", { class: "ov-stat-k", text: key }),

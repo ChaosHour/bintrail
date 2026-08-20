@@ -1877,3 +1877,64 @@ button { font-family: inherit; }
   white-space: nowrap; max-width: 46ch; overflow: hidden; text-overflow: ellipsis;
 }
 .sql-table th { color: var(--ink-2); font-weight: 600; position: sticky; top: 0; background: var(--surface); }
+
+/* ============================================================
+   Motion: chrome only (#1385)
+
+   The console is opened when something has gone wrong — someone is tracing a
+   bad DELETE. Delight lives in the chrome: navigation, tiles, headers. Data
+   surfaces (rows, diffs, badges, the numbers under inspection) stay calm and
+   are deliberately untouched here.
+
+   Rules this section keeps:
+   - No color moves, and no custom-property redefinition. The semantic
+     INSERT/UPDATE/DELETE tokens and the brand palette's "never encode data"
+     boundary are set in :root and stay set.
+   - Everything animated sits inside prefers-reduced-motion: no-preference.
+     With motion off the page loses movement and nothing else.
+   ============================================================ */
+
+@media (prefers-reduced-motion: no-preference) {
+  /* Tiles rise as their fetch lands.
+     
+     TRANSFORM ONLY, and no fill-mode — both are load-bearing.
+     
+     No opacity: :467 states the invariant for `rise` ("content is ALWAYS
+     visible"), and a tile that starts transparent flashes on every
+     replaceWith as Overview swaps skeletons for values.
+     
+     No `both`/`forwards`: a filling animation keeps contributing
+     `transform: none` after it ends, and animations outrank normal author
+     declarations — which silently killed the hover lift below. Measured in
+     Chrome: hovered transform was matrix(1,0,0,1,0,0) with the fill, and
+     translateY(-3px) without it. `rise` ends at the element's natural
+     transform, so nothing needs filling. A hover landing inside the first
+     380ms still will not lift, because a RUNNING animation outranks author
+     rules too; at 380ms that is a shrug, not a bug.
+     
+     Reuses the existing `rise` keyframe rather than adding one. */
+  .ov-stat { animation: rise .38s var(--ease-out); }
+
+  /* Inside the guard with the state it times. An earlier draft kept this
+     outside on the theory that "a hover lift with motion reduced should still
+     change state, just instantly" — but the :hover rule is itself guarded, so
+     under reduce there is no state change for a transition to time and the
+     rationale described something that could not happen. */
+  .ov-stat { transition: transform .22s var(--ease), box-shadow .22s var(--ease); }
+  .ov-stat:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 12px 26px -14px oklch(0.4 0.06 305 / 0.42), var(--panel-shadow);
+  }
+
+  /* Nav: the icon leads the eye toward the destination. 2px — responsive
+     without rippling as a mouse crosses the sidebar.
+
+     No `transition` declaration here on purpose. :385 already transitions
+     both color and transform on this exact selector, and `transition` is a
+     SHORTHAND: re-declaring it later in the file reset transition-property to
+     `transform` alone, so the icon's color snapped instantly for every
+     no-preference user. The section whose first rule is "no color moves" had
+     changed color behaviour, and the color guard could not see it because the
+     line contained no color property. */
+  .nav-item:hover .ni-icon { transform: translateX(2px); }
+}
