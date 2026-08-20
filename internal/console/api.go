@@ -84,6 +84,10 @@ type filterParams struct {
 	ChangedColumn string
 	Order         string
 	Limit         int
+	// LimitPerPK caps how many of the LATEST events per pk_values reach the
+	// caller. Wired from /api/recover only for now; buildOptions is shared, so
+	// the events endpoint simply leaves it zero (unlimited).
+	LimitPerPK int
 }
 
 // recoverRequest is the JSON body accepted by POST /api/recover.
@@ -102,6 +106,12 @@ type recoverRequest struct {
 	// re-sorted ASC before generation. A client-supplied value has no effect.
 	Order string `json:"order"`
 	Limit int    `json:"limit"`
+	// LimitPerPK reverses only the latest N events for the matched row. It is
+	// the only filter that can isolate one event from another when both share
+	// a timestamp: `since`/`until` are second-granular, so a row INSERTed and
+	// DELETEd inside the same second cannot be split by time. Requires a PK
+	// (see buildOptions).
+	LimitPerPK int `json:"limit_per_pk"`
 }
 
 type eventsResponse struct {
@@ -214,6 +224,18 @@ func (s *Server) buildOptions(p filterParams, defaultLimit, maxLimit int) (query
 	if p.ChangedColumn != "" && (p.Schema == "" || p.Table == "") {
 		return query.Options{}, errors.New("the changed-column filter needs both a schema and a table")
 	}
+	// "Latest N per row" is meaningless without a row to scope it to: over an
+	// unscoped window it would silently keep N events for every PK the filters
+	// happen to touch, which is not what anyone asking for it wants. Mirrors
+	// the CLI's guard, phrased for this surface's own field names — a console
+	// user has no --pk to reach for. Enforced here, not in the UI: the API is
+	// reachable without the form.
+	if p.LimitPerPK < 0 {
+		return query.Options{}, errors.New("latest-per-row must be 0 or more")
+	}
+	if p.LimitPerPK > 0 && p.PK == "" {
+		return query.Options{}, errors.New("the latest-per-row filter needs a PK")
+	}
 
 	// Default to newest-first, the natural order for a browsing UI.
 	order := strings.ToUpper(strings.TrimSpace(p.Order))
@@ -231,6 +253,7 @@ func (s *Server) buildOptions(p filterParams, defaultLimit, maxLimit int) (query
 		Until:         until,
 		ChangedColumn: p.ChangedColumn,
 		Limit:         clampLimit(p.Limit, defaultLimit, maxLimit),
+		LimitPerPK:    p.LimitPerPK,
 		Order:         order,
 		DenyTables:    s.denyTables,
 		RedactColumns: s.redactCols,
@@ -279,6 +302,20 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
+	// Parsed with an error rather than atoiDefault, unlike `limit`. The
+	// directions differ: a dropped `limit` falls back to a CAP (safe), while a
+	// dropped `limit_per_pk` REMOVES one — `?limit_per_pk=abc` would silently
+	// widen the result set. The JSON side of this filter already 400s on a
+	// non-number via the decoder; this makes the query-string side agree.
+	lpp := 0
+	if raw := q.Get("limit_per_pk"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "limit_per_pk must be a whole number")
+			return
+		}
+		lpp = n
+	}
 	p := filterParams{
 		Schema:        q.Get("schema"),
 		Table:         q.Get("table"),
@@ -290,10 +327,33 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		ChangedColumn: q.Get("changed_column"),
 		Order:         q.Get("order"),
 		Limit:         atoiDefault(q.Get("limit"), 0),
+		// Accepted here so Restore's "Preview rows" can mirror /api/recover's
+		// EFFECTIVE window. previewRecover already promises that the preview
+		// shows the events the undo script will reverse; wiring latest-per-row
+		// into recover alone would break that promise silently — the preview
+		// would list events the script leaves untouched.
+		LimitPerPK: lpp,
 	}
 	opts, err := s.buildOptions(p, eventsDefaultLimit, eventsMaxLimit)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Per-PK caps and keyset paging are mutually exclusive, and the reason is
+	// the SQL: the cursor predicate joins the same `where` slice that is
+	// interpolated INSIDE the ROW_NUMBER subquery, so every page would
+	// re-anchor "latest N per PK" to the post-cursor remainder. Page 6 of a
+	// limit_per_pk=50 walk serves events 51+ for that PK — no single row wrong,
+	// the SET silently larger than the one asked for. internal/query states the
+	// same invariant for the streaming path (FetchMergedStream: "Limit/
+	// LimitPerPK are whole-result-set caps and cannot be combined with
+	// paging"); this is the HTTP edge of it. Unreachable from the UI today —
+	// previewRecover renders one flat list — but the Events view pages on
+	// `before=`, so the day this field is offered there it would break quietly.
+	if opts.LimitPerPK > 0 && (q.Get("after") != "" || q.Get("before") != "") {
+		writeJSONError(w, http.StatusBadRequest,
+			"latest-per-row is a whole-result-set cap and cannot be combined with paging; "+
+				"drop the after/before cursor or the limit_per_pk filter")
 		return
 	}
 	if err := applyEventCursors(&opts, q.Get("after"), q.Get("before")); err != nil {
@@ -389,6 +449,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		ChangedColumn: body.ChangedColumn,
 		Order:         body.Order,
 		Limit:         body.Limit,
+		LimitPerPK:    body.LimitPerPK,
 	}
 	opts, err := s.buildOptions(p, recoverDefaultLimit, recoverMaxLimit)
 	if err != nil {
