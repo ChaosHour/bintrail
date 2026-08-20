@@ -151,9 +151,14 @@ and searching events:
    permanently lost" record when an unfillable gap (or a lost PostgreSQL slot)
    was detected. Both fire for any source family. See
    [the continuity signal](rotation-and-status.md#stream-continuity-no-data-lost).
-6. **Settings** (under `watch` only) — **Storage** (rotation policy,
-   per-source S3 archiving, baseline snapshots, AWS credential signals, and a
-   usage-telemetry opt-out — see
+6. **Protect** (under `watch` only) — **Baselines** (the selected server's
+   snapshot listing, plus **Create baseline**) and **Verification** (run
+   `bintrail verify` and read past runs). These produce and validate the
+   artifacts a restore depends on, so they are operations rather than
+   settings; they lived on the Storage page until they outgrew it.
+7. **Settings** (under `watch` only) — **Storage** (rotation policy,
+   per-source S3 archiving, a baseline summary card, AWS credential signals,
+   and a usage-telemetry opt-out — see
    [The Storage page](#the-storage-page)) and **Rotation** (opens the
    rotation dialog).
 
@@ -344,30 +349,49 @@ editing flags or restarting:
 - The standalone `bintrail-console serve` hides the panel and refuses the write
   (HTTP 403) — only the daemon running the loop consumes the policy.
 
+### The Protect pages
+
+Under `watch` the sidebar carries a **Protect** group with two pages. They were
+part of the Storage page until they outgrew it: both are operations that
+produce and validate the artifacts a restore depends on, rather than settings,
+and the snapshot listing is unbounded in practice — it pushed verification, the
+panel that answers whether a restore would work, far below the fold.
+
+**Protect → Baselines**
+
+- A read-only listing of the **selected server's** baseline source
+  (`baseline_dir` / `baseline_s3`): each snapshot's timestamp, age, table
+  count, and (local sources) the binlog coordinates its deltas start from. The
+  empty states explain how to produce a first baseline (`bintrail dump` →
+  `bintrail baseline`). When the **Create baseline** button is enabled it sits
+  in this panel's header.
+- **Automatic baseline refresh** — when `--baseline-refresh-interval` is set,
+  the panel reports the daemon's last automatic refresh for the selected
+  server: how many tables it published, or that it published nothing and why.
+  A refusal there is the fail-closed contract working (a capture gap, a schema
+  change), not a broken daemon — nothing was overwritten and the next run
+  retries. The refresh is opt-in on its own: it does not require, and does not
+  enable, the **Create baseline** button.
+
+**Protect → Verification** carries the verification runner and the history of
+past runs for the selected server.
+
+The Storage page keeps a compact **Baselines** summary card (count and age)
+alongside the rest of the storage picture.
+
 ### The Storage page
 
 Under `watch` the sidebar grows a **Settings → Storage** page that gathers
-everything S3/baseline-related in one place (it was previously scattered
-across the rotation dialog and the per-server edit form):
+storage policy in one place (it was previously scattered across the rotation
+dialog and the per-server edit form). The full baseline listing and the
+verification runner moved to their own **Protect** group; Storage keeps a
+compact baseline summary card and links onward:
 
 - **Rotation** — the effective policy (override vs daemon defaults) with an
   edit shortcut to the rotation dialog.
 - **S3 archiving per source** — every monitored server with its
   `Archive to S3` destination (or `drop-only` when none), with a shortcut into
   that server's edit form. The boot (cli) index always rotates drop-only.
-- **Baseline snapshots** — a read-only listing of the **selected server's**
-  baseline source (`baseline_dir` / `baseline_s3`): each snapshot's timestamp,
-  age, table count, and (local sources) the binlog coordinates its deltas
-  start from. The empty states explain how to produce a first baseline
-  (`bintrail dump` → `bintrail baseline`). When the **Create baseline** button
-  is enabled (see below) it sits in this panel's header.
-- **Automatic baseline refresh** — when `--baseline-refresh-interval` is set,
-  the Baseline snapshots panel reports the daemon's last automatic refresh for
-  the selected server: how many tables it published, or that it published
-  nothing and why. A refusal there is the fail-closed contract working (a
-  capture gap, a schema change), not a broken daemon — nothing was overwritten
-  and the next run retries. The refresh is opt-in on its own — it does not
-  require, and does not enable, the **Create baseline** button.
 - **Query in DuckDB** — a one-click download of `views.sql`: a ready-made
   DuckDB schema over the selected server's own Parquet — an `events` view
   across every archive source registered in `archive_state`, plus one
@@ -443,7 +467,7 @@ ambient credential chain, scoped to the allowed prefixes.
 By default the console only *lists* baselines — you produce them with the
 `bintrail dump` → `bintrail baseline` CLI (or the compose `baseline` profile).
 A **Create baseline** button can run that pipeline for a monitored server
-straight from the Storage page, and it only runs on the `watch` daemon:
+straight from the **Protect → Baselines** page, and it only runs on the `watch` daemon:
 
 - A bare `watch` invocation (no compose) has this **opt-in** and off by
   default — start it with `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1`. The bundled
@@ -632,7 +656,7 @@ see the metrics tables and example alert rules in
   the upload come from the ambient chain (`AWS_*` / `~/.aws` / role).
 - `BINTRAIL_CONSOLE_BASELINE_TRIGGER` (`watch` only) — `1`/`true` enables the
   **Create baseline** button (runs `mydumper` → convert → upload in-process;
-  see [The Storage page](#the-storage-page)). Off by default for a bare
+  see [Protect → Baselines](#the-protect-pages)). Off by default for a bare
   `watch` invocation; the bundled compose stack sets this on by default (see
   [docker.md](docker.md) — `BASELINE_TRIGGER=0` in `.env` opts out there).
 - `BINTRAIL_CONSOLE_BASELINE_STAGING` (`watch` only) — local staging dir for
@@ -659,7 +683,7 @@ see the metrics tables and example alert rules in
   [Running verification from the console](#running-verification-from-the-console)).
 - `BINTRAIL_CONSOLE_VERIFY_TABLES` (`watch` only) — same as `--verify-tables`.
 - `BINTRAIL_CONSOLE_VERIFY_TRIGGER` (`watch` only) — `1`/`true` enables the
-  Storage page's **Verification** panel (runs `bintrail verify` in-process;
+  **Protect → Verification** page (runs `bintrail verify` in-process;
   see [Running verification from the console](#running-verification-from-the-console)).
   Off by default for a bare `watch` invocation; the bundled compose stack sets
   this on by default (see [docker.md](docker.md) — `VERIFY_TRIGGER=0` in
