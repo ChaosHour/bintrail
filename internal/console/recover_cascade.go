@@ -67,6 +67,15 @@ type recoverCascadeResponse struct {
 	Complete   bool     `json:"complete"`
 	Incomplete []string `json:"incomplete,omitempty"`
 	Warnings   []string `json:"warnings,omitempty"`
+	// GeneratedInMs: see recoverResponse.GeneratedInMs (internal/console/api.go).
+	// The two endpoints are dominated by different work and neither ranks above
+	// the other. This one runs a LIVE-ONLY parent fetch (cascade recovery never
+	// reads archives — see the note further down this file) plus victim
+	// synthesis and per-link key-chain probes, so synthesis dominates.
+	// /api/recover is the one that can be dominated by storage: its fetch can
+	// take an archive/Parquet leg, and it is a strict superset of this work
+	// when cascade is auto-detected there.
+	GeneratedInMs int64 `json:"generated_in_ms"`
 }
 
 // rbacActive reports whether the console is running under an RBAC profile with
@@ -107,6 +116,9 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 	if b == nil {
 		return
 	}
+	// Same boundary as handleRecover: after the bundle resolves, before the
+	// fetch — so synthesis and the key-chain probes are inside the measurement.
+	start := time.Now()
 
 	var body recoverCascadeRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
@@ -211,6 +223,7 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 		Complete:        len(synth.Caveats) == 0 && synth.SynthErr == nil,
 		Incomplete:      synth.Caveats,
 		Warnings:        synth.Warnings,
+		GeneratedInMs:   time.Since(start).Milliseconds(),
 	})
 	// An incomplete synthesis still produced a script, so it is still recorded
 	// (matching the CLI's emit-before-cascadeExit placement).
