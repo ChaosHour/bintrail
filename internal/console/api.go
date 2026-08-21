@@ -106,12 +106,28 @@ type recoverRequest struct {
 	// re-sorted ASC before generation. A client-supplied value has no effect.
 	Order string `json:"order"`
 	Limit int    `json:"limit"`
-	// LimitPerPK reverses only the latest N events for the matched row. It is
-	// the only filter that can isolate one event from another when both share
-	// a timestamp: `since`/`until` are second-granular, so a row INSERTed and
-	// DELETEd inside the same second cannot be split by time. Requires a PK
-	// (see buildOptions).
+	// LimitPerPK reverses only the latest N events for the matched row.
+	// Requires a PK (see buildOptions).
+	//
+	// It used to be described here as "the only filter that can isolate one
+	// event from another when both share a timestamp". That was true of the
+	// time filters and false as a general claim, and Undo relied on it: with
+	// `until` second-granular, latest-per-row=1 resolves to "the newest event
+	// in that second", which on a row INSERTed and DELETEd inside one second
+	// is not the event the operator clicked (#1411). Event is the filter that
+	// isolates one event; this one caps a row's history.
 	LimitPerPK int `json:"limit_per_pk"`
+	// Event names ONE event exactly, encoded `<RFC3339Nano>|<event_id>` — the
+	// same spelling as the ?after=/?before= cursors, parsed by the same
+	// parseEventCursor. It is what Undo sends: the operator clicked a row, so
+	// the client already holds its identity and does not need the server to
+	// re-derive it from a timestamp.
+	//
+	// Composable rather than exclusive with the filters above: an anchor
+	// admits at most one event, so anything else narrows a set of one. It is
+	// NOT rejected alongside LimitPerPK for that reason — but callers that
+	// have an anchor should not also send a cap, and Undo no longer does.
+	Event string `json:"event"`
 }
 
 type eventsResponse struct {
@@ -295,6 +311,69 @@ func (s *Server) fetch(ctx context.Context, b *bundle, opts query.Options) ([]qu
 	})
 }
 
+// applyEventAnchor parses the `event` parameter onto opts, writing a 400 and
+// returning false when it is malformed.
+//
+// A 400 rather than a silent fall back to the unanchored request: the caller
+// asked for ONE event and would instead get everything the remaining filters
+// admit. Undo's other filters are deliberately wide — schema/table/pk and an
+// `until` at the clicked second — so the degraded result is not a near miss,
+// it is the row's whole history returned with a 200.
+//
+// Shared by /api/events and /api/recover so the preview and the script cannot
+// disagree about what the anchor means, or about whether it is honoured at
+// all. They diverged once already, in exactly that direction.
+func applyEventAnchor(w http.ResponseWriter, opts *query.Options, raw string) bool {
+	if raw == "" {
+		return true
+	}
+	anchor, err := parseEventCursor("event", raw)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return false
+	}
+	opts.EventAnchor = anchor
+	return true
+}
+
+// anchorMissedWarning fires when a request named ONE event and the fetch
+// returned nothing.
+//
+// Before the anchor, an empty Undo meant exactly one thing: nothing happened in
+// the window. The anchor adds several causes that all render identically — a
+// 200 with `-- No events matched the specified criteria.`, no warnings, no
+// notes — and the operator has no way to tell them apart:
+//
+//   - the anchor is stale after a target edit (the client clears it on
+//     schema/table/pk changes, but that is a client-side mitigation of a
+//     server-side ambiguity, and it deliberately does NOT cover since/until);
+//   - since/until were narrowed past the anchored instant, which is an
+//     ordinary scope edit on a visible field and leaves the banner on screen
+//     still asserting the clicked event was reversed;
+//   - an access profile withholds the target table;
+//   - the event lives only in an archive source that failed under AllowGaps
+//     (these browsing endpoints keep a partially-failing source a log-only
+//     condition — a deliberate trade-off for BROWSING, and a reversal script
+//     naming one event is not browsing);
+//   - the anchor was minted against a different server's index (event_id is a
+//     per-index AUTO_INCREMENT, so the same id exists in several at once);
+//   - the index was rebuilt or renumbered under it.
+//
+// The server is the only layer that can see all of them, so this is where the
+// distinction is drawn. It is a WARNING, not an error: the empty result is a
+// legitimate answer, it just must not read as a finding.
+func anchorMissedWarning(opts query.Options, rowCount int) []string {
+	if opts.EventAnchor == nil || rowCount > 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"The selected event (id %d at %s UTC) was not found. It may fall outside the time range "+
+			"on this form, be withheld by your access profile, be held only in an archive this "+
+			"read did not reach, or belong to a different server — event ids are per-index. "+
+			"This is NOT evidence that the row has no history.",
+		opts.EventAnchor.EventID, opts.EventAnchor.Timestamp.UTC().Format("2006-01-02 15:04:05"))}
+}
+
 // handleEvents serves GET /api/events — the events browser.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	b := s.resolveOr(w, r)
@@ -337,6 +416,15 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	opts, err := s.buildOptions(p, eventsDefaultLimit, eventsMaxLimit)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// The anchor is accepted here for exactly the reason stated above the cap,
+	// and it is the sharper case: unmirrored, the preview lists the row's whole
+	// history up to the clicked second while the script reverses one event of
+	// it. Review caught this wired on the client and missing here — with a
+	// guard that only checked the client half, so it was green over the broken
+	// promise.
+	if !applyEventAnchor(w, &opts, q.Get("event")) {
 		return
 	}
 	// Per-PK caps and keyset paging are mutually exclusive, and the reason is
@@ -392,6 +480,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// the archives went unread — but as an info NOTE (#1365): it is a benign
 	// audit fact, not an incident.
 	warnings, notes := responseAdvisories(plan, excl, diverged, archivesElided, archiveElisionNote())
+	// The preview mirrors the script, so it mirrors this too: an empty preview
+	// under an anchor is the same ambiguity, rendered as "0 affected event(s)".
+	warnings = append(anchorMissedWarning(opts, len(rows)), warnings...)
 	resp := eventsResponse{
 		Events:   toEventDTOs(rows),
 		Count:    len(rows),
@@ -456,6 +547,9 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if !applyEventAnchor(w, &opts, body.Event) {
+		return
+	}
 	opts, err = s.applySessionProfile(r.Context(), r, b, opts)
 	if err != nil {
 		writeSessionProfileError(w, r, err)
@@ -498,6 +592,9 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// an info note (#1365), since the skip is correctness-preserving —
 	// worded for this surface (a reversal has a window, not pages).
 	warnings, notes := responseAdvisories(plan, excl, diverged, archivesElided, recoverArchiveElisionNote())
+	// Prepended: on an empty anchored reversal this is the only thing the
+	// response says, and it has to be the first thing read.
+	warnings = append(anchorMissedWarning(opts, len(rows)), warnings...)
 
 	// The fetch above ran Order=DESC so the limit kept the newest suffix of
 	// the window (#981). Detect truncation on the FETCHED row count — before

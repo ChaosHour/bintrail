@@ -2073,44 +2073,48 @@ function renderRecover(params) {
     const banner = el("div", { class: "ctx-banner", id: "undo-ctx-banner" });
     banner.append(el("span", { class: "badge " + badgeClass(ctx.type), text: ctx.type }));
     banner.append(el("div", { class: "ctx-main" },
-      // Scope, not target state — and the scope is a WINDOW OF TIME, not an
-      // event. The prefill sets `until` from ctx.time and never `since`;
-      // ctx.time is second-granular (consoleTSFormat) and the predicate is
-      // `event_timestamp <= ?`, so the ceiling is the END OF THAT SECOND, not
-      // the clicked event. Everything on the row up to there is reversed,
-      // including events that happened AFTER the clicked one inside the same
-      // second.
+      // Scope, and since #1411 the scope is an EVENT, not a window of time.
+      // The prefill sets form.elements.event from ctx.anchor — the server's own
+      // `<RFC3339Nano>|<event_id>` token for the clicked row — and the engine
+      // filters on that identity, so exactly one event is reversed and it is
+      // the one pointed at.
       //
-      // That is not a corner case, it is the case this wording exists for —
-      // and #1404 INVERTED its outcome, which this paragraph went on claiming
-      // the opposite of until review caught it. It used to read "undoing from
-      // EITHER event reverses both and leaves no row at all", which was true
-      // when it was written and was falsified by the prefill below, sixteen
-      // lines away, in the same file. What happens now: the cap keeps the LAST
-      // event in that second — the DELETE — so undoing from either event
-      // RE-CREATES the row. The banner says so; this comment used to say the
-      // reverse of it.
+      // What this block used to have to explain, kept because it is the reason
+      // the anchor exists rather than history for its own sake: with only
+      // `until` + latest-per-row = 1, the ceiling was the END OF A SECOND and
+      // the cap kept the last event inside it. On a row INSERTed and DELETEd
+      // within one second that is the DELETE whichever row was clicked, and
+      // reversing a DELETE re-creates the row — so Undo on the INSERT put the
+      // row BACK while the badge read INSERT. The banner disclosed it in
+      // words; disclosure was the right immediate move and a poor permanent
+      // one.
       //
-      // Worth knowing about the guard: it deliberately reads string literals
-      // only, so no test can ever see prose in this block. Stale comments here
-      // are a manual-review class, and this was a live instance of one.
+      // `until` stays prefilled and is still worth stating: it is how the
+      // operator reads WHEN, and it is what remains as the scope if they press
+      // Clear. It no longer decides WHICH.
       //
-      // The remaining imprecision is stated rather than smoothed over. Latest
-      // per row keeps the LATEST event at or before the ceiling, and the
-      // ceiling is a whole second, so on a row touched more than once inside
-      // that second the reversal lands on the last of them — which need not be
-      // the one the operator clicked. Since cannot fix it either: it parses at
-      // the same granularity. Naming a control without saying where it stops
-      // working is how an operator ends up believing they narrowed something
-      // they did not.
+      // Worth knowing about the guard: assets_recover_banner_test.go reads
+      // string literals only, so no test can see this prose. The same-second
+      // caveat it used to pin as REQUIRED text is now false and was removed in
+      // the same commit that made it false — dropping one without the other
+      // either fails the build or ships a lie.
       el("span", { class: "ctx-eyebrow", text: "Undoing one change" }),
-      el("span", { class: "ctx-title", text: ctx.schema + "." + ctx.table + " · pk " + ctx.pk }),
-      el("span", { class: "ctx-detail", text: "reverses the latest change to this row at or before the end of the second holding this "
-        + ctx.type + " (" + ctx.time + " UTC)" }),
-      el("span", { class: "ctx-detail", text: "Latest per row is set to 1 — clear it to reverse this row's whole history up to that point. If the row changed more than once inside that second, the last of them is the one reversed — not necessarily the one you clicked. A row created and deleted within one second comes back rather than going away." })));
+      el("span", { class: "ctx-title", text: ctx.schema + "." + ctx.table + " \u00b7 pk " + ctx.pk }),
+      el("span", { class: "ctx-detail", text: "reverses exactly this " + ctx.type
+        + ", the one you clicked (" + ctx.time + " UTC) — not the rest of the row's history, and not other changes sharing that second" }),
+      el("span", { class: "ctx-detail", text: "Clear to search this row freely instead; the time you clicked stays as the upper bound." })));
     banner.append(el("span", { class: "spacer" }));
+    // Clear retires the SELECTION, not the form.
+    //
+    // It used to `navigate("recover")`, which re-renders the route and builds a
+    // fresh EMPTY form — so the one control labelled Clear wiped the target and
+    // the upper bound, while the sentence above it promised the opposite
+    // ("search this row freely… the time you clicked stays as the upper
+    // bound"). The mechanism that sentence describes already existed, as
+    // clearUndoAnchor; it just had no name in the UI. Calling it here is what
+    // makes the copy true.
     banner.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Clear",
-      onclick: () => { pendingRecover = null; navigate("recover"); } }));
+      onclick: () => clearUndoAnchor(form) }));
     v.append(banner);
   }
 
@@ -2122,10 +2126,19 @@ function renderRecover(params) {
   // events are still indexed — a typed name must always submit.
   form.append(fieldTableCombo("Table", "table", "md", "orders"));
   form.append(fieldInput("PK", "pk", "sm", "42 or 42|7"));
+  // The undo anchor rides in the form rather than in a module variable so the
+  // two request builders pick it up the same way every other filter does (both
+  // read the form through FormData). That is what keeps "Preview rows" and
+  // "Generate undo SQL" showing the same events — the promise previewRecover
+  // makes. Hidden because it is an identity, not a filter an operator can
+  // usefully type: it is set by Undo and removed by the banner's Clear.
+  form.append(el("input", { type: "hidden", name: "event" }));
   // Latest-per-row sits beside PK because it is meaningless without one (the
-  // server refuses the pair). It is the only filter that can separate events
-  // sharing a timestamp: Since/Until are second-granular, so a row created and
-  // deleted inside the same second cannot be split by time.
+  // server refuses the pair). It caps a row's HISTORY — it does not name an
+  // event: this comment used to claim it was "the only filter that can
+  // separate events sharing a timestamp", which was true of the time filters
+  // and false as a general claim, and Undo relied on it (#1411). The hidden
+  // `event` field above is what separates events sharing a second.
   form.append(fieldInput("Latest per row", "limit_per_pk", "sm", "all"));
   form.append(fieldDateInput("Since (UTC)", "since", "md", "YYYY-MM-DD HH:MM:SS"));
   form.append(fieldDateInput("Until (UTC)", "until", "md", "YYYY-MM-DD HH:MM:SS"));
@@ -2143,6 +2156,24 @@ function renderRecover(params) {
   v.append(el("div", { id: "recover-out" }));
 
   form.addEventListener("submit", (e) => { e.preventDefault(); generateUndo(form); });
+  // Editing the target retires the anchor, and the banner with it.
+  //
+  // The anchor names one event of one row. Retype the PK and it still names
+  // the OLD row's event, so the request comes back empty — a 200 with no
+  // statements, which reads as "this row has no history to undo". It fails
+  // closed rather than producing wrong SQL, but the narrowing moved from a
+  // VISIBLE field the banner named ("Latest per row is set to 1 — clear it
+  // to…") into a hidden one nothing names, so an operator has nothing to
+  // notice. Retiring it on a target edit is what keeps the form's visible
+  // state and its actual scope the same thing.
+  //
+  // Bound to `change`, not `input`: a keystroke-by-keystroke clear would drop
+  // the anchor while the operator is still typing over a value they mean to
+  // restore.
+  for (const name of ["schema", "table", "pk"]) {
+    const field = form.elements[name];
+    if (field) field.addEventListener("change", () => clearUndoAnchor(form));
+  }
   wireSchemaCascade(form);
   populateSchemas(form);
 
@@ -2152,16 +2183,20 @@ function renderRecover(params) {
       form.elements.table.value = ctx.table;
       form.elements.pk.value = ctx.pk;
       if (ctx.time) form.elements.until.value = ctx.time;
-      // Undo means "undo THIS change", and until #1404 it did not: with only
-      // `until` set, the window ran from the beginning of time and the script
-      // reversed the row's ENTIRE history up to that second. On a row touched
-      // five times, undoing the third put it back to before the first.
+      // Undo means "undo THIS change", and it now says which one. #1404 got
+      // the scope down to a single event with `until` + latest-per-row = 1,
+      // which is one event but not necessarily the CLICKED one: both filters
+      // are second-granular between them, so a row INSERTed and DELETEd inside
+      // one second resolved to the DELETE whichever of the two was clicked —
+      // and reversing a DELETE re-creates the row, inverting the outcome
+      // (#1411). The anchor names the event itself, so no cap is needed and
+      // none is set: two mechanisms narrowing the same scope is how they drift.
       //
-      // Prefilled rather than hardcoded: it lands in a visible, editable field
-      // and the banner states it, so widening the scope is one edit away and
-      // narrowing it was never a silent act. Clearing the field restores the
-      // old whole-history behaviour exactly.
-      form.elements.limit_per_pk.value = "1";
+      // `until` is left prefilled even though the anchor makes it redundant for
+      // membership. It is what the operator reads to know WHEN, it bounds the
+      // engine's partition scan, and clearing the anchor (banner → Clear) must
+      // leave a sane window behind rather than the whole index.
+      if (ctx.anchor) form.elements.event.value = ctx.anchor;
       generateUndo(form);
     });
   }
@@ -2250,6 +2285,12 @@ function recoverBusyFacts(f) {
   // Both call sites pass their own request object — generateUndo a number,
   // previewRecover a string — so stringify rather than assume either.
   if (f.limit_per_pk) facts.push(["latest per row", String(f.limit_per_pk)]);
+  // The anchor is the filter that most determines the scope and the only one
+  // with no visible field, so the busy modal is where an operator can see it
+  // at all. Shown as the event id rather than the raw token: the timestamp is
+  // already on the `until` line above, and the id is what the Events view
+  // shows beside the row they clicked.
+  if (f.event) facts.push(["single event", String(f.event).split("|").pop()]);
   return facts;
 }
 
@@ -2371,9 +2412,12 @@ async function previewRecover(form) {
   const warns = $("#recover-warnings", VIEW());
   const f = Object.fromEntries(new FormData(form).entries());
   const params = {};
-  ["schema", "table", "pk", "since", "until"].forEach((k) => { if (f[k] && f[k].trim()) params[k] = f[k].trim(); });
+  ["schema", "table", "pk", "since", "until", "event"].forEach((k) => { if (f[k] && f[k].trim()) params[k] = f[k].trim(); });
   // Part of mirroring recover's effective window (see below): without this the
-  // preview would list events the generated script will not touch.
+  // preview would list events the generated script will not touch. The anchor
+  // above is here for the same reason and matters more — unmirrored, the
+  // preview would list every event in the clicked second while the script
+  // reverses exactly one of them.
   const plpp = parseLatestPerRow(f.limit_per_pk);
   if (plpp === null) { renderError(container, "Latest per row must be a whole number, 0 or more."); return; }
   if (plpp > 0) params.limit_per_pk = String(plpp);
@@ -2465,7 +2509,7 @@ async function generateUndo(form) {
   const out = $("#recover-out", VIEW());
   const f = Object.fromEntries(new FormData(form).entries());
   const body = {};
-  ["schema", "table", "pk", "since", "until"].forEach((k) => { if (f[k] && f[k].trim()) body[k] = f[k].trim(); });
+  ["schema", "table", "pk", "since", "until", "event"].forEach((k) => { if (f[k] && f[k].trim()) body[k] = f[k].trim(); });
   if (!body.schema) { renderError(out, "Choose at least a schema to search."); return; }
   // Sent as a NUMBER: the field is an int on the wire, and a string would be
   // rejected by the decoder rather than silently ignored. Only when > 0 —
@@ -2576,6 +2620,11 @@ function undoEvent(e) {
   pendingRecover = {
     schema: e.schema_name, table: e.table_name, pk: e.pk_values,
     type: e.event_type, time: e.event_timestamp,
+    // The server's own identity token for this row, echoed back verbatim
+    // (eventDTO.Anchor). Never rebuilt from `time`: that one is second-
+    // granular and offset-less, which is exactly the ambiguity the anchor
+    // exists to remove (#1411).
+    anchor: e.anchor,
   };
   navigate("recover");
 }
@@ -2687,6 +2736,21 @@ async function runState(form, history) {
   }
 }
 
+// clearUndoAnchor retires the single-event selection and the banner that
+// describes it, leaving the visible filters untouched.
+//
+// Shared by the target-edit listeners and available to anything else that
+// widens the scope. It does NOT touch `until`: that is the scope the operator
+// is left with, and blanking it here would silently widen a retargeted search
+// to the whole index.
+function clearUndoAnchor(form) {
+  if (!form.elements.event || !form.elements.event.value) return;
+  form.elements.event.value = "";
+  pendingRecover = null;
+  const banner = document.getElementById("undo-ctx-banner");
+  if (banner) banner.remove();
+}
+
 // aimUndoAtInstant points the undo window at the state as of `at`: reverse
 // everything AFTER that instant, so the row lands exactly on what was shown.
 //
@@ -2713,11 +2777,18 @@ function aimUndoAtInstant(form, at) {
   // reverse only the newest of them and land it somewhere else entirely,
   // silently, with the button still naming the state it did not produce.
   form.elements.limit_per_pk.value = "";
-  // …and retire the banner that describes the scope just replaced. It states
-  // "Latest per row is set to 1" as a fact about this form, and the line above
-  // makes that false: the operator would read a one-change scope over a script
-  // that reverses everything after `at`. The stale-label half of the same bug
-  // the comment above describes, one level up from the fields.
+  // The undo anchor goes for the strongest version of the same reason: it
+  // names ONE event, and this action reverses every change after `at`. Left
+  // set, the generated script would reverse exactly the event the operator
+  // clicked minutes ago in Events and nothing else, while the button that
+  // produced it named a completely different outcome.
+  form.elements.event.value = "";
+  // …and retire the banner that describes the scope just replaced. It asserts
+  // that exactly the clicked event is reversed, and the lines above make that
+  // false: this action reverses EVERYTHING after `at`. (Before #1411 the same
+  // contradiction ran through the cap — the banner then read "Latest per row is
+  // set to 1", which the clear above falsified.) The stale-label half of the
+  // same bug, one level up from the fields.
   //
   // By ID, not by `.ctx-banner`: generateUndo appends a second node with that
   // class into #recover-out for the cascade notice, and an unscoped remove

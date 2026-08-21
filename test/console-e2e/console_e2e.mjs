@@ -1240,6 +1240,12 @@ try {
     // #1404: arrive carrying the Undo bridge's per-row cap, which is what an
     // operator who used Undo first would have in the field.
     f.elements.limit_per_pk.value = "1";
+    // #1411: …and its event anchor, which is the stronger half of the same
+    // hazard. The cap reverses the newest change after the instant; a leftover
+    // anchor reverses ONE event chosen minutes ago in Events and nothing else,
+    // under a button naming the state as of `at`. Set to a well-formed token so
+    // a clear is the only thing that can empty it.
+    f.elements.event.value = "2026-08-21T20:08:36Z|403440";
     // #1405: previewRecover is stubbed for the duration of the click, and that
     // is the whole assertion rather than a convenience. aimUndoAtInstant calls
     // it synchronously, previewRecover opens the busy dialog, and openBusyModal
@@ -1252,7 +1258,8 @@ try {
     const stillOpen = !!document.querySelector("#modal .state-modal");
     previewRecover = realPreview;
     return { since: f.elements.since.value, until: f.elements.until.value,
-             cap: f.elements.limit_per_pk.value, at, inline, stillOpen };
+             cap: f.elements.limit_per_pk.value, anchor: f.elements.event.value,
+             at, inline, stillOpen };
   });
   {
     const m = /as of (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/.exec(bridge.at || "");
@@ -1276,6 +1283,9 @@ try {
     bridge.cap === ""
       ? ok("restore: 'Restore to this state' clears the Undo bridge's per-row cap")
       : bad("restore: 'Restore to this state' clears the Undo bridge's per-row cap", `limit_per_pk=${bridge.cap}`);
+    bridge.anchor === ""
+      ? ok("restore: 'Restore to this state' clears the Undo bridge's event anchor")
+      : bad("restore: 'Restore to this state' clears the Undo bridge's event anchor", `event=${bridge.anchor}`);
   }
 
   // The other direction: arriving through Undo must land the cap in the field,
@@ -1303,11 +1313,12 @@ try {
     {
       const f0 = document.getElementById("recover-form");
       window.__preUndo = {};
-      if (f0) for (const n of ["schema", "table", "pk", "limit_per_pk", "since", "until"]) {
+      if (f0) for (const n of ["schema", "table", "pk", "limit_per_pk", "since", "until", "event"]) {
         window.__preUndo[n] = f0.elements[n] ? f0.elements[n].value : "";
       }
     }
-    pendingRecover = { schema: fixSchema, table: "orders", pk: "1", type: "update", time: "2026-01-01 00:00:00" };
+    pendingRecover = { schema: fixSchema, table: "orders", pk: "1", type: "update",
+                       time: "2026-01-01 00:00:00", anchor: "2026-01-01T00:00:00Z|4242" };
     navigate("recover");
     for (let i = 0; i < 40; i++) {
       const f = document.getElementById("recover-form");
@@ -1318,33 +1329,39 @@ try {
     if (!f) return { err: "no recover form" };
     const eyebrow = (document.querySelector(".ctx-banner .ctx-eyebrow") || {}).textContent || "";
     const detail = Array.from(document.querySelectorAll(".ctx-banner .ctx-detail")).map((n) => n.textContent).join(" ");
-    return { cap: f.elements.limit_per_pk.value, until: f.elements.until.value, eyebrow, detail };
+    return { cap: f.elements.limit_per_pk.value, anchor: f.elements.event.value,
+             until: f.elements.until.value, eyebrow, detail };
   }, FIX);
-  (undoBridge.cap === "1" && undoBridge.until === "2026-01-01 00:00:00")
-    ? ok("restore: the Undo bridge prefills a per-row cap of 1 alongside the ceiling")
-    : bad("restore: the Undo bridge prefills a per-row cap of 1 alongside the ceiling", JSON.stringify(undoBridge));
+  // #1411: the anchor is what the bridge prefills now, and the cap must NOT
+  // come back with it — two mechanisms narrowing one scope drift, and the cap
+  // is the one the banner no longer mentions.
+  (undoBridge.anchor === "2026-01-01T00:00:00Z|4242" && undoBridge.cap === "" && undoBridge.until === "2026-01-01 00:00:00")
+    ? ok("restore: the Undo bridge prefills the event anchor alongside the ceiling, and no per-row cap")
+    : bad("restore: the Undo bridge prefills the event anchor alongside the ceiling, and no per-row cap", JSON.stringify(undoBridge));
   // Give the generate its POST, then stop intercepting.
   for (let i = 0; i < 40 && !sentBodies.length; i++) await new Promise((r) => setTimeout(r, 100));
   await page.unroute("**/api/recover");
   {
     const parsed = sentBodies.map((b) => { try { return JSON.parse(b); } catch { return {}; } });
-    const capped = parsed.filter((b) => b.limit_per_pk === 1);
-    (sentBodies.length > 0 && capped.length === parsed.length)
-      ? ok("restore: the Undo bridge's generate SENDS limit_per_pk — the cap is on the wire, not just in the field")
-      : bad("restore: the Undo bridge's generate SENDS limit_per_pk — the cap is on the wire, not just in the field",
+    const anchored = parsed.filter((b) => b.event === "2026-01-01T00:00:00Z|4242");
+    (sentBodies.length > 0 && anchored.length === parsed.length)
+      ? ok("restore: the Undo bridge's generate SENDS the anchor — the identity is on the wire, not just in the field")
+      : bad("restore: the Undo bridge's generate SENDS the anchor — the identity is on the wire, not just in the field",
             JSON.stringify({ sent: sentBodies }));
   }
   // The prefill changes what the button reverses, so the banner has to say it.
   // A prefill the banner does not mention is a silent narrowing.
-  (/one change/.test(undoBridge.eyebrow) && /Latest per row is set to 1/.test(undoBridge.detail) && /clear it/.test(undoBridge.detail))
-    ? ok("restore: the Undo banner states the cap it prefilled and how to clear it")
-    : bad("restore: the Undo banner states the cap it prefilled and how to clear it", JSON.stringify(undoBridge));
+  (/one change/.test(undoBridge.eyebrow) && /exactly this/.test(undoBridge.detail)
+    && /the one you clicked/.test(undoBridge.detail) && /Clear/.test(undoBridge.detail)
+    && !/not necessarily the one you clicked/.test(undoBridge.detail))
+    ? ok("restore: the Undo banner claims the clicked event, and no longer carries the retired same-second caveat")
+    : bad("restore: the Undo banner claims the clicked event, and no longer carries the retired same-second caveat", JSON.stringify(undoBridge));
   // The two bridges collide one level above the fields. With the Undo banner
   // on screen — the only place in the run where it really is — driving
-  // "Restore to this state" must retire it: the banner states "Latest per row
-  // is set to 1" as a fact about this form, and that action clears the field.
-  // Left up, the operator reads a one-change scope over a script that reverses
-  // everything after the instant.
+  // "Restore to this state" must retire it: the banner asserts that exactly the
+  // clicked event is reversed, and that action clears the anchor. Left up, the
+  // operator reads a one-event scope over a script that reverses everything
+  // after the instant.
   const staleBanner = await page.evaluate(async () => {
     const f = document.getElementById("recover-form");
     const before = !!document.getElementById("undo-ctx-banner");
@@ -1367,9 +1384,10 @@ try {
   }
 
   // Leave the page as this scenario found it. pendingRecover survives a
-  // re-render, and the prefilled cap makes every later generate 400 with
-  // "the latest-per-row filter needs a PK" the moment a scenario clears the PK
-  // — which is a correct server refusal and a wrong reason for fourteen
+  // re-render, and a leftover Undo prefill makes later scenarios answer the
+  // wrong question — historically the cap 400'd every generate that cleared
+  // the PK, and since #1411 a leftover anchor pins them all to one old event.
+  // Either way: a correct server response, and a wrong reason for fourteen
   // unrelated checks to go red.
   const undoRestore = await page.evaluate(async (fixSchema) => {
     pendingRecover = null;
