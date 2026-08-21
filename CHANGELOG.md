@@ -7,7 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.60.0] - 2026-08-21
+
+### Added
+- **Protect is its own section of the console** (#1384). Settings > Storage
+  carried three unrelated concerns: storage policy, backup lifecycle and
+  recovery assurance. Two of those produce and validate recovery artifacts
+  rather than configure anything, and the page had already been patched around
+  the mismatch — with a snapshot list unbounded in practice, Verification, the
+  panel that answers whether a restore would actually work, sat about two
+  screens below the fold. Baselines and Verification are now routes under a
+  **Protect** nav group beside Investigate / Resolve / Monitor; Storage keeps
+  storage policy and a compact baseline summary card that links onward. The
+  whole group is gated on watch-daemon capabilities, so a standalone `serve`
+  collapses it rather than showing a heading with nothing under it.
+- **Restore can isolate the latest N events per row** (#1387). The query engine
+  has implemented `LimitPerPK` for a long time and the CLI exposes it; the
+  console could not reach it from the form or the API. It is the only filter
+  that separates events sharing a timestamp: `since`/`until` are
+  second-granular, so a row INSERTed and DELETEd inside one second cannot be
+  split by time, and reversing that window nets to no row when the operator
+  wanted to undo the DELETE alone. Wired into `/api/events` as well as
+  `/api/recover`, deliberately — the preview documents that it mirrors
+  recover's effective window, and adding the filter to one side only would
+  break that promise silently. Requires a PK, enforced in the request layer
+  rather than the form, since the API is reachable without the UI.
+- **Recover reports how long the reversal script took to generate** (#1386).
+  `/api/recover` and `/api/recover-cascade` return `generated_in_ms`, rendered
+  as *"2 statement(s) from 2 event(s) · generated in 0.4s"*. The clock covers
+  the event fetch — including any archive/Parquet leg — plus SQL rendering,
+  because that fetch is where a recover reaching S3 differs from one served
+  from live partitions by orders of magnitude. Zero and absent are different
+  answers and the field is not `omitempty`: a sub-millisecond recover is a real
+  result, and a client must be able to tell it from an older server that does
+  not report timing at all.
+- **The console has a first motion pass** (#1385). Overview tiles rise as their
+  fetch lands and lift on hover; nav icons nudge toward their destination. The
+  sidebar wordmark and the large Overview counts now carry the site's headline
+  gradient, and the Overview loading bars are warmed toward the hero pink.
+  Every animation sits inside `prefers-reduced-motion: no-preference` with a
+  usable resting state outside it. The gradient is opt-in per element rather
+  than a rule over the count class: its sweep bottoms out at 3.53:1 on the tile
+  it paints on, which clears WCAG's large-text bar and never the body bar, so
+  it lands only on 19px/700 and 32px text and never on the semantic
+  `--delete` tile.
+
+### Changed
+- **Reduced motion has one shape, and a guard that reads the whole file**
+  (#1392). The stylesheet had accumulated three different ways of honouring
+  `prefers-reduced-motion`, which is why an earlier audit scoped to one shape
+  manufactured alarms against correct code. They are now one shape, and the
+  guard covers the file rather than a section — it also caught five animations
+  that no guard had been watching.
+
 ### Fixed
+- **The Events loading skeleton was nearly invisible** (#1397). `.ev-skel-bar`
+  filled with `--surface-3`, which renders **1.09:1** against the page —
+  fainter than the 1.17:1 hairline separating the rows it stands in for. A
+  loading list therefore rendered as an empty list with dividers, which is
+  precisely the "blank list" the loading state exists to avoid, on the page an
+  operator opens mid-incident. The pulse made it worse rather than better, and
+  it is gated behind `prefers-reduced-motion`, so with motion reduced there was
+  nothing moving to suggest the bar was there at all. It now renders at 1.64:1.
+- **The Undo banner stated a target state the script does not produce**
+  (#1388). It read *"Reverting this row to before this point"*, but the
+  prefill fills only `until`, so the generated script reverses every event on
+  that row in an unbounded window ending at the end of the clicked event's
+  SECOND. Those coincide when the clicked event is the only one in range, which
+  is why the wording survived — and they diverge exactly where it hurts: a row
+  created and deleted inside one second nets to no row at all. The banner now
+  names the scope it actually reverses and the control that narrows it.
 - **The documented source user could not take a baseline.** Every place that
   spells out the source grants — `streaming.md`, `quickstart.md`, `install.md`,
   `console.md`, `docker.md`, `guide.md`, `mariadb.md`, `deployment.md`,
