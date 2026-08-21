@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.62.0] - 2026-08-21
+
+### Added
+- **Undo reverses one change, not the row's whole history** (#1404). Arriving at
+  Restore through an event's **Undo** prefilled `until` from the clicked event
+  and never `since`, so the window ran from the beginning of time: undoing the
+  third of five changes to a row put it back to before the **first**. The bridge
+  now also prefills `limit_per_pk = 1`, so the script reverses the latest change
+  at or before the ceiling. Prefilled rather than hardcoded — it lands in a
+  visible, editable field and the banner states it, so widening the scope is one
+  cleared field away and narrowing it was never a silent act. The ceiling is
+  unchanged and still second-granular, and the banner now names the one outcome
+  that inverts because of it: on a row INSERTed and DELETEd inside one second the
+  cap keeps the DELETE, so undoing from either event **re-creates** the row.
+  Identifying the clicked change by event rather than by second is #1411.
+- **A row's state and history open in a dialog** (#1405). `Show state` /
+  `Show history` rendered into a strip between the filter form and the reversal
+  panel. The output is unbounded — a churny row's history is a long table — and
+  it is consulted on the way to the script rather than being the script, so
+  checking one pushed the artifact the page exists to produce off screen. Both
+  now open a dialog, with the reconstruct warnings carried inside it (a
+  `stale_baseline` caveat left on the page behind a scrim is worse than the old
+  layout) and **Restore to this state** dismissing it before retargeting the
+  form underneath.
+
+### Fixed
+- **A PK-scoped reversal no longer reads every archive** (#1403). `recover` for a
+  single row with `limit_per_pk` set fetched from the live index **and then
+  downloaded and scanned every registered Parquet source**, even when the live
+  partitions already held that row's latest N events and nothing archived could
+  survive the per-PK trim. Measured on a real index: 25s spent scanning archives
+  back to a month before the event being reversed. `fetchPage` now skips the
+  archive leg when every named PK already has its `limit_per_pk` rows live, and
+  reports the elision so the operator is told the archives went unread rather
+  than left to assume they were consulted.
+
+  The skip is refused unless the planner can prove **archives are strictly
+  older than live** — a new `QueryPlan.ArchivesBelowLive`, computed from
+  partition hours the same way `PlanBrowse` has always computed it. Without that
+  premise, an index whose archives sit at or above the live floor (a restored or
+  hand-surgered index, or a rotate that archived without dropping) would let a
+  PK with its newest live rows skip an archive holding **newer** ones — a short
+  reversal script reported as complete. The same requirement is now applied to
+  the pre-existing top-N short-circuit, which was blind to the same layout.
+  Note the CLI's `recover --pk` sets a second PK spelling and is deliberately
+  excluded from the skip; the console and MCP paths are not (MCP builds its own
+  merge loop and does not reach this at all — #1410).
+
 ## [0.61.0] - 2026-08-21
 
 ### Added
