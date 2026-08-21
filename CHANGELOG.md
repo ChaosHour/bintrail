@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.63.0] - 2026-08-21
+
+### Fixed
+- **Undo reverses the event you clicked, not the last one in its second**
+  (#1411). The Undo bridge carried the clicked event to Restore as a **time**,
+  not an identity: `until` is second-granular, and paired with #1404's
+  `limit_per_pk = 1` that resolves to "the newest event at or before the end of
+  that second". Inside one second that is not necessarily the event pointed at,
+  and on one shape the outcome **inverted** — a row INSERTed and DELETEd in the
+  same second yields two events sharing a timestamp, the cap keeps the DELETE,
+  and reversing a DELETE re-INSERTs, so clicking Undo on the INSERT put the row
+  **back** while the badge still read INSERT. #1404's banner disclosed this in
+  words; this names the event instead. Events now carry an `anchor` — the
+  server's own `<RFC3339Nano>|<event_id>` token, the same spelling the
+  `?before=`/`?after=` cursors use — and `query.Options.EventAnchor` filters on
+  it in both the live index and the Parquet archives. The per-row cap is no
+  longer prefilled: two mechanisms narrowing one scope is how they drift apart.
+  Emitted by the server rather than rebuilt client-side because the displayed
+  timestamp carries no offset, so reconstructing an instant from it means
+  guessing a location — and guessing wrong does not fail, it names a different
+  row.
+- An anchored request that matches nothing now **says so**. An empty reversal
+  used to mean one thing (nothing happened in the window); an anchor adds
+  several causes that render identically as a 200 with an empty script — a
+  selection left over from an earlier target, a time range narrowed past the
+  anchored instant, a table withheld by an access profile, an archive source
+  that failed, or an anchor from a different server's index, since `event_id` is
+  a per-index AUTO_INCREMENT. Both `/api/recover` and `/api/events` now name the
+  event id and refuse the finding.
+- The Restore banner's **Clear** button retires the single-event selection and
+  keeps the target and the upper bound, which is what the banner beside it has
+  always said it does. It previously re-rendered the route into a fresh empty
+  form.
+
+### Added
+- An **archive short-circuit for anchored reads**, joining the two added in
+  #1403 and cheaper than either: it needs no query plan, no archives-below-live
+  premise and no boundary check. An anchor admits at most one event and
+  `event_id` is the merge layer's own dedup key, so an archive can hold a copy
+  of the event already in hand or nothing. An anchor whose event is **not** live
+  falls through to the archives as before — the predicate accelerates the common
+  case, it never decides membership.
+
 ## [0.62.0] - 2026-08-21
 
 ### Added
