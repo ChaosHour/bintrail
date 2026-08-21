@@ -1240,6 +1240,76 @@ try {
     }
   }
 
+
+  // ── Scenario 17d — the JavaScript half of reduced motion (#1392) ──
+  // Placed here, out of numeric order, because this is the one point in the
+  // run with a REAL rendered timeline. The stagger under test is scheduled by
+  // renderTimeline's own rAF loop; the synthesised DOM 17c uses never runs it.
+  //
+  // The Go guard and 17c both stop at the stylesheet. This stagger is driven
+  // from app.js — one setTimeout per node — so honouring the preference in CSS
+  // alone removes the SMOOTHNESS while the loop still moves every node: under
+  // `reduce` a long timeline snapped one node at a time across seconds of
+  // shifting content, a jumpier version of the motion the preference asked to
+  // remove. Only matchMedia can see this, and only at run time.
+  //
+  // NOT covered: the two scrollIntoView call sites gated on the same helper.
+  // Their smooth/auto difference is a browser-internal scroll with no
+  // observable DOM state, so this scenario makes no claim about them.
+  const staggerProbe = async (mode) => {
+    await page.emulateMedia({ reducedMotion: mode });
+    return page.evaluate(async () => {
+      const f = document.getElementById("recover-form");
+      f.elements.pk.value = "1";
+      f.elements.since.value = "";
+      f.elements.until.value = "2000-01-01 00:00:00";
+      await runState(f, true);
+      // Record the poll tick at which each node FIRST carries `.in`, instead
+      // of sampling once at a fixed instant.
+      //
+      // What is under test is a relative ordering — setTimeout(60) fires
+      // before setTimeout(115) however loaded the runner is — and an ordering
+      // survives a stall that a fixed window does not. The single snapshot
+      // this replaces needed the second node's 115ms to still be in the
+      // future when it read, and this fixture renders exactly two nodes, so
+      // that margin was the whole assertion. It also gets STRONGER as the
+      // fixture grows rather than weaker.
+      const firstSeen = [];
+      let arrived = 0, total = 0;
+      for (let tick = 0; tick < 90; tick++) {
+        const nodes = document.querySelectorAll(".tl-node");
+        total = nodes.length;
+        arrived = 0;
+        nodes.forEach((n, i) => {
+          if (!n.classList.contains("in")) return;
+          arrived++;
+          if (firstSeen[i] === undefined) firstSeen[i] = tick;
+        });
+        if (total > 0 && arrived === total) break;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      return { total, arrived, firstSeen };
+    });
+  };
+  const rmTl = await staggerProbe("reduce");
+  const npTl = await staggerProbe("no-preference");
+  await page.emulateMedia({ reducedMotion: null });
+
+  (rmTl.total > 0 && rmTl.arrived === rmTl.total
+    && rmTl.firstSeen.every((t) => t === rmTl.firstSeen[0]))
+    ? ok("reduced motion: every timeline node arrives on the same tick — no JS stagger")
+    : bad("reduced motion: every timeline node arrives on the same tick — no JS stagger", JSON.stringify(rmTl));
+  // The other half, and the reason the arm above is not satisfied by a broken
+  // render: under no-preference the nodes must arrive IN SEQUENCE.
+  //
+  // Two nodes are enough for an order claim, so unlike the snapshot version
+  // there is no fixture size at which this quietly stops asserting — and a
+  // fixture that drops below two is reported as a failure rather than waved
+  // through, because at that point the scenario has proved nothing.
+  (npTl.total >= 2 && npTl.arrived === npTl.total && npTl.firstSeen[1] > npTl.firstSeen[0])
+    ? ok("reduced motion: under no-preference the timeline arrives one node at a time")
+    : bad("reduced motion: under no-preference the timeline arrives one node at a time", JSON.stringify(npTl));
+
   // Scenario 14c — the Overview against the LIVE daemon (#1300). The fixture
   // scenario below drives buildOverview directly, so it cannot catch a route
   // that was never registered, an authz table that refuses it, or a JSON shape
@@ -2077,6 +2147,107 @@ try {
   (rmOn.anim === "none" && rmOn.note === "block")
     ? ok("busy modal: prefers-reduced-motion collapses the animation to the static note")
     : bad("busy modal: prefers-reduced-motion collapses the animation to the static note", JSON.stringify(rmOn));
+
+  // Scenario 17c — resting states under prefers-reduced-motion (#1392).
+  //
+  // The whole-file guard in assets_reducedmotion_test.go proves every
+  // animation SITS inside the reduced-motion block. It cannot prove the rule
+  // left OUTSIDE is a usable resting state, and that is the failure that costs
+  // information rather than polish: `ul` defines only a `to` frame, so leaving
+  // its scaleX(0) start on the base rule WOULD have hidden the underline
+  // marking WHICH value changed — permanently, and with the text guard
+  // green. A text checker cannot see that; it is a cascade question, so it is
+  // asked of a real browser.
+  //
+  // The elements are synthesised rather than driven to through the UI on
+  // purpose: the claim is about the stylesheet, and reaching a timeline with a
+  // changed value through five navigations would test the route, not the CSS.
+  const restProbe = async () => page.evaluate(() => {
+    const host = document.createElement("div");
+    host.innerHTML = '<div class="tl-node in"><span class="tl-dot"></span>'
+      + '<div class="tl-body"><span class="pv changed">v</span></div></div>'
+      + '<nav class="nav"><a class="nav-item active"><span>x</span></a></nav>'
+      + '<button class="cov-refresh-btn spin"><span class="cov-refresh-ico">'
+      + '<svg viewBox="0 0 24 24"></svg></span></button>'
+      + '<div class="view-enter"><div>panel</div></div>'
+      + '<div class="ov-stat"><div class="ov-stat-v">1</div></div>';
+    document.body.appendChild(host);
+    const cs = (sel, pseudo) => getComputedStyle(host.querySelector(sel), pseudo || null);
+    const res = {
+      underline: cs(".pv.changed", "::after").transform,
+      underlineAnim: cs(".pv.changed", "::after").animationName,
+      node: cs(".tl-node.in").transform,
+      dot: cs(".tl-dot").transform,
+      railHeight: cs(".nav-item.active", "::before").height,
+      railAnim: cs(".nav-item.active", "::before").animationName,
+      spinAnim: cs(".cov-refresh-ico svg").animationName,
+      spinOpacity: cs(".cov-refresh-btn.spin").opacity,
+      riseAnim: cs(".view-enter > div").animationName,
+      // The Go orphan check anchors on @keyframes, which leaves two blind
+      // spots these four fields cover. A guarded TRANSITION has no keyframes
+      // to orphan; and `rise` is declared on BOTH .view-enter > * and
+      // .ov-stat, so deleting either one leaves the name still "driven".
+      nodeTransDur: cs(".tl-node.in").transitionDuration,
+      dotTransDur: cs(".tl-dot").transitionDuration,
+      dotAnim: cs(".tl-dot").animationName,
+      ovAnim: cs(".ov-stat").animationName,
+      ovTransDur: cs(".ov-stat").transitionDuration,
+    };
+    host.remove();
+    return res;
+  });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  const rest = await restProbe();
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  const moved = await restProbe();
+  await page.emulateMedia({ reducedMotion: null });
+
+  // Every element must ARRIVE without its animation. "none" is the computed
+  // transform of an element with none declared — i.e. scaleX(1), full size,
+  // final position.
+  (rest.underline === "none" && rest.underlineAnim === "none")
+    ? ok("reduced motion: the changed-value underline is VISIBLE without its animation")
+    : bad("reduced motion: the changed-value underline is VISIBLE without its animation", JSON.stringify(rest));
+  (rest.node === "none" && rest.dot === "none" && rest.dotAnim === "none"
+    && rest.nodeTransDur === "0s" && rest.dotTransDur === "0s")
+    ? ok("reduced motion: timeline node and dot rest at their final position, untimed")
+    : bad("reduced motion: timeline node and dot rest at their final position, untimed", JSON.stringify(rest));
+  (rest.ovAnim === "none" && rest.ovTransDur === "0s")
+    ? ok("reduced motion: the stat tile neither enters nor transitions")
+    : bad("reduced motion: the stat tile neither enters nor transitions", JSON.stringify(rest));
+  rest.railHeight !== "0px"
+    ? ok("reduced motion: the active rail keeps its height without railpop")
+    : bad("reduced motion: the active rail keeps its height without railpop", rest.railHeight);
+  (rest.railAnim === "none" && rest.riseAnim === "none")
+    ? ok("reduced motion: neither the rail nor the view entrance animates")
+    : bad("reduced motion: neither the rail nor the view entrance animates", JSON.stringify(rest));
+  // The spin carries nearly all the in-flight signal — the :disabled dim is
+  // subtle and the cursor change invisible without a pointer — so its guard
+  // owes a replacement rather than a plain removal.
+  (rest.spinAnim === "none" && rest.spinOpacity === "0.55")
+    ? ok("reduced motion: the refresh spinner is replaced by a dimmed button, not by nothing")
+    : bad("reduced motion: the refresh spinner is replaced by a dimmed button, not by nothing", JSON.stringify(rest));
+
+  // The other half: moving the rules into the guard must not have deleted the
+  // motion for everyone else. Without this, emptying the block passes above.
+  (moved.underlineAnim === "ul" && moved.railAnim === "railpop" && moved.spinAnim === "covspin"
+    && moved.riseAnim === "rise" && moved.dotAnim === "dotpop")
+    ? ok("reduced motion: under no-preference every animation this probe covers still runs")
+    : bad("reduced motion: under no-preference every animation this probe covers still runs", JSON.stringify(moved));
+  // Asserted as "nonzero", not as an exact duration. The exact form caught the
+  // deletion this exists for, but it ALSO went red on a legitimate retune
+  // (.45s -> .5s) with a message accusing the author of a deletion that never
+  // happened — the cry-wolf shape this file argues against everywhere else.
+  (parseFloat(moved.nodeTransDur) > 0 && parseFloat(moved.dotTransDur) > 0
+    && parseFloat(moved.ovTransDur) > 0)
+    ? ok("reduced motion: the guarded transitions still have a duration under no-preference")
+    : bad("reduced motion: the guarded transitions still have a duration under no-preference", JSON.stringify(moved));
+  moved.ovAnim === "rise"
+    ? ok("reduced motion: the stat tile keeps its own entrance (rise has a second driver)")
+    : bad("reduced motion: the stat tile keeps its own entrance (rise has a second driver)", moved.ovAnim);
+  moved.spinOpacity === "1"
+    ? ok("reduced motion: the dimmed-button stand-in does not leak into no-preference")
+    : bad("reduced motion: the dimmed-button stand-in does not leak into no-preference", moved.spinOpacity);
 
   // ── Scenario 18 — advisory severity split on the archive fixture (#1365) ──
   // The archive-elision record must render in the INFO register (muted line,
