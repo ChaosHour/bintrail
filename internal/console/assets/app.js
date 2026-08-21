@@ -2636,20 +2636,54 @@ async function runState(form, history) {
   const atVal = atField && atField.value.trim();
   if (atVal) params.at = atVal;
   if (history) params.history = "true";
+  clear(out);
+  clear(warns);
   try {
     const data = await api("/api/reconstruct?" + new URLSearchParams(params).toString());
     if (gen !== serverGen) return;
-    renderWarnings(warns, data.warnings);
-    clear(out);
-    if (history) renderTimeline(out, data);
+    // Into a modal, not between the filter form and the reversal panel
+    // (#1405). The output is unbounded — a busy row's history is a long table
+    // — and it is consulted on the way to the script, so rendering it inline
+    // pushed the artifact the page exists to produce off screen.
+    //
+    // The WARNINGS come with it. They used to render into a sibling container
+    // that would now sit behind the scrim, and a reconstruct can return
+    // stale_baseline or a capture-gap caveat: an operator reading a row state
+    // with the caveat hidden behind the dialog is worse off than before this
+    // change, not better.
+    const dlg = openModal({
+      class: "state-modal",
+      label: history ? "Row history" : "Row at a point in time",
+      title: f.schema + "." + f.table + " · pk " + f.pk,
+      desc: [history
+        ? "Every recorded change to this row, newest last."
+        : "The row as of " + (atVal || "now") + " UTC — your latest snapshot plus every change since."],
+    });
+    const mwarns = el("div", { class: "warnings" });
+    dlg.body.append(mwarns);
+    renderWarnings(mwarns, data.warnings);
+    if (history) renderTimeline(dlg.body, data, dlg.close);
     else {
-      renderStateAt(out, data);
-      out.append(restoreToStateAction(form, data));
+      renderStateAt(dlg.body, data);
+      // The action retargets the form UNDERNEATH this dialog, so the dialog
+      // has to get out of the way — leaving it open hides the change it just
+      // made, which is the same complaint that moved this output in here.
+      const action = restoreToStateAction(form, data, dlg.close);
+      // Empty on a not-found/deleted row, and an empty footer is a stray
+      // divider with padding under it, so only mount one that has a button.
+      if (action.firstChild) dlg.panel.append(action);
     }
   } catch (err) {
     if (gen !== serverGen) return;
-    clear(warns);
-    renderError(out, err);
+    // The fetch failed rather than the form being wrong, so the answer belongs
+    // where the answer would have been. A 422 gap refusal is a result about
+    // the request, not a hint about the fields.
+    const dlg = openModal({
+      class: "state-modal",
+      label: history ? "Row history" : "Row at a point in time",
+      title: f.schema + "." + f.table + " · pk " + f.pk,
+    });
+    renderError(dlg.body, err);
   }
 }
 
@@ -2709,13 +2743,18 @@ function aimUndoAtInstant(form, at) {
 // these indexes routinely carry dozens (a single write burst stamps them all
 // alike). Until is cleared for the same reason it is set by the Undo bridge:
 // a leftover upper bound would silently drop the newest damage from the window.
-function restoreToStateAction(form, data) {
+function restoreToStateAction(form, data, onDone) {
   const row = el("div", { class: "state-actions" });
   if (!data.found) return row;
   row.append(el("button", {
     class: "btn btn-primary", type: "button", text: "Restore to this state",
     title: "Reverse every change after " + data.at + " UTC, leaving the row exactly as shown",
-    onclick: () => aimUndoAtInstant(form, data.at),
+    onclick: () => {
+      // Close BEFORE retargeting: aimUndoAtInstant scrolls the form into view
+      // and previews the rows, and both are invisible behind a scrim.
+      if (onDone) onDone();
+      aimUndoAtInstant(form, data.at);
+    },
   }));
   row.append(el("span", { class: "state-actions-note", text:
     "Sets the undo window to every change after this instant. Review the rows, then generate the SQL." }));
@@ -2784,6 +2823,12 @@ function renderTimetravel(params) {
   viewEnter();
 }
 
+// runReconstruct is the standalone Time-travel view, NOT the Restore view's
+// embedded panel. It renders inline and keeps doing so: #1405 moved runState
+// into a dialog because its output was wedged between a filter form and the
+// reversal panel it was pushing off screen. Here the reconstructed state IS
+// the page, with nothing below it to displace, so a dialog would add a scrim
+// and buy nothing.
 async function runReconstruct(form, history) {
   const gen = serverGen;
   const warns = $("#tt-warnings", VIEW());
@@ -2829,7 +2874,12 @@ function stateTable(state) {
   return table;
 }
 
-function renderTimeline(container, data) {
+// onDone, when given, is the caller's dismissal — the timeline is rendered
+// into a dialog from runState and inline from runReconstruct, and only the
+// first has anything to close. Each node carries its OWN restore button, so
+// unlike the state panel there is no single footer to pin outside the scroll;
+// the button travels with the node it names, which is where it belongs.
+function renderTimeline(container, data, onDone) {
   const entries = data.history || [];
   container.append(reconstructMeta(data, "history through " + data.at + " · " + entries.length + " state(s)"));
   if (!entries.length) { container.append(el("div", { class: "deleted-note", text: "No history for this primary key in the time range that's been indexed." })); return; }
@@ -2879,6 +2929,13 @@ function renderTimeline(container, data) {
         class: "btn btn-sm tl-restore", type: "button", text: "Restore to this state",
         title: "Reverse every change after " + e.time + " UTC, leaving the row as shown here",
         onclick: () => {
+          // Same reason the state panel's action closes first: aimUndoAtInstant
+          // scrolls the form into view and previews the rows, and both are
+          // invisible behind a scrim. This one used to be carried by accident —
+          // previewRecover's busy dialog happens to replace the mount — which
+          // held right up until previewRecover took one of its two early
+          // returns and left the error rendering behind the scrim.
+          if (onDone) onDone();
           const form = document.getElementById("recover-form");
           if (form) aimUndoAtInstant(form, e.time);
         },
@@ -4269,6 +4326,52 @@ async function openVerifyExplain(id, schema, table, btn) {
 }
 
 function closeVerifyExplain() { document.getElementById("modal").replaceChildren(); }
+
+// openModal builds the scrim/panel/head boilerplate the console's dialogs all
+// repeat, and returns the body to fill plus the close it wired.
+//
+// Extracted rather than copied a seventh time (#1405), and it has ONE caller
+// today — which is worth stating plainly rather than dressing up as a shared
+// abstraction.
+//
+// The six existing dialogs are not migrated, and the reason is structural, not
+// caution: they append their body, footer and extras as SIBLINGS of the panel,
+// while this returns a body div nested inside it. Adopting it would move their
+// content one level deeper and put their .modal-foot and body rules on
+// different ancestors — a DOM change to working recovery-adjacent UI, for
+// tidiness, with no browser coverage of most of them to catch a layout break.
+//
+// What it does own is the part that is genuinely identical everywhere: the
+// mount, the scrim, scrim-click dismissal, the ✕, and the focus handoff.
+// Escape still comes from globalKeydown keyed off the shared #modal slot, so
+// nothing here re-implements it.
+function openModal(opts) {
+  const mount = document.getElementById("modal");
+  const scrim = el("div", { class: "modal-scrim show" });
+  const modal = el("div", { class: "modal" + (opts.class ? " " + opts.class : ""),
+    role: "dialog", "aria-label": opts.label });
+  const close = () => {
+    if (mount) mount.replaceChildren();
+    if (opts.onClose) opts.onClose();
+  };
+  const head = el("div", { class: "modal-head" });
+  if (opts.title) head.append(el("h2", { class: "modal-title", text: opts.title }));
+  for (const d of opts.desc || []) head.append(el("p", { class: "modal-desc", text: d }));
+  head.append(el("button", { class: "modal-x", type: "button", text: "✕", onclick: close }));
+  modal.append(head);
+  const body = el("div", { class: "modal-body" });
+  modal.append(body);
+  scrim.append(modal);
+  scrim.addEventListener("click", (e) => { if (e.target === scrim) close(); });
+  if (mount) mount.replaceChildren(scrim);
+  focusModal(scrim);
+  // The PANEL comes back alongside the body because a footer must not live
+  // inside a scrolling body: a wide row's state table is taller than the
+  // viewport, and an action rendered after it scrolls out of reach. Callers
+  // append their own .modal-foot-ish row as a sibling, which is also how the
+  // dialogs this did not absorb are built.
+  return { body, panel: modal, close };
+}
 
 // focusModal moves keyboard focus into a freshly-opened dialog (#968): the
 // first form field when there is one, else the first button (usually the ✕
