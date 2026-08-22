@@ -3583,6 +3583,7 @@ try {
     ? ok("tropical: the haze is anchored to scroll content, not the viewport")
     : bad("tropical: the haze is anchored to scroll content, not the viewport", tropSide.attachment);
 
+
   // The card tint rotation, on the page from the user's own screenshot. Two
   // distinct tinted grounds prove rotation; "not white" alone would pass a
   // single flat tint.
@@ -3595,6 +3596,38 @@ try {
   (tints.length === 2 && tints[0] !== tints[1] && !tints.includes("rgb(255, 255, 255)") && !tints.includes("rgba(0, 0, 0, 0)"))
     ? ok("tropical: config cards rotate through the home's tint palette")
     : bad("tropical: config cards rotate through the home's tint palette", JSON.stringify(tints));
+
+  // ── Scenario 17g — Connect AI reads as steps, not as jargon. The page's
+  // audience is Claude users, mostly non-technical; the rewrite turned the
+  // three cards into an explicit Step 1/2/3 with a literal ordered list.
+  // Structure is the guard (titles, the <ol>, the one-time warning), so a
+  // future copy edit can rewrite words but not silently dissolve the steps.
+  // Limit worth naming: run.sh builds without -ldflags, so this only ever
+  // exercises the UNVERSIONED bundle arm; the released arm's copy is not
+  // photographed here.
+  await page.evaluate(() => navigate("connect"));
+  await page.waitForFunction(() => location.pathname === "/connect"
+    && document.querySelectorAll(".view .card").length >= 3, { timeout: 10000 });
+  const cn = await page.evaluate(() => {
+    const titles = Array.from(document.querySelectorAll(".view .card .card-title")).map((n) => n.textContent);
+    const addrCard = Array.from(document.querySelectorAll(".view .card")).find((c) =>
+      /Step 2/.test((c.querySelector(".card-title") || {}).textContent || ""));
+    return {
+      steps: titles.filter((t) => /^Step [123] · /.test(t)).length,
+      olItems: document.querySelectorAll(".cn-steps li").length,
+      subOnce: /shown only once/.test((document.querySelector(".page-sub") || {}).textContent || ""),
+      addrCopy: addrCard ? Array.from(addrCard.querySelectorAll("button")).some((b) => b.textContent === "Copy") : false,
+    };
+  });
+  (cn.steps === 3)
+    ? ok("connect: the three cards are literal steps 1, 2 and 3")
+    : bad("connect: the three cards are literal steps 1, 2 and 3", JSON.stringify(cn));
+  (cn.olItems >= 5)
+    ? ok("connect: step 3 is an ordered list a non-technical user can follow")
+    : bad("connect: step 3 is an ordered list a non-technical user can follow", "items " + cn.olItems);
+  (cn.subOnce && cn.addrCopy)
+    ? ok("connect: the one-time-token warning leads the page and the address is one click to copy")
+    : bad("connect: the one-time-token warning leads the page and the address is one click to copy", JSON.stringify(cn));
 
   // ── Scenario 17f — the Events skeleton is visible (#1397) ──
   //
