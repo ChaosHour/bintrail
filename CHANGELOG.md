@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.64.0] - 2026-08-22
+
+### Added
+- **The Events browser renders the live index first** (#1414). The page used
+  to block on a single all-or-nothing fetch: rows already sitting in
+  `binlog_events` — milliseconds away — waited behind an S3 archive scan that
+  can take tens of seconds. `GET /api/events?scope=live` now serves the live
+  index immediately and says exactly what it left unread (`scope: "live"`,
+  `archives_pending`, and a PARTIAL warning louder than the elision note); the
+  UI paints that phase at once, completes with the full merged read in the
+  background, and replaces the list wholesale keyed on each event's `anchor`,
+  so backfill layouts cannot reorder rows under the operator. A failed
+  background read leaves the marker up and names the failure — and both browse
+  endpoints now put skipped archive sources and discovery failures in the
+  response warnings instead of only the daemon log, so the follow-up read can
+  keep the phase-1 promise.
+- **A fourth archive-elision proof, `windowSatisfiedLive`** (#1414): a `since`
+  bound at or above contiguous live coverage makes every label-accurate
+  archived row unable to survive the row-level time filter, whatever the page
+  looks like — the sparse table reached from a live-retention widget could
+  never fill a page, so no earlier short-circuit could help it. Misfiled
+  archives (#1037) and `SincePos` veto the proof. The Overview's *Activity by
+  table* click now carries its own window as a visible `since:` token, so the
+  count an operator clicked and the search it opens ask the same question.
+  The two reconstruct surfaces (console and MCP), where the proof made elision
+  reachable on ASC fetches, grew the notes lists their guards had reserved.
+- **Verification's inconclusive bucket is subdivided** (#1416). One bucket
+  carried three meanings and rendered them identically, so a healthy run over
+  a server full of log tables read as a page of warnings. `--check recover`
+  now reports `inconclusive_kind` per table — `no-activity`, `nothing-to-assert`
+  (append-only shapes where zero assertions is the expected outcome), or
+  `unproven` — and every surface splits the summary: CLI text and JSON
+  (`summary.inconclusive_nothing_to_check`), the console's cards (benign kinds
+  render neutral, not amber), toast, history, and a verdict sentence in words.
+  The attention side is the REMAINDER, so an unclassified inconclusive is
+  never rounded toward benign, and the exit contract is unchanged.
+
+### Changed
+- **The console adopts the home page's surface language** (#1421): tinted
+  bento cards (violet/sun structure tints with AA-measured text partners — the
+  site's own deep values fail 4.5:1 and were darkened, not copied), pill
+  eyebrows, and a dark code-block recipe. Body text, row dividers and the
+  warning register were all measured on the tint grounds after review caught
+  the first cut failing all three.
+- **`/baselines` redesigned** (#1415): a full-width context strip — source
+  path as one-line code, snapshot count, latest with its relative age beside
+  the absolute time, tables-per-snapshot when uniform, and Create baseline as
+  the page action — over a full-width list where the newest snapshot (the one
+  a restore actually uses) wears the treatment and rows carry only what
+  varies.
+- **`/verification` redesigned** (#1417, #1418, #1419, #1420): three separated
+  regions (run / current / history); per-mode help stating what each check
+  proves, needs and costs; result rows as scannable columns sorted
+  worst-first; a glossary for the walk's vocabulary; a running verification
+  that finally looks like one (animated live chip, progress strip, counts
+  framed "so far" so a partial tally cannot read as a verdict, a perceptible
+  completion); and history rows that expand to their per-table detail — data
+  that was already persisted and on the wire, dropped on the floor by the old
+  renderer. `LAST VERIFIED` no longer shares its treatment with `RUNNING`,
+  and the recover-inputs counters now actually reach the console's wire shape.
+
 ## [0.63.0] - 2026-08-21
 
 ### Fixed
