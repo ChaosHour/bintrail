@@ -14,6 +14,7 @@
 // playwright-managed chromium).
 import { chromium } from "playwright";
 import zlib from "node:zlib";
+import { readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 
 const URL = process.env.CONSOLE_URL || "http://127.0.0.1:8090";
@@ -3597,37 +3598,79 @@ try {
     ? ok("tropical: config cards rotate through the home's tint palette")
     : bad("tropical: config cards rotate through the home's tint palette", JSON.stringify(tints));
 
-  // ── Scenario 17g — Connect AI reads as steps, not as jargon. The page's
-  // audience is Claude users, mostly non-technical; the rewrite turned the
-  // three cards into an explicit Step 1/2/3 with a literal ordered list.
-  // Structure is the guard (titles, the <ol>, the one-time warning), so a
-  // future copy edit can rewrite words but not silently dissolve the steps.
+  // ── Scenario 17g — Connect AI is three short steps with a drawn dialog ──
+  // The audience is Claude users, mostly non-technical. The first rewrite
+  // (#1430) made the steps explicit but drowned them in prose; the verdict on
+  // the live page was "demasiado texto". This pass folds every contingency
+  // into <details> and DRAWS the install dialog instead of describing it.
+  // Guards: the three numbered badges in order, the mock whose field labels
+  // are VERBATIM from build/packaging/mcpb/manifest.template.json, and a hard
+  // budget on the VISIBLE text. innerText is the budget's measuring stick on
+  // purpose: it skips a closed <details>' folded content (each summary line
+  // still counts), so fine print stays free while anything unfolded on the
+  // open page counts against the cap. The cap (1500)
+  // sits ~50% above the measured page (869-985 chars across the token states)
+  // and 35% below the pre-simplify page (2304 measured, RED verified), so a
+  // copy edit breathes but a wall of text rings.
   // Limit worth naming: run.sh builds without -ldflags, so this only ever
-  // exercises the UNVERSIONED bundle arm; the released arm's copy is not
-  // photographed here.
+  // photographs the UNVERSIONED bundle arm.
   await page.evaluate(() => navigate("connect"));
+  // Wait on .cn-card, a connect-only marker. ".card" is not connect-specific:
+  // anything else that paints cards into the shared #view container (another
+  // view's late async paint — the route-clobber class scenario 17c exists
+  // for) can satisfy it, and the preview loop for this scenario photographed
+  // exactly one such half-built page. .cn-card can only exist after
+  // buildConnect ran, and === 3 also rings if a card is dropped.
+  // Tolerant wait: against a page with no .cn-card at all (the M1 mutation,
+  // assets reverted to the pre-simplify page) a bare waitForFunction timeout
+  // ABORTS the suite at this line, hiding the four assertions below and every
+  // later scenario. Catch it and let the assertions report the actual shape.
   await page.waitForFunction(() => location.pathname === "/connect"
-    && document.querySelectorAll(".view .card").length >= 3, { timeout: 10000 });
+    && document.querySelectorAll(".view .cn-card").length === 3, { timeout: 15000 })
+    .catch(() => {});
+  // The mock's field labels come from the REAL bundle manifest, not from a
+  // second hand-maintained copy: renaming either side alone rings below. A
+  // failed read degrades to null titles (a loud label mismatch carrying the
+  // error) instead of throwing here, which would abort 17f and 18 with it.
+  // globalThis.URL because this file shadows URL with the console's
+  // base-address string.
+  let mcpbTitles = [null, null], mcpbReadErr = "";
+  try {
+    const mcpbCfg = JSON.parse(readFileSync(new globalThis.URL("../../build/packaging/mcpb/manifest.template.json", import.meta.url), "utf8")).user_config;
+    mcpbTitles = [mcpbCfg.console_url.title, mcpbCfg.token.title];
+  } catch (e) { mcpbReadErr = String(e); }
   const cn = await page.evaluate(() => {
-    const titles = Array.from(document.querySelectorAll(".view .card .card-title")).map((n) => n.textContent);
-    const addrCard = Array.from(document.querySelectorAll(".view .card")).find((c) =>
-      /Step 2/.test((c.querySelector(".card-title") || {}).textContent || ""));
+    const badges = Array.from(document.querySelectorAll(".view .card .cn-num")).map((n) => n.textContent).join("");
+    const labels = Array.from(document.querySelectorAll(".cn-mock .cn-mock-label")).map((n) => n.textContent);
+    const addrCard = document.querySelectorAll(".view .cn-card")[1];
+    const visible = (document.querySelector(".view") || { innerText: "" }).innerText;
     return {
-      steps: titles.filter((t) => /^Step [123] · /.test(t)).length,
-      olItems: document.querySelectorAll(".cn-steps li").length,
-      subOnce: /shown only once/.test((document.querySelector(".page-sub") || {}).textContent || ""),
+      badges,
+      labels,
+      visibleChars: visible.length,
+      fine: document.querySelectorAll(".view details.cn-fine").length,
       addrCopy: addrCard ? Array.from(addrCard.querySelectorAll("button")).some((b) => b.textContent === "Copy") : false,
+      once: /shown only once/.test(visible),
+      // The 404-honesty rule's photographable half: this run is the
+      // unversioned arm, where a direct release-asset link can only 404.
+      downloadLinks: document.querySelectorAll('.view a[href*="/releases/download/"]').length,
     };
   });
-  (cn.steps === 3)
-    ? ok("connect: the three cards are literal steps 1, 2 and 3")
-    : bad("connect: the three cards are literal steps 1, 2 and 3", JSON.stringify(cn));
-  (cn.olItems >= 5)
-    ? ok("connect: step 3 is an ordered list a non-technical user can follow")
-    : bad("connect: step 3 is an ordered list a non-technical user can follow", "items " + cn.olItems);
-  (cn.subOnce && cn.addrCopy)
-    ? ok("connect: the one-time-token warning leads the page and the address is one click to copy")
-    : bad("connect: the one-time-token warning leads the page and the address is one click to copy", JSON.stringify(cn));
+  (cn.badges === "123")
+    ? ok("connect: three numbered step badges in order")
+    : bad("connect: three numbered step badges in order", JSON.stringify(cn.badges));
+  (cn.labels.length === 2 && cn.labels[0] === mcpbTitles[0] && cn.labels[1] === mcpbTitles[1])
+    ? ok("connect: the drawn dialog carries the manifest's field names verbatim")
+    : bad("connect: the drawn dialog carries the manifest's field names verbatim", JSON.stringify({ drawn: cn.labels, manifest: mcpbTitles, readErr: mcpbReadErr }));
+  (cn.visibleChars > 0 && cn.visibleChars < 1500 && cn.fine >= 1)
+    ? ok("connect: visible text stays under budget with fine print folded")
+    : bad("connect: visible text stays under budget with fine print folded", "chars " + cn.visibleChars + " fine " + cn.fine);
+  // "shown only once" is carried by the fresh state and the managed state
+  // (except managed read_only, which drops the Lost-it clause and the phrase
+  // with it); this run exercises the fresh one (no scenario mints a token).
+  (cn.once && cn.addrCopy && cn.downloadLinks === 0)
+    ? ok("connect: one-time warning visible, address one click to copy, no 404able download link")
+    : bad("connect: one-time warning visible, address one click to copy, no 404able download link", JSON.stringify({ once: cn.once, addrCopy: cn.addrCopy, downloadLinks: cn.downloadLinks }));
 
   // ── Scenario 17f — the Events skeleton is visible (#1397) ──
   //
@@ -3786,7 +3829,10 @@ try {
   const skelPulseWorst = skelPhases.every(skelEnough)
     ? skelPhases.reduce((w, s) => (!w || s.ratio < w.ratio ? s : w), null)
     : null;
-  const skelR = (s) => s && +s.ratio.toFixed(3);
+  // ratio can be ABSENT (a phase whose screenshot sampled no bars spreads {}
+  // into the entry) — and this reporter runs precisely when that happens, so
+  // it must render the hole as null, not abort the whole suite reporting it.
+  const skelR = (s) => (s && s.ratio != null) ? +s.ratio.toFixed(3) : null;
   const skelDetail = () => JSON.stringify({
     bars: skelBars,
     rest: Object.fromEntries(skelShots.map(([d, s]) => [d, skelR(s)])),
@@ -3928,24 +3974,37 @@ try {
     f.elements.until.value = until;
     f.elements.limit.value = "50";
     f.requestSubmit();
-    for (let i = 0; i < 60; i++) {
+    // Progressive events (#1414) answer in two phases, and phase 1 paints its
+    // own TRANSIENT scope=live partial warning before phase 2 replaces it
+    // with the final set. Breaking on ANY .warn-item samples whichever phase
+    // got there first — a race this scenario lost twice in one session — so
+    // wait for the warning the assertions below are actually about.
+    let w = null;
+    for (let i = 0; i < 120; i++) {
       await new Promise((r) => setTimeout(r, 50));
-      if (document.querySelectorAll("#ev-warnings .warn-item").length) break;
+      w = Array.from(document.querySelectorAll("#ev-warnings .warn-item"))
+        .find((n) => /rotated and not archived/.test(n.textContent)) || null;
+      if (w) break;
     }
-    const w = document.querySelector("#ev-warnings .warn-item");
     const cs = w ? getComputedStyle(w) : null;
     return {
       warnCount: document.querySelectorAll("#ev-warnings .warn-item").length,
       warnText: w ? w.textContent : "",
+      warnTexts: Array.from(document.querySelectorAll("#ev-warnings .warn-item")).map((n) => n.textContent),
       hasIcon: w ? !!w.querySelector("svg") : false,
       bg: cs ? cs.backgroundColor : "",
       border: cs ? cs.borderTopStyle : "",
       noteCount: document.querySelectorAll("#ev-notes .note-item").length,
     };
   }, { since: ARC_GAP_SINCE, until: ARC_GAP_UNTIL });
-  arcWarn.warnCount >= 1 && /rotated and not archived/.test(arcWarn.warnText)
-    ? ok("severity split: a real coverage-gap warning renders")
-    : bad("severity split: a real coverage-gap warning renders", JSON.stringify(arcWarn));
+  // The matcher that found `w` makes /rotated and not archived/ true by
+  // construction, so the real claim here is the second half: once the gap
+  // warning is up, no phase-1 transient (scope=live partial, background-read
+  // notice) and no failed-archive-read notice may share the box with it.
+  (arcWarn.warnCount >= 1 && /rotated and not archived/.test(arcWarn.warnText)
+    && !arcWarn.warnTexts.some((t) => /Reading archived history in the background|archive read FAILED|scope=live/.test(t)))
+    ? ok("severity split: a real coverage-gap warning renders, with no transient sharing the box")
+    : bad("severity split: a real coverage-gap warning renders, with no transient sharing the box", JSON.stringify(arcWarn));
   (arcWarn.hasIcon && arcWarn.bg !== "rgba(0, 0, 0, 0)" && arcWarn.border === "solid")
     ? ok("severity split: the gap warning keeps the alert register (⚠, amber, border)")
     : bad("severity split: the gap warning keeps the alert register (⚠, amber, border)", `icon=${arcWarn.hasIcon} bg=${arcWarn.bg} border=${arcWarn.border}`);
