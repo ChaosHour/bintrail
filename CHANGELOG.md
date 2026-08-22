@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.66.0] - 2026-08-22
+
+### Added
+- **Build a .sql backup for any moment, from the Backups page** (#1428). Pick
+  a past instant; the watch daemon folds the newest backup at-or-before it
+  forward through the recorded changes and hands out one tar.gz of plain SQL
+  files (mydumper format) that `myloader` restores with nothing from
+  bintrail on the receiving side. Every build writes into its own staging
+  directory (a rebuild can never interleave two instants into one archive),
+  the download is gated on the build's completeness marker read together
+  with its status in one locked snapshot, and the handler re-checks the
+  marker after the last byte so a build replaced mid-stream aborts loudly
+  instead of ending as an apparently whole archive. Fail-closed like every
+  fold: a stamped capture gap or a table whose backup vanished mid-build
+  fails the run; nothing incomplete is ever downloadable. Downloads sit on
+  the `query:execute` tier and are audited (aborted streams included);
+  profile-scoped sessions are refused on trigger and download. Staging is
+  swept at daemon startup, so no plaintext dump outlives the process that
+  can serve it.
+
+### Changed
+- **The console wears the dbtrail.com sunset** (#1429). The sidebar goes to a
+  light tropical-morning ground (tinted, never white) with the site's sunset
+  as its accents: the active page is a pink-to-orange pill, section labels
+  are deep gold, and the wordmark keeps its headline gradient. The content
+  canvas warms up: a blush ground, a sunset haze at the top of each page
+  (anchored to the page, so scrolled list headers never ride it), page
+  titles in the headline gradient, and config cards rotating the home's four
+  tints with their own borders and ribbons. Every measured contrast floor
+  holds and is recorded next to the values; data surfaces (events, diff,
+  the INSERT/UPDATE/DELETE code) keep their exact colors.
+- **Connect AI reads as literal steps for non-technical users** (#1430).
+  Three cards become Step 1 (Access token), Step 2 (Console address) and
+  Step 3 (Add it to Claude, a real ordered list quoting Claude Desktop's own
+  field names). Rotate/revoke became New token / Delete token everywhere,
+  the Bearer-header detail moved into the technical accordion, and the
+  bundle card stopped promising files that do not exist: there is no
+  Windows installer, so Windows browsers are routed to the claude.ai custom
+  connector, and Intel Macs are pointed at the darwin-amd64 bundle instead
+  of the arm64 one. docs/connect-ai.md now numbers its steps the same way
+  the page does.
+
 ## [0.65.0] - 2026-08-22
 
 ### Added
