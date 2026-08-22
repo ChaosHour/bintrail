@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.67.0] - 2026-08-22
+
+### Changed
+- **Connect AI is now three short steps with a drawn install dialog** (#1432).
+  The page said everything and showed nothing; live feedback was that it read
+  as a wall of text. Step numbers are badges, each card is one action plus one
+  short line, a miniature of Claude Desktop's install dialog shows the two
+  fields with chips pointing back at steps 1 and 2, and every contingency
+  (Intel Mac, Windows, claude.ai in the browser, fixed startup tokens,
+  several servers) folds into fine print. Visible text drops from ~2300 to
+  under 1000 characters, and the e2e suite now enforces the budget, reads the
+  bundle manifest's field names at run time so the drawing can never drift
+  from the real dialog, and pins that no arm ever renders a download link
+  that can only answer Not Found.
+
+### Fixed
+- The console e2e's Events-skeleton failure reporter crashed while reporting
+  a broken fixture, taking the rest of the suite with it; and the severity
+  split scenario could sample the transient scope=live warning that
+  progressive Events paint before the final read lands (#1432).
+
 ## [0.66.0] - 2026-08-22
 
 ### Added
