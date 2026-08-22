@@ -198,11 +198,13 @@ const DiscoveryFailedSource = "(archive source discovery failed)"
 // the skipped sources and the diverging events.
 //
 // archivesElided reports that resolved archive sources were deliberately NOT
-// read because they provably could not change the result. Three short-circuits
+// read because they provably could not change the result. Four short-circuits
 // can set it, in ascending order of how much they must prove: anchorSatisfiedLive
 // (the live index already returned the one event Options.EventAnchor names),
-// perPKSatisfiedLive (every named PK already has its latest LimitPerPK live),
-// and topNSatisfiedLive (the live index filled a DESC page whose span is
+// windowSatisfiedLive (a Since bound inside contiguous live coverage puts
+// every label-accurate archived row below the window), perPKSatisfiedLive
+// (every named PK already has its latest LimitPerPK live), and
+// topNSatisfiedLive (the live index filled a DESC page whose span is
 // live-covered from the cutoff upward). It is a completeness-
 // preserving optimization, never a scope reduction, but a caller rendering
 // the result to a human must still be able to SAY the archives went unread
@@ -237,7 +239,7 @@ func FetchMergedFull(
 // event Options.EventAnchor names, which makes every resolved archive source
 // redundant for this request.
 //
-// It is the cheapest of the three short-circuits and the only one that needs
+// It is the cheapest of the four short-circuits and the only one that needs
 // no QueryPlan: no contiguous-range check, no ArchivesBelowLive premise, no
 // boundary comparison. The proof is the anchor itself. An anchor admits at
 // most one event, event_id is unique, and it is the key MergeResults dedupes
@@ -269,6 +271,67 @@ func anchorSatisfiedLive(opts Options, rows []ResultRow) bool {
 		}
 	}
 	return false
+}
+
+// windowSatisfiedLive reports that a Since-bounded window is provably beyond
+// the archives' reach, so the archive sources can be skipped without reading
+// them. It is the proof behind the sharpest measured shape (#1414): a click on
+// a live-retention widget ("6 events in the last ~12h") navigated into a full
+// multi-archive S3 scan that could not, by construction, contribute a row —
+// and because a sparse table never fills a page, topNSatisfiedLive's
+// filled-page premise structurally cannot rescue it. This predicate needs no
+// rows at all; the window is the proof.
+//
+// The premises, each load-bearing:
+//
+//   - A Since bound. Without one the window reaches back to the beginning of
+//     time, which is exactly where the archives live.
+//   - A plan, with archive coverage actually evaluated. No plan, no proof;
+//     ArchiveCoverageUnavailable means archivesBelowLive was computed over an
+//     hour list that was never read — a vacuous premise, the same refusal its
+//     two plan-consuming siblings make.
+//   - ONE contiguous live range with Since at or above its start. Archived
+//     hours all sit strictly below the oldest live hour (ArchivesBelowLive),
+//     and hour labels are whole: an archived hour H < range start means every
+//     label-accurate row in it has a timestamp below H+1h <= start <= Since —
+//     excluded by the row-level Since filter whichever source served it.
+//     (In practice Plan clamps its range start to Since.Truncate(1h), so the
+//     reachable predicate reduces to "a live partition exists at the Since
+//     hour" — the single-range premise is over-strict rather than
+//     load-bearing, kept for symmetry with the sibling proofs.)
+//   - No misfiled archives overlapping the window. ArchivesBelowLive is
+//     computed from partition LABELS; a #1037 backfill puts rows INSIDE the
+//     window into an archive labeled below it, and plan.MisfiledArchiveHours
+//     is the window-scoped list of exactly those files. Non-empty → decline
+//     and read them. (An archive predating the content stamps can hide a
+//     misfile from this list — but it hides it from the label-scoped fetch's
+//     file pruning identically, so declining here would not read it either:
+//     the proof is exactly as strong as the fetch it elides.)
+//
+// Until needs no premise: it can only exclude more. And unlike its siblings
+// this proof is order-independent — ASC and DESC windows are the same set.
+func windowSatisfiedLive(opts Options, plan *QueryPlan) bool {
+	if opts.Since == nil {
+		return false
+	}
+	if opts.SincePos != nil {
+		// SincePos DROPS the exact `event_timestamp >= Since` row filter
+		// (buildQuery) and widens the coarse bound a full hour below Since —
+		// on both the live and the archive leg — so the fetch this proof
+		// claims equivalence to reads an hour the proof never modeled, and
+		// correctness there rests on the position comparison this predicate
+		// cannot see. Every SincePos caller (reconstruct's fold, verify,
+		// the shim's _snapshot, cascade) is a surface where a silently
+		// dropped delta becomes a wrong answer or a false mismatch. Decline.
+		return false
+	}
+	if plan == nil || len(plan.MySQLRanges) != 1 || !plan.ArchivesBelowLive || plan.ArchiveCoverageUnavailable {
+		return false
+	}
+	if len(plan.MisfiledArchiveHours) > 0 {
+		return false
+	}
+	return !opts.Since.Before(plan.MySQLRanges[0].Start)
 }
 
 // topNSatisfiedLive reports whether the live partitions alone already hold the
@@ -793,7 +856,7 @@ func resolveMergeSources(ctx context.Context, db *sql.DB, o FetchMergedOptions) 
 // retired from the walk entirely. diverged counts the duplicate event_ids
 // whose two merged copies disagreed (#1325); zero on every path that reads a
 // single source, since no duplicate can exist there. archivesElided reports
-// that one of the three short-circuits below fired — resolved archives went
+// that one of the four short-circuits below fired — resolved archives went
 // unread because they provably could not change this page (see FetchMergedFull
 // for which, and for why the signal is returned rather than logged).
 func fetchPage(
@@ -828,6 +891,11 @@ func fetchPage(
 	if anchorSatisfiedLive(o.Opts, rows) {
 		slog.Debug("planner: skipping archive sources (the anchored event is already live)",
 			"event_id", o.Opts.EventAnchor.EventID, "sources", len(src.archSources))
+		return rows, nil, nil, 0, true, nil
+	}
+	if windowSatisfiedLive(o.Opts, src.plan) {
+		slog.Debug("planner: skipping archive sources (the Since bound sits inside contiguous live coverage)",
+			"since", o.Opts.Since, "sources", len(src.archSources))
 		return rows, nil, nil, 0, true, nil
 	}
 	if topNSatisfiedLive(o.Opts, rows, src.plan) {

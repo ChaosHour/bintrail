@@ -19,7 +19,6 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/metadata"
-	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/recovery"
 	"github.com/dbtrail/dbtrail/internal/status"
@@ -160,6 +159,22 @@ type eventsResponse struct {
 	// severities render differently (alert vs muted) and API clients read the
 	// same shape. Additive: clients that ignore it are unaffected.
 	Notes []string `json:"notes,omitempty"`
+	// Scope echoes a ?scope=live request (#1414): this page was served from
+	// the live index only, by the caller's own choice. Absent on a normal
+	// merged read — the field marks the REQUEST's scope, never the engine's
+	// internal short-circuits (those speak through Notes as the elision
+	// record).
+	Scope string `json:"scope,omitempty"`
+	// ArchivesPending reports that a scope=live read left registered archive
+	// sources unconsulted (or that discovery failed, leaving their existence
+	// unknown) — the client's signal that a follow-up full read is required
+	// before this list may present itself as complete. False when nothing
+	// further exists to read, which is the client's signal to skip phase 2
+	// entirely. Always false on a merged read. NO omitempty: false is a
+	// meaningful answer ("nothing further to read"), and eliding it left a
+	// non-browser client unable to tell that from an older server that
+	// ignored scope entirely.
+	ArchivesPending bool `json:"archives_pending"`
 }
 
 type recoverResponse struct {
@@ -307,7 +322,7 @@ func (s *Server) fetch(ctx context.Context, b *bundle, opts query.Options) ([]qu
 		DBName:         b.dbName,
 		NoArchive:      b.noArchive,
 		AllowGaps:      true,
-		ArchiveFetcher: parquetquery.Fetch,
+		ArchiveFetcher: s.archiveFetch(),
 	})
 }
 
@@ -395,6 +410,17 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		lpp = n
 	}
+	// scope=live (#1414): serve the live index only and say what was left
+	// unread, so the client can render immediately and complete in the
+	// background. A 400 on anything else, never a silent fall back to the
+	// full read: a client that believes it asked for the fast phase must not
+	// be handed the slow one with no way to tell.
+	scope := q.Get("scope")
+	if scope != "" && scope != "live" {
+		writeJSONError(w, http.StatusBadRequest, `scope must be "live" when set`)
+		return
+	}
+	liveOnly := scope == "live"
 	p := filterParams{
 		Schema:        q.Get("schema"),
 		Table:         q.Get("table"),
@@ -464,7 +490,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// row is not a paging escape hatch for pulling the index into a browser.
 	pageLimit := opts.Limit
 	opts.Limit = pageLimit + 1
-	rows, plan, excl, diverged, archivesElided, err := s.fetchRestricted(r.Context(), r, b, opts)
+	rows, plan, excl, skipped, diverged, archivesElided, err := s.fetchRestrictedScoped(r.Context(), r, b, opts, liveOnly)
 	if err != nil {
 		writeFetchError(w, err)
 		return
@@ -479,7 +505,29 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// served fast because the archives provably could not change it must SAY
 	// the archives went unread — but as an info NOTE (#1365): it is a benign
 	// audit fact, not an incident.
-	warnings, notes := responseAdvisories(plan, excl, diverged, archivesElided, archiveElisionNote())
+	//
+	// A scope=live page assembles through liveScopeAdvisories instead: the
+	// planner's gap classification is wrong by construction there (it labels
+	// archived hours "rotated and not archived"), and the partiality marker is
+	// a WARNING with pending counted by the same discovery the full read runs.
+	var warnings, notes []string
+	pending := 0
+	if liveOnly {
+		if !excl.any() {
+			if srcs, derr := query.ResolveArchiveSources(r.Context(), b.db); derr != nil {
+				// The warning tells the operator discovery failed; this log
+				// line is the only server-side trace of WHY for a scope=live
+				// call that never runs a phase 2 (a direct API client).
+				slog.Warn("events scope=live: archive source discovery failed", "error", derr)
+				pending = -1
+			} else {
+				pending = len(srcs)
+			}
+		}
+		warnings, notes = liveScopeAdvisories(plan, excl, pending)
+	} else {
+		warnings, notes = responseAdvisories(plan, excl, skipped, diverged, archivesElided, archiveElisionNote())
+	}
 	// The preview mirrors the script, so it mirrors this too: an empty preview
 	// under an anchor is the same ambiguity, rendered as "0 affected event(s)".
 	warnings = append(anchorMissedWarning(opts, len(rows)), warnings...)
@@ -490,6 +538,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		HasMore:  hasMore,
 		Warnings: warnings,
 		Notes:    notes,
+	}
+	if liveOnly {
+		resp.Scope = "live"
+		resp.ArchivesPending = pending != 0
 	}
 	// The cursor comes from the last row of the page the client is about to
 	// see, in the direction it is reading. Built server-side from a served row
@@ -578,7 +630,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// Coverage gaps come back in plan.GapHours and are surfaced as warnings
 	// below — the recover UI renders them, so an incomplete-coverage undo is
 	// flagged to the operator rather than silently presented as complete.
-	rows, plan, excl, diverged, archivesElided, err := s.fetchRestricted(r.Context(), r, b, opts)
+	rows, plan, excl, skipped, diverged, archivesElided, err := s.fetchRestricted(r.Context(), r, b, opts)
 	if err != nil {
 		writeFetchError(w, err)
 		return
@@ -591,7 +643,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// archives, and the reviewer of an undo script must see that stated — as
 	// an info note (#1365), since the skip is correctness-preserving —
 	// worded for this surface (a reversal has a window, not pages).
-	warnings, notes := responseAdvisories(plan, excl, diverged, archivesElided, recoverArchiveElisionNote())
+	warnings, notes := responseAdvisories(plan, excl, skipped, diverged, archivesElided, recoverArchiveElisionNote())
 	// Prepended: on an empty anchored reversal this is the only thing the
 	// response says, and it has to be the first thing read.
 	warnings = append(anchorMissedWarning(opts, len(rows)), warnings...)
