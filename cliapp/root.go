@@ -38,7 +38,7 @@ var rootCmd = &cobra.Command{
 	Short: "MySQL binlog indexer and recovery tool",
 	Long: `Bintrail parses MySQL ROW-format binary logs, indexes every row event into a
 MySQL table with full before/after images, and provides query and recovery
-capabilities. The index is self-contained — recovery does not depend on
+capabilities. The index is self-contained; recovery does not depend on
 binlog files still existing on disk.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		observe.Setup(os.Stderr, logFormat, logLevel)
@@ -126,15 +126,15 @@ func Main(version, commitSHA, buildDate string) int {
 func exitCodeFor(reason agent.FatalReason) (int, string) {
 	switch reason {
 	case agent.FatalRateLimited:
-		return 65, "agent rate-limited by server — contact support"
+		return 65, "agent rate-limited by server; contact support"
 	case agent.FatalMissingCredentials:
-		return 64, "missing credentials — set --api-key or BINTRAIL_API_KEY"
+		return 64, "missing credentials: set --api-key or BINTRAIL_API_KEY"
 	case agent.FatalWrongTenantMode:
-		return 64, "tenant is not in BYOS mode — WebSocket channel unavailable"
+		return 64, "tenant is not in BYOS mode; WebSocket channel unavailable"
 	case agent.FatalInvalidKey:
 		return 64, "invalid or revoked API key"
 	default:
-		return 64, "agent rejected by server — fix credentials/config and restart manually"
+		return 64, "agent rejected by server; fix credentials/config and restart manually"
 	}
 }
 
