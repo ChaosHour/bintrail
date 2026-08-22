@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.65.0] - 2026-08-22
+
+### Added
+- **The console's Baselines page is now Backups, and acts like it** (#1427).
+  Each snapshot row expands to its tables with sizes, the total weight, and
+  how long the backup took: exact for runs this daemon performed (a new
+  console-local run history records dumps, refreshes and restores), bounded
+  by file timestamps otherwise. Every backup downloads as one tar.gz stream
+  (local and S3 stores; markers and the integrity manifest included, so what
+  lands on disk is a complete discoverable snapshot; `_INCOMPLETE` snapshots
+  are refused; a mid-stream failure cuts the connection so a truncated
+  archive can never look like a success; audited as
+  `console/baseline.download`, aborted streams included). A point-in-time
+  restore folds the backup at-or-before a chosen instant forward through the
+  index and publishes the result as a NEW discoverable snapshot named by
+  that instant — the periodic refresh's engine with an operator-chosen
+  anchor, same single-flight and fail-closed refusals; it needs the server's
+  own local backup directory and is gated by the new `baseline_restore`
+  capability. A running dump, restore or refresh paints a live in-progress
+  region and the page settles itself when the run finishes. The rename is
+  UI-only: routes, APIs, CLI commands, flags and env names keep "baseline".
+  S3 listings now carry sizes and timestamps (`storage.InfoLister`), and the
+  four new routes are classified in the console's route-permission table:
+  the download requires `query:execute`, because it is a full unredacted
+  copy of every baseline row.
+
+### Changed
+- **Every user-visible sentence says it in plain words** (#1426). The verify
+  verdicts stopped talking about "event budgets" and "chains": a truncated
+  recover-inputs run says what was read and what each remedy buys, CLI flags
+  never reach console text without an explicit "(CLI: ...)" marker, and
+  cause-neutral wording replaced claims the walk cannot know. Roughly 200
+  em-dash strings across the console, CLI errors and help, MCP tool output
+  and generated-file headers were rewritten to plain punctuation, and docs
+  that transcribe CLI output were re-synced. The verification page's counts
+  column sizes to its content instead of painting over the reason column.
+
 ## [0.64.0] - 2026-08-22
 
 ### Added
