@@ -60,13 +60,22 @@ type baselinesResponse struct {
 	Staleness string `json:"staleness,omitempty"`
 }
 
-// selectedServerID is the id the request selected, defaulting to the reserved
-// boot entry — the same rule the rest of the handler uses.
-func selectedServerID(r *http.Request) string {
-	if id := r.Header.Get("X-Bintrail-Server"); id != "" {
+// selectedServerID is the id the request EFFECTIVELY selected: the header
+// when present, else the same default connManager.Resolve("") lands on. The
+// old fallback was the literal "default", which under HideBoot names an entry
+// the selection never resolves to — so the refresh chip and the run-history
+// join silently missed on every fresh tab of a single-server watch.
+func (s *Server) selectedServerID(r *http.Request) string {
+	if id := r.Header.Get(serverHeader); id != "" {
 		return id
 	}
-	return "default"
+	if id := s.cm.defaultID(); id != "" {
+		return id
+	}
+	// HideBoot with an empty registry: defaultID has nothing to name, but
+	// Resolve("") serves the hidden boot bundle — and the refresh loop
+	// registers that server's runs under the boot id.
+	return bootServerID
 }
 
 // handleBaselines serves GET /api/baselines: a read-only listing of the
@@ -86,12 +95,12 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 	if sessionRestricted(r) {
 		recordProfileGateDeny(r, "baselines")
 		writeJSONError(w, http.StatusForbidden,
-			"baseline listings are unavailable while an access-control profile is active: baseline reads aren't redacted")
+			"backup listings are unavailable while an access-control profile is active: baseline reads aren't redacted")
 		return
 	}
 	resp := baselinesResponse{Reconstruct: b.baselineConfigured, Snapshots: []baselineSnapshotDTO{}}
 	if s.baselineRefresh != nil {
-		if st := s.baselineRefresh.RefreshStatus(selectedServerID(r)); st.State != "idle" {
+		if st := s.baselineRefresh.RefreshStatus(s.selectedServerID(r)); st.State != "idle" {
 			resp.Refresh = &st
 		}
 	}
@@ -120,10 +129,7 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 	// fabricated verdict — an unopened bundle connection or an unreadable
 	// index yields the explicit "unknown".
 	var floor status.DeltaFloor
-	serverID := r.Header.Get("X-Bintrail-Server")
-	if serverID == "" {
-		serverID = "default"
-	}
+	serverID := s.selectedServerID(r)
 	if b.db == nil {
 		slog.Warn("console: baseline staleness not evaluated — the server's index connection is not open", "server", serverID)
 	} else if f, err := status.OldestDeltaFromDB(r.Context(), b.db, b.dbName); err != nil {
