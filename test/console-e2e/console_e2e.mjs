@@ -13,6 +13,8 @@
 // optional PW_CHANNEL (e.g. "chrome" to use system Chrome instead of the
 // playwright-managed chromium).
 import { chromium } from "playwright";
+import zlib from "node:zlib";
+import { execSync } from "node:child_process";
 
 const URL = process.env.CONSOLE_URL || "http://127.0.0.1:8090";
 const TOKEN = process.env.CONSOLE_TOKEN || "";
@@ -2089,7 +2091,11 @@ try {
   const bkRestore = await page.evaluate(async () => {
     const out = { cap: !!capsCache.baseline_restore };
     const v = document.querySelector(".view");
-    const card = v.querySelector(".bk-restore");
+    // Two cards wear .bk-restore since the sql-export card landed; pick the
+    // restore one by its summary or this guard drifts to the wrong card the
+    // first time their gates diverge.
+    const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
+      /Restore to a moment/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
     out.card = !!card;
     if (!card) return out;
     card.open = true;
@@ -2148,6 +2154,202 @@ try {
   (bkErr.noFlags && bkErr.bothTables && bkErr.terminated)
     ? ok("backups: fold refusals lose their CLI flags without losing table identities")
     : bad("backups: fold refusals lose their CLI flags without losing table identities", JSON.stringify(bkErr));
+
+  // Scenario 15f — the made-to-measure .sql backup: pick an instant, the
+  // daemon folds the nearest earlier backup forward through the index and
+  // hands out a mydumper-format dump. Driven END TO END against the fixture:
+  // baseline rows 1,2,4 + INSERT id 3 + UPDATE id 1 (-> shipped) + DELETE
+  // id 2, built at TT_AT (after all three), so the dump must carry the folded
+  // state — not the baseline, not the raw events.
+  const sqlxGate = await page.evaluate(async () => {
+    const out = { cap: !!capsCache.sql_export };
+    const v = document.querySelector(".view");
+    const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
+      /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+    out.card = !!card;
+    if (!card) return out;
+    card.open = true;
+    const input = card.querySelector("input");
+    out.prefilled = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(input.value);
+    // Before any build the download must refuse with words, not stream bytes.
+    const headers = TOKEN ? { Authorization: ["Bearer", TOKEN].join(" ") } : {};
+    if (currentServer) headers["X-Bintrail-Server"] = currentServer;
+    const res = await fetch("/api/servers/" + encodeURIComponent(currentServer) + "/sql-export/download", { headers });
+    out.preStatus = res.status;
+    try { out.preBody = (await res.json()).error || ""; } catch (_) { out.preBody = ""; }
+    // A bad instant is refused inline, next to the input.
+    input.value = "not-a-time";
+    Array.from(card.querySelectorAll("button")).find((b) => b.textContent === "Build").click();
+    for (let i = 0; i < 40; i++) {
+      const msg = card.querySelector(".form-msg.err");
+      if (msg && !msg.hidden && msg.textContent) { out.inlineErr = msg.textContent; break; }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return out;
+  });
+  (sqlxGate.cap && sqlxGate.card && sqlxGate.prefilled)
+    ? ok("sqlx: the build card renders under its capability, prefilled with the newest backup time")
+    : bad("sqlx: the build card renders under its capability, prefilled with the newest backup time", JSON.stringify(sqlxGate));
+  (sqlxGate.preStatus === 409 && /build one first/.test(sqlxGate.preBody))
+    ? ok("sqlx: downloading before any build refuses with words")
+    : bad("sqlx: downloading before any build refuses with words", JSON.stringify({ s: sqlxGate.preStatus, b: sqlxGate.preBody }));
+  (sqlxGate.inlineErr && /UTC time/.test(sqlxGate.inlineErr))
+    ? ok("sqlx: a bad instant is refused inline")
+    : bad("sqlx: a bad instant is refused inline", JSON.stringify(sqlxGate.inlineErr));
+
+  // The gate arms, fixture-driven through the REAL builder (a daemon without
+  // the exporter cannot be photographed from this one). The on-arm is the
+  // vacuousness control: a builder that always returned null would pass the
+  // off-arm alone.
+  const sqlxGateOff = await page.evaluate(() => {
+    const cur = { id: "srv-fix", kind: "registry" };
+    const b = { configured: true, snapshots: [{ time: "2026-06-10 12:00:00" }] };
+    const st = { sql_export: { state: "idle" } };
+    const keep = capsCache.sql_export;
+    capsCache.sql_export = false;
+    const off = backupSQLExportCard(cur, b, st);
+    capsCache.sql_export = keep;
+    return { off: !!off, on: !!backupSQLExportCard(cur, b, st) };
+  });
+  (!sqlxGateOff.off && sqlxGateOff.on)
+    ? ok("sqlx: the capability gates the card (off absent, on present)")
+    : bad("sqlx: the capability gates the card (off absent, on present)", JSON.stringify(sqlxGateOff));
+
+  // The real build. TT_AT sits after every fixture event; the fold reads the
+  // baseline AND the index. Poll the status endpoint, not the DOM — the page
+  // re-renders itself while the run region is up.
+  const sqlxRun = await page.evaluate(async (TT_AT) => {
+    const v = document.querySelector(".view");
+    const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
+      /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+    if (!card) return { err: "card vanished" };
+    card.open = true;
+    const input = card.querySelector("input");
+    input.value = TT_AT;
+    Array.from(card.querySelectorAll("button")).find((b) => b.textContent === "Build").click();
+    for (let i = 0; i < 240; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      try {
+        const st = await api("/api/servers/" + encodeURIComponent(currentServer) + "/sql-export");
+        if (st.sql_export && st.sql_export.state !== "running" && st.sql_export.state !== "idle") return st.sql_export;
+      } catch (_) { /* transient; keep polling */ }
+    }
+    return { err: "build never settled" };
+  }, TT_AT);
+  (sqlxRun.state === "succeeded" && sqlxRun.rows === 3 && sqlxRun.tables === 1 && sqlxRun.bytes > 0)
+    ? ok("sqlx: the fold succeeds over the real fixture with the folded row count (1+3+4, not 4 rows) and a byte count")
+    : bad("sqlx: the fold succeeds over the real fixture with the folded row count (1+3+4, not 4 rows) and a byte count", JSON.stringify(sqlxRun));
+
+  // Settle: the watcher re-renders when the run finishes; the card must come
+  // back wearing the Ready line and a download action.
+  await page.waitForFunction(() => {
+    const v = document.querySelector(".view");
+    if (!v) return false;
+    const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
+      /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+    return !!card && /Ready: every table as of/.test(card.textContent) &&
+      Array.from(card.querySelectorAll("button")).some((b) => /Download \.sql backup/.test(b.textContent));
+  }, { timeout: 30000 });
+  ok("sqlx: after the run settles the card offers the finished build for download");
+
+  // The download wire: gunzip the archive in node and read the actual SQL.
+  const sqlxDl = await page.evaluate(async () => {
+    const headers = TOKEN ? { Authorization: ["Bearer", TOKEN].join(" ") } : {};
+    if (currentServer) headers["X-Bintrail-Server"] = currentServer;
+    const res = await fetch("/api/servers/" + encodeURIComponent(currentServer) + "/sql-export/download", { headers });
+    const buf = new Uint8Array(await res.arrayBuffer());
+    return { status: res.status, cd: res.headers.get("Content-Disposition") || "", bytes: Array.from(buf) };
+  });
+  let sqlxText = "";
+  try { sqlxText = zlib.gunzipSync(Buffer.from(sqlxDl.bytes)).toString("latin1"); } catch (_) { /* asserted below */ }
+  (sqlxDl.status === 200 && /dbtrail-sql-.*\.tar\.gz/.test(sqlxDl.cd) && sqlxText.length > 0)
+    ? ok("sqlx: the download streams a gzip archive with an attachment name")
+    : bad("sqlx: the download streams a gzip archive with an attachment name", JSON.stringify({ s: sqlxDl.status, cd: sqlxDl.cd, n: sqlxDl.bytes.length }));
+  (/-schema\.sql/.test(sqlxText) && /CREATE TABLE/.test(sqlxText) && /INSERT INTO/.test(sqlxText) && /metadata/.test(sqlxText))
+    ? ok("sqlx: the archive holds loadable SQL — schema, rows and the coordinates file")
+    : bad("sqlx: the archive holds loadable SQL — schema, rows and the coordinates file", sqlxText.slice(0, 200));
+  (/shipped/.test(sqlxText) && !/b@example\.com/.test(sqlxText) && !/_SUCCESS/.test(sqlxText))
+    ? ok("sqlx: the dump carries the FOLDED state (the update landed, the deleted row is gone, the build markers stay out)")
+    : bad("sqlx: the dump carries the FOLDED state (the update landed, the deleted row is gone, the build markers stay out)", JSON.stringify({ shipped: /shipped/.test(sqlxText), deleted: /b@example\.com/.test(sqlxText), marker: /_SUCCESS/.test(sqlxText) }));
+
+  // 15f gap arm — the fail-closed contract on the REAL path: stamp a
+  // permanent capture gap inside the window, and the build must refuse
+  // (AllowGaps is hardwired false at the call site — this is the guard that
+  // goes red if anyone ever plumbs it through), the failure must render
+  // inline WITHOUT the engine's CLI flag, and the previous artifact must no
+  // longer be downloadable (the failed build's wipe revoked it).
+  const IDX_DB = process.env.E2E_IDX_DB || "";
+  const MYSQL_CTR = process.env.E2E_MYSQL_CONTAINER || "";
+  if (IDX_DB && MYSQL_CTR) {
+    // STRICTLY inside the window (snapshot, TT_AT]: TT_AT itself sits on the
+    // inclusive upper bound, so stamping there keeps working only for as
+    // long as that bound stays inclusive — an interior instant does not
+    // depend on it.
+    const gapAt = new Date(new Date(TT_AT.replace(" ", "T") + "Z").getTime() - 60e3)
+      .toISOString().slice(0, 19).replace("T", " ");
+    const mysqlIdx = (sql) => {
+      try {
+        return execSync(
+          ["docker", "exec", "-i", MYSQL_CTR, "mysql", "-uroot", "-ptestroot", IDX_DB].join(" "),
+          { input: sql, stdio: ["pipe", "pipe", "pipe"] });
+      } catch (e) {
+        e.message += " :: " + String(e.stderr || "").slice(0, 400);
+        throw e;
+      }
+    };
+    try {
+      mysqlIdx("INSERT INTO stream_state (id, mode, binlog_file, binlog_position, last_checkpoint, server_id, gap_lost_at, gap_lost_detail) " +
+        "VALUES (1,'position','binlog.000001',400,NOW(),99,'" + gapAt + "','e2e manufactured gap');");
+      const gapRun = await page.evaluate(async (TT_AT) => {
+        await api("/api/servers/" + encodeURIComponent(currentServer) + "/sql-export",
+          { method: "POST", body: { at: TT_AT } });
+        for (let i = 0; i < 240; i++) {
+          await new Promise((r) => setTimeout(r, 500));
+          try {
+            const st = await api("/api/servers/" + encodeURIComponent(currentServer) + "/sql-export");
+            if (st.sql_export && st.sql_export.state !== "running") return st.sql_export;
+          } catch (_) { /* transient */ }
+        }
+        return { err: "never settled" };
+      }, TT_AT);
+      (gapRun.state === "failed" && /capture gap/.test(gapRun.last_error || ""))
+        ? ok("sqlx: a stamped capture gap fails the build closed")
+        : bad("sqlx: a stamped capture gap fails the build closed", JSON.stringify(gapRun));
+      const gapDl = await page.evaluate(async () => {
+        const headers = TOKEN ? { Authorization: ["Bearer", TOKEN].join(" ") } : {};
+        if (currentServer) headers["X-Bintrail-Server"] = currentServer;
+        const res = await fetch("/api/servers/" + encodeURIComponent(currentServer) + "/sql-export/download", { headers });
+        return res.status;
+      });
+      gapDl === 409
+        ? ok("sqlx: the failed build revoked the previous artifact (download refuses)")
+        : bad("sqlx: the failed build revoked the previous artifact (download refuses)", "status " + gapDl);
+      await page.evaluate(() => navigate("baselines"));
+      await page.waitForFunction(() => {
+        const v = document.querySelector(".view");
+        if (!v) return false;
+        const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
+          /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+        return !!card && /Last build failed/.test(card.textContent);
+      }, { timeout: 15000 });
+      const gapMsg = await page.evaluate(() => {
+        const v = document.querySelector(".view");
+        const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
+          /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+        return card.textContent;
+      });
+      (/capture gap/.test(gapMsg) && !/--allow-gaps/.test(gapMsg))
+        ? ok("sqlx: the gap refusal renders inline without the engine's CLI flag")
+        : bad("sqlx: the gap refusal renders inline without the engine's CLI flag", gapMsg.slice(0, 300));
+    } finally {
+      // Scenario 15v's verify reads this table; a cleanup failure must be its
+      // own loud finding, not a mask over the in-flight one.
+      try { mysqlIdx("DELETE FROM stream_state;"); }
+      catch (e) { bad("sqlx: gap fixture cleanup failed", String((e && e.message) || e)); }
+    }
+  } else {
+    bad("sqlx: gap arm env missing", "E2E_IDX_DB/E2E_MYSQL_CONTAINER not passed by run.sh");
+  }
 
   // Scenario 15d — Protect group (#1384). Baselines and verification moved off
   // Settings > Storage into their own routes. Two halves must hold TOGETHER,

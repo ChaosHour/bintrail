@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,6 +59,12 @@ type baselineSupervisor struct {
 	// a third kind alongside jobs (dumps) and refreshes, all sharing the
 	// single-flight in busyLocked.
 	restores map[string]*console.BaselineStatus
+	// exports tracks custom .sql backup builds, keyed by server id — the
+	// fourth job kind under the shared single-flight.
+	exports map[string]*console.BaselineStatus
+	// exportDirs is each server's CURRENT build directory (unique per build;
+	// see sqlExportRoot for why builds never share a path).
+	exportDirs map[string]string
 	// history, when non-nil, records every finished run (dump/refresh/
 	// restore) so the backups page can report exact durations. Failures to
 	// save are logged, never returned: history must not fail a run.
@@ -71,7 +78,21 @@ type baselineSupervisor struct {
 // newBaselineSupervisor builds a supervisor bound to the daemon context. The
 // staging dir is created lazily per run. lockMode selects the MySQL dump's sync
 // mode for every run this supervisor executes — see the field doc.
+// sweepSQLExportStaging removes sql-export staging left by previous
+// processes: a restart empties the in-memory exports map, so any dump a
+// dead process built is unreachable from the API — remove the plaintext
+// rows rather than leave them on disk indefinitely. Called from watch
+// startup UNCONDITIONALLY as well as from the supervisor constructor,
+// because a restart that turned the baseline features off would otherwise
+// keep the old artifact forever (no supervisor would ever sweep it).
+func sweepSQLExportStaging(stagingDir string) {
+	if err := os.RemoveAll(filepath.Join(stagingDir, "sql-export")); err != nil {
+		slog.Warn("could not sweep stale sql-export staging", "error", err)
+	}
+}
+
 func newBaselineSupervisor(ctx context.Context, stagingDir string, lockMode baseline.LockMode) *baselineSupervisor {
+	sweepSQLExportStaging(stagingDir)
 	return &baselineSupervisor{
 		ctx:        ctx,
 		stagingDir: stagingDir,
@@ -79,6 +100,8 @@ func newBaselineSupervisor(ctx context.Context, stagingDir string, lockMode base
 		jobs:       make(map[string]*console.BaselineStatus),
 		refreshes:  make(map[string]*console.BaselineStatus),
 		restores:   make(map[string]*console.BaselineStatus),
+		exports:    make(map[string]*console.BaselineStatus),
+		exportDirs: make(map[string]string),
 	}
 }
 
