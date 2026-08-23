@@ -350,6 +350,16 @@ type Options struct {
 
 	DenyTables    []SchemaTable       // tables excluded by RBAC profile
 	RedactColumns []SchemaTableColumn // column values nulled out by RBAC profile
+	// AllowTables, when non-empty, switches to allow-list mode: only rows from
+	// the listed tables are returned (session-policy restrictions, #1449).
+	// DenyTables still composes over it — a table both allowed and denied
+	// yields nothing.
+	AllowTables []SchemaTable
+	// AllowColumns is the column-level allow list: for each table appearing in
+	// it, every column of that table's row images NOT listed is nulled by the
+	// redaction pass (the complement of RedactColumns, which names the columns
+	// to null). Tables not appearing in it are untouched by this rule.
+	AllowColumns []SchemaTableColumn
 	// ProfileActive is set by callers whenever a profile NAME was supplied,
 	// even if it resolved to zero deny/redact rules (a nonexistent or empty
 	// profile). It forces the redaction pass so QueryText/QueryHash are
@@ -439,7 +449,7 @@ func (e *Engine) Fetch(ctx context.Context, opts Options) ([]ResultRow, error) {
 	// so rows of an ALLOWED table can carry a statement whose literals
 	// belong to a denied sibling table — see applyRedaction (#699).
 	if opts.RedactionActive() {
-		applyRedaction(results, opts.RedactColumns)
+		applyRedaction(results, opts.RedactColumns, opts.AllowColumns)
 	}
 	return results, nil
 }
@@ -454,7 +464,8 @@ func (e *Engine) Fetch(ctx context.Context, opts Options) ([]ResultRow, error) {
 // Server.rbacActive and mcptools recover-cascade — which cannot call this
 // method; they are known, not overlooked.)
 func (o Options) RedactionActive() bool {
-	return o.ProfileActive || len(o.RedactColumns) > 0 || len(o.DenyTables) > 0
+	return o.ProfileActive || len(o.RedactColumns) > 0 || len(o.DenyTables) > 0 ||
+		len(o.AllowTables) > 0 || len(o.AllowColumns) > 0
 }
 
 // ErrQueryHashUnderProfile is returned when a statement-digest filter is
@@ -474,11 +485,28 @@ func (o Options) RedactionActive() bool {
 var ErrQueryHashUnderProfile = errors.New(
 	"statement-digest filter unavailable while an RBAC profile is active: the digest is withheld from every returned row, so filtering on it would confirm the statement that redaction hides")
 
+// ErrChangedColumnUnderRedaction is returned when a changed-column filter is
+// combined with COLUMN-LEVEL redaction rules (RedactColumns or AllowColumns,
+// #1449). The reasoning is ErrQueryHashUnderProfile's, transferred: the
+// redaction pass nulls a hidden column's VALUES, but honouring a filter on
+// "rows where <hidden column> changed" confirms that column's existence,
+// change timing and affected PKs one candidate at a time — the answer the
+// nulling withholds. Deny-table-only rules do not trip this: no column is
+// hidden there, only whole tables, which the table clauses already enforce.
+//
+// The message names no CLI flag, for the same MCP-client reason as the
+// digest refusal.
+var ErrChangedColumnUnderRedaction = errors.New(
+	"changed-column filter unavailable while column-level redaction is active: hidden columns are nulled in every returned row, so filtering on one would confirm the changes that redaction hides")
+
 // ValidateStatementFilter rejects option combinations the redaction contract
 // cannot honour. Called by Fetch, so every engine path is covered.
 func (o Options) ValidateStatementFilter() error {
 	if o.QueryHash != "" && o.RedactionActive() {
 		return ErrQueryHashUnderProfile
+	}
+	if o.ChangedColumn != "" && (len(o.RedactColumns) > 0 || len(o.AllowColumns) > 0) {
+		return ErrChangedColumnUnderRedaction
 	}
 	return nil
 }
@@ -825,6 +853,25 @@ func buildQuery(opts Options) (string, []any) {
 			  AND table_flags.flag        = ?)`)
 		args = append(args, opts.Flag)
 	}
+	if len(opts.AllowTables) > 0 {
+		// Allow-list mode (#1449): only the listed tables survive. Emitted
+		// BEFORE the deny clauses so the composed WHERE reads allow-then-deny,
+		// though AND makes the order semantically irrelevant — deny always wins.
+		//
+		// BINARY, asymmetrically on purpose: the columns' collation is the
+		// server default, commonly case-insensitive, and a case-insensitive
+		// ALLOW fails open — an entry for `users` would also serve a distinct
+		// `Users` table's rows (lower_case_table_names=0 hosts). Deny stays on
+		// the column collation: case-insensitive there withholds MORE, the
+		// safe direction. BINARY rather than a COLLATE clause so an index
+		// whose columns are not utf8mb4 cannot error the comparison.
+		ors := make([]string, len(opts.AllowTables))
+		for i, at := range opts.AllowTables {
+			ors[i] = "(BINARY schema_name = ? AND BINARY table_name = ?)"
+			args = append(args, at.Schema, at.Table)
+		}
+		where = append(where, "("+strings.Join(ors, " OR ")+")")
+	}
 	for _, dt := range opts.DenyTables {
 		where = append(where, "NOT (schema_name = ? AND table_name = ?)")
 		args = append(args, dt.Schema, dt.Table)
@@ -897,25 +944,63 @@ func buildQuery(opts Options) (string, []any) {
 // values. This mirrors the codebase's "a surface that cannot honor redaction
 // is disabled entirely under a profile" pattern (archives, cascade,
 // reconstruct).
-func applyRedaction(rows []ResultRow, redact []SchemaTableColumn) {
+// The allow parameter is the column-level allow list (Options.AllowColumns,
+// #1449): for a table appearing in it, every row-image column NOT listed for
+// that table is nulled — the complement of redact, composed so that an
+// explicit redact entry wins even over a column the allow list names.
+func applyRedaction(rows []ResultRow, redact, allow []SchemaTableColumn) {
 	type colKey struct{ schema, table, column string }
+	type tblKey struct{ schema, table string }
 	set := make(map[colKey]struct{}, len(redact))
 	for _, r := range redact {
 		set[colKey{r.Schema, r.Table, r.Column}] = struct{}{}
+	}
+	allowed := make(map[tblKey]map[string]struct{}, len(allow))
+	for _, a := range allow {
+		k := tblKey{a.Schema, a.Table}
+		if allowed[k] == nil {
+			allowed[k] = make(map[string]struct{})
+		}
+		allowed[k][a.Column] = struct{}{}
 	}
 	for i := range rows {
 		r := &rows[i]
 		r.QueryText = nil
 		r.QueryHash = nil
+		allowSet, allowListed := allowed[tblKey{r.SchemaName, r.TableName}]
+		null := func(col string) bool {
+			if _, deny := set[colKey{r.SchemaName, r.TableName, col}]; deny {
+				return true
+			}
+			if allowListed {
+				_, ok := allowSet[col]
+				return !ok
+			}
+			return false
+		}
 		for col := range r.RowBefore {
-			if _, ok := set[colKey{r.SchemaName, r.TableName, col}]; ok {
+			if null(col) {
 				r.RowBefore[col] = nil
 			}
 		}
 		for col := range r.RowAfter {
-			if _, ok := set[colKey{r.SchemaName, r.TableName, col}]; ok {
+			if null(col) {
 				r.RowAfter[col] = nil
 			}
+		}
+		// ChangedColumns carries column NAMES, and a hidden column's name is
+		// itself what the restriction withholds — under an allow list every
+		// unlisted column of the table would otherwise be enumerated by name
+		// on every UPDATE row. Strip the hidden names; rows of tables with no
+		// column rule are untouched.
+		if r.ChangedColumns != nil && (allowListed || len(set) > 0) {
+			kept := r.ChangedColumns[:0:0]
+			for _, col := range r.ChangedColumns {
+				if !null(col) {
+					kept = append(kept, col)
+				}
+			}
+			r.ChangedColumns = kept
 		}
 	}
 }

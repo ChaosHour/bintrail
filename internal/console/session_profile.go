@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
@@ -39,13 +40,24 @@ func sessionProfileName(r *http.Request) string {
 	return ""
 }
 
-// sessionRestricted reports whether the request's session carries a data
-// profile. It is the single predicate the raw/baseline-data gates key on
-// (reconstruct, baselines, recover-cascade, verify, extension views): those
-// surfaces cannot honor per-column redaction, so a profiled session is refused
-// outright rather than shown unredacted data.
+// sessionRestrictions returns the direct table/column restrictions the
+// request's session policy carries (#1449), or nil. Nil-safe on both ends —
+// SessionRestrictions methods accept a nil receiver.
+func sessionRestrictions(r *http.Request) *ext.SessionRestrictions {
+	if p := policyFrom(r.Context()); p != nil {
+		return p.Restrictions
+	}
+	return nil
+}
+
+// sessionRestricted reports whether the request's session scopes what data it
+// may read — a data profile, direct policy restrictions (#1449), or both. It
+// is the single predicate the raw/baseline-data gates key on (reconstruct,
+// baselines, recover-cascade, verify, extension views): those surfaces cannot
+// honor per-column redaction, so a restricted session is refused outright
+// rather than shown unredacted data.
 func sessionRestricted(r *http.Request) bool {
-	return sessionProfileName(r) != ""
+	return policyFrom(r.Context()).DataRestricted()
 }
 
 // rbacActiveFor folds the request's session profile into the process-global
@@ -185,28 +197,60 @@ func (c *profileRuleCache) invalidate(id string) {
 	}
 }
 
-// applySessionProfile unions the request session's data-profile rules — resolved
-// against the selected server's index — onto opts, on top of the startup floor
-// buildOptions already set, and forces ProfileActive so query_text/query_hash
-// stay withheld (#699). A profile that does not exist on the selected server is a
-// *profileNotFoundError (handler → 403). No session profile → opts unchanged.
+// applySessionProfile unions the request session's data restrictions onto opts,
+// on top of the startup floor buildOptions already set, and forces
+// ProfileActive so query_text/query_hash stay withheld (#699). Two sources,
+// both applied when both are present:
+//
+//   - a data-profile NAME (resolved against the selected server's index at
+//     request time; nonexistent → *profileNotFoundError, handler → 403);
+//   - direct policy restrictions (#1449), carried by the session itself and
+//     needing no index resolution.
+//
+// Neither present → opts unchanged.
 func (s *Server) applySessionProfile(ctx context.Context, r *http.Request, b *bundle, opts query.Options) (query.Options, error) {
 	profile := sessionProfileName(r)
-	if profile == "" {
+	rest := sessionRestrictions(r)
+	if profile == "" && rest.Empty() {
 		return opts, nil
-	}
-	e, err := s.sessionProfiles.load(ctx, s.selectedID(r)+"\x00"+profile, b.db, profile)
-	if err != nil {
-		return opts, fmt.Errorf("resolve session profile %q: %w", profile, err)
-	}
-	if !e.exists {
-		return opts, &profileNotFoundError{profile}
 	}
 	// Union with the startup floor: the startup profile is the floor, a session
 	// profile can only narrow further. Copy rather than append-in-place so the
 	// startup slices (shared across requests) are never mutated.
-	opts.DenyTables = append(append([]query.SchemaTable(nil), opts.DenyTables...), e.deny...)
-	opts.RedactColumns = append(append([]query.SchemaTableColumn(nil), opts.RedactColumns...), e.redact...)
+	opts.DenyTables = append([]query.SchemaTable(nil), opts.DenyTables...)
+	opts.RedactColumns = append([]query.SchemaTableColumn(nil), opts.RedactColumns...)
+	if profile != "" {
+		e, err := s.sessionProfiles.load(ctx, s.selectedID(r)+"\x00"+profile, b.db, profile)
+		if err != nil {
+			return opts, fmt.Errorf("resolve session profile %q: %w", profile, err)
+		}
+		if !e.exists {
+			return opts, &profileNotFoundError{profile}
+		}
+		opts.DenyTables = append(opts.DenyTables, e.deny...)
+		opts.RedactColumns = append(opts.RedactColumns, e.redact...)
+	}
+	if !rest.Empty() {
+		for _, t := range rest.DenyTables {
+			opts.DenyTables = append(opts.DenyTables, query.SchemaTable{Schema: t.Schema, Table: t.Table})
+		}
+		for _, c := range rest.RedactColumns {
+			opts.RedactColumns = append(opts.RedactColumns, query.SchemaTableColumn{Schema: c.Schema, Table: c.Table, Column: c.Column})
+		}
+		// The allow lists have no startup-floor counterpart today (nothing
+		// else sets them on console options), but they get the same
+		// copy-before-append discipline as the deny slices anyway: the next
+		// caller who DOES pre-populate them from a shared slice must not
+		// discover cross-request mutation the hard way.
+		opts.AllowTables = append([]query.SchemaTable(nil), opts.AllowTables...)
+		opts.AllowColumns = append([]query.SchemaTableColumn(nil), opts.AllowColumns...)
+		for _, t := range rest.AllowTables {
+			opts.AllowTables = append(opts.AllowTables, query.SchemaTable{Schema: t.Schema, Table: t.Table})
+		}
+		for _, c := range rest.AllowColumns {
+			opts.AllowColumns = append(opts.AllowColumns, query.SchemaTableColumn{Schema: c.Schema, Table: c.Table, Column: c.Column})
+		}
+	}
 	opts.ProfileActive = true
 	return opts, nil
 }
@@ -286,7 +330,9 @@ type archiveExclusion struct {
 	// server: the whole console excludes archives (--no-archive, or a startup
 	// --profile, which implies it — see consoleapp/serve.go).
 	server bool
-	// profile: THIS session carries a data profile.
+	// profile: THIS session carries a data access policy — a profile name,
+	// direct restrictions (#1449), or both (sessionRestricted's verdict; the
+	// field keeps its original name).
 	profile bool
 }
 
@@ -329,10 +375,10 @@ func (e archiveExclusion) notice() string {
 			"implies it), so archived (rotated) hours are not searched. A short or empty result does not " +
 			"mean nothing happened in that window."
 	case e.profile:
-		return "Your session carries a data profile, so these results come from the LIVE INDEX ONLY: " +
+		return "Your session carries a data access policy, so these results come from the LIVE INDEX ONLY: " +
 			"archived (rotated) hours are not searched, because the archive path cannot apply the " +
-			"redaction your profile requires. A short or empty result does not mean nothing happened " +
-			"in that window; ask an operator without a data profile, or use the CLI, to search the archives."
+			"redaction your policy requires. A short or empty result does not mean nothing happened " +
+			"in that window; ask an operator without data restrictions, or use the CLI, to search the archives."
 	}
 	return ""
 }

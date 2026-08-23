@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -596,6 +597,18 @@ func TestHandleSchemasSnapshotUnavailable(t *testing.T) {
 				t.Fatalf("sqlmock: %v", err)
 			}
 			defer db.Close()
+			if c.profiled {
+				// handleSchemas resolves the session profile like every other
+				// data read (its name listings are filtered by the resolved
+				// scope), so the profile must exist — with no rules, since this
+				// test is about the snapshot flag, not filtering.
+				mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM profiles`).
+					WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+				mock.ExpectQuery(`SELECT DISTINCT tf.schema_name, tf.table_name\s+FROM access_rules`).
+					WillReturnRows(sqlmock.NewRows([]string{"schema_name", "table_name"}))
+				mock.ExpectQuery(`SELECT DISTINCT tf.schema_name, tf.table_name, tf.column_name`).
+					WillReturnRows(sqlmock.NewRows([]string{"schema_name", "table_name", "column_name"}))
+			}
 			mock.ExpectQuery("SELECT DISTINCT schema_name FROM binlog_events").
 				WillReturnRows(sqlmock.NewRows([]string{"schema_name"}))
 
@@ -655,4 +668,33 @@ func TestLoadResolverUnavailable(t *testing.T) {
 			t.Errorf("loadResolver = (%v, %v), want (nil, false)", r, unavailable)
 		}
 	})
+}
+
+// TestFilterTablesAndSchemas is the always-running pin of the picker
+// filters' asymmetry: allow matches exactly (case-insensitive allow fails
+// OPEN), deny matches case-insensitively (withholding more is safe). The
+// end-to-end behavior lives in the integration tier, which skips without
+// MySQL; this one cannot skip.
+func TestFilterTablesAndSchemas(t *testing.T) {
+	deny := []query.SchemaTable{{Schema: "App", Table: "Secrets"}}
+	allow := []query.SchemaTable{{Schema: "app", Table: "users"}}
+
+	got := filterTables("app", []string{"users", "Users", "secrets", "orders"}, deny, nil)
+	if slices.Contains(got, "secrets") || !slices.Contains(got, "users") {
+		t.Errorf("deny must match case-insensitively and spare siblings: %v", got)
+	}
+	got = filterTables("app", []string{"users", "Users", "orders"}, nil, allow)
+	if !slices.Equal(got, []string{"users"}) {
+		t.Errorf("allow must match exactly (Users is a DIFFERENT table): %v", got)
+	}
+	if got := filterTables("app", []string{"users"}, deny, nil); got == nil {
+		t.Error("a filtered result must never be nil on the wire")
+	}
+	schemas := filterSchemas([]string{"app", "App", "hr"}, allow)
+	if !slices.Equal(schemas, []string{"app"}) {
+		t.Errorf("schema allow-list must match exactly: %v", schemas)
+	}
+	if got := filterSchemas([]string{"hr"}, allow); got == nil {
+		t.Error("a fully-filtered schema list must never be nil on the wire")
+	}
 }
