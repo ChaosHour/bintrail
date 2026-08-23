@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.68.0] - 2026-08-22
+
+### Fixed
+- **The Claude Desktop bridge crashed when connecting through a
+  response-buffering reverse proxy** (#1433). The console announces its tool
+  list moments after a session is born, and that notification could arrive
+  while the bridge was still finishing its own connection, dereferencing a
+  session that did not exist yet. A buffering proxy (nginx without
+  `proxy_buffering off`) shifted timing into the crash window every time.
+  The bridge now treats the early notification as a no-op and syncs the tool
+  list right after connecting, so nothing is lost.
+- **A trailing slash on the console's MCP address answered the web page
+  instead of the MCP endpoint** (#1433). `/mcp/` and `/mcp/<server>/` now
+  route to the MCP handler exactly like their slash-less forms. The bridge
+  also prints a plain-words next step when an address lands on a web page or
+  a credential is refused, and the reverse-proxy recipe in docs/console.md
+  names the symptom.
+
 ## [0.67.0] - 2026-08-22
 
 ### Changed
