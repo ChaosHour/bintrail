@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.69.0] - 2026-08-23
+
+### Added
+- **Session policies can carry direct table and column restrictions**
+  (#1449). An installed auth provider can now attach data scoping to the
+  console session it mints: tables withheld, column values blanked, or an
+  allow-list where only the named tables (and, within them, the named
+  columns) are visible. Deny wins when both name the same data. The console
+  enforces these in the same pass as session data profiles: events and
+  recover results are filtered and redacted, the schema listing shrinks to
+  what the session may see, and the surfaces that cannot redact per column
+  (time-travel, baseline listings, recover-cascade, verify, extension
+  views) answer forbidden, exactly as they do for profiled sessions.
+  Sessions with restrictions query the live index only, since archive reads
+  bypass the redaction pass; the response says so. The OSS build's own
+  logins are unchanged: nothing in the core constructs these policies.
+
+### Security
+- **A session carrying a data access policy can no longer mint a managed
+  MCP token** (#1449). The token would have outlived the session's
+  restrictions and authenticated unrestricted. Tokens minted by such
+  sessions BEFORE this release still work unrestricted: revoke them and
+  mint replacements from an unrestricted session.
+- **The changed-column filter is refused for sessions under column-level
+  rules** (#1449). Filtering by a hidden column's changes would reveal that
+  the column changed, which is the fact the redaction hides.
+
 ## [0.68.0] - 2026-08-22
 
 ### Fixed
