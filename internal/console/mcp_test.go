@@ -85,12 +85,17 @@ func TestMCP_routingUnknownServer404(t *testing.T) {
 	defer closer()
 	s := newBootServer(db)
 
-	rec := doMCP(t, s, "/mcp/no-such-server", "t")
-	if rec.Code != 404 {
-		t.Fatalf("/mcp/no-such-server = %d, want 404; body: %s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "unknown server") {
-		t.Errorf("404 body should say unknown server, got: %s", rec.Body.String())
+	for _, path := range []string{"/mcp/no-such-server", "/mcp/no-such-server/"} {
+		rec := doMCP(t, s, path, "t")
+		if rec.Code != 404 {
+			// Errorf, not Fatalf: the slashed case is the one that catches a
+			// renamed wildcard, and a failure on the bare path must not hide it.
+			t.Errorf("%s = %d, want 404; body: %s", path, rec.Code, rec.Body.String())
+			continue
+		}
+		if !strings.Contains(rec.Body.String(), "unknown server") {
+			t.Errorf("%s 404 body should say unknown server, got: %s", path, rec.Body.String())
+		}
 	}
 }
 
@@ -111,7 +116,14 @@ func TestMCP_routingByIDNameAndDefault(t *testing.T) {
 
 	// Initialize never opens the server's connection, so a routing accept
 	// (200) proves selector resolution without a live MySQL.
-	for _, path := range []string{"/mcp", "/mcp/" + entry.ID, "/mcp/prod", "/mcp/default"} {
+	// The slashed forms ride the {$} routes: "/mcp/" must resolve like bare
+	// /mcp (empty PathValue) and "/mcp/<sel>/" like "/mcp/<sel>". This loop
+	// alone cannot pin the wildcard NAME on the trailing-slash pattern (a
+	// renamed wildcard yields an empty selector, which this fixture's boot
+	// bundle happily serves as 200) — the slashed case in
+	// TestMCP_routingUnknownServer404 is what kills that mutation, by
+	// resolving to the healthy default instead of 404 (verified red).
+	for _, path := range []string{"/mcp", "/mcp/" + entry.ID, "/mcp/prod", "/mcp/default", "/mcp/", "/mcp/" + entry.ID + "/", "/mcp/prod/", "/mcp/default/"} {
 		if rec := doMCP(t, s, path, "t"); rec.Code != 200 {
 			t.Errorf("%s initialize = %d, want 200; body: %s", path, rec.Code, rec.Body.String())
 		}
