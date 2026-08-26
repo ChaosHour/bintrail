@@ -96,3 +96,86 @@ func TestViewsAPI_localOnlyLayoutIgnoresEndpointTypo(t *testing.T) {
 		t.Errorf("a layout treated as local reads S3 after all:\n%s", body)
 	}
 }
+
+// TestViewsAPI_pinsTheDetectedRegion is the WIRING guard for #1462: the
+// resolver is unit-tested on its own, which says nothing about whether
+// buildViewsInput calls it. Before this the console pinned no region at all
+// while the daemon's own reads pinned a detected one, so a downloaded file
+// described a different read than the one this process performs.
+func TestViewsAPI_pinsTheDetectedRegion(t *testing.T) {
+	t.Setenv(storage.EnvS3PathStyle, "")
+	t.Setenv(storage.EnvS3Endpoint, "")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("FROM archive_state").WillReturnRows(
+		sqlmock.NewRows([]string{"bintrail_id", "sample_local", "sample_bucket", "sample_key"}).
+			AddRow("aaaa", nil, "bkt", "events/bintrail_id=aaaa/f.parquet"))
+
+	srv := newViewsServer(t, "", false)
+	srv.cm.boot.db = db
+	// Pre-seeded so the test needs no network: what is under test is that the
+	// resolver's answer reaches the file, not how the answer is obtained.
+	srv.bucketRegions = map[string]bucketRegionEntry{"bkt": detected("eu-central-1")}
+
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql", "")
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, body)
+	}
+	if !strings.Contains(string(body), "REGION 'eu-central-1'") {
+		t.Errorf("the downloaded file pins no region, so the reader resolves their own:\n%s", body)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// The other half of the same rule, at the endpoint: a bucket whose region was
+// only GUESSED (GetBucketLocation is outside bintrail's documented minimal IAM
+// policy, so this is the common case) must leave the file unpinned. Pinning the
+// daemon's ambient region would override the reader's own correct
+// configuration on a machine this process cannot see.
+func TestViewsAPI_pinsNothingForAGuessedRegion(t *testing.T) {
+	t.Setenv(storage.EnvS3PathStyle, "")
+	t.Setenv(storage.EnvS3Endpoint, "")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("FROM archive_state").WillReturnRows(
+		sqlmock.NewRows([]string{"bintrail_id", "sample_local", "sample_bucket", "sample_key"}).
+			AddRow("aaaa", nil, "bkt", "events/bintrail_id=aaaa/f.parquet"))
+
+	srv := newViewsServer(t, "", false)
+	srv.cm.boot.db = db
+	srv.bucketRegions = map[string]bucketRegionEntry{"bkt": fellBack("us-east-1")}
+
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql", "")
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, body)
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		if strings.Contains(line, "REGION '") || strings.Contains(line, "s3_region") {
+			t.Errorf("an unverified region was pinned into a file that leaves this host: %s", line)
+		}
+	}
+	// And it must not claim the buckets disagree, which would be a stated fact.
+	if strings.Contains(string(body), "each detected in a DIFFERENT region") {
+		t.Errorf("a bucket that could not be asked was reported as a disagreement:\n%s", body)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}

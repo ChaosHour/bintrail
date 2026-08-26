@@ -74,3 +74,47 @@ func TestGenerate_noEndpointIsAWS(t *testing.T) {
 		t.Errorf("an AWS layout mentions an endpoint or reroutes httpfs:\n%s", out)
 	}
 }
+
+// A reader who sees no REGION clause cannot tell "nothing to pin" from "we
+// could not agree", and the two need different action from them: the second
+// means one of their buckets will answer 301 and the file needs splitting.
+func TestGenerate_ambiguousRegionSaysSo(t *testing.T) {
+	in := goldenInput()
+	// A NON-EMPTY region with the flag set: with "" the suppression assertion
+	// below passes whatever the flag does, which is a guard that cannot fail.
+	in.ArchiveRegion, in.RegionAmbiguous = "eu-central-1", true
+	out := Generate(in)
+
+	if !strings.Contains(out, "each detected in a DIFFERENT region") {
+		t.Errorf("an ambiguous region renders silently:\n%s", out)
+	}
+	// Executable lines only: the file's closing comment SHOWS a sample secret
+	// carrying REGION, so an unscoped scan matches prose and never fails.
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		if strings.Contains(line, "REGION '") || strings.Contains(line, "s3_region") {
+			t.Errorf("a region was pinned despite the buckets disagreeing: %s", line)
+		}
+	}
+	// The note is prose, so it must not be executable.
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "each detected in a DIFFERENT region") && !strings.HasPrefix(strings.TrimSpace(line), "--") {
+			t.Errorf("the note is not a comment: %s", line)
+		}
+	}
+}
+
+// The ordinary case stays silent: a pinned region needs no explanation.
+func TestGenerate_unambiguousRegionCarriesNoNote(t *testing.T) {
+	in := goldenInput()
+	in.ArchiveRegion, in.RegionAmbiguous = "eu-central-1", false
+	out := Generate(in)
+	if strings.Contains(out, "each detected in a DIFFERENT region") {
+		t.Errorf("a pinned region carries the ambiguity note:\n%s", out)
+	}
+	if !strings.Contains(out, "REGION 'eu-central-1'") {
+		t.Errorf("the pinned region is missing from the secret:\n%s", out)
+	}
+}

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A console-generated `views.sql` pins the S3 region when it is known**
+  (#1462). The console filled no region at all, while archive reads pin one
+  detected from the bucket, so a downloaded file described a different read
+  than the one this process performs: a store that checks the signing region
+  rejected what the recipient sent. The SQL panel's own DuckDB session gets the
+  same treatment, and is resolved separately because the download names
+  archives portably while the panel is local-first. Only a region actually
+  **detected** is pinned: `s3:GetBucketLocation` is deliberately outside
+  bintrail's documented minimal IAM policy, so falling back to the daemon's
+  ambient region is the common case, and writing that guess into a file would
+  override a correct configuration on a machine bintrail cannot see, where
+  pinning nothing lets the reader's own credential chain resolve it. Detection
+  is memoized per bucket, so it stays off the SQL panel's per-query path;
+  failures expire, since a blip is not a property of a bucket. When two buckets
+  are each detected in a different region, nothing is pinned (one secret cannot
+  name two) and the file says so.
+
 ### Added
 - **S3-compatible object stores (MinIO, Wasabi, LocalStack) for every S3
   path** (#1453, #1454). `BINTRAIL_S3_ENDPOINT=scheme://host[:port]` points
