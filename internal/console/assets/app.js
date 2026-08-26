@@ -3762,7 +3762,7 @@ function duckdbCard() {
     try {
       const sql = await apiText("/api/views.sql");
       downloadBlob("views.sql", sql, "text/plain");
-      toast("views.sql downloaded. Run it with: duckdb lake.db < views.sql");
+      toast("views.sql downloaded. In DuckDB run .read views.sql, once per session.");
     } catch (err) {
       toastError("could not generate views: " + ((err && err.message) || err));
     } finally {
@@ -3858,7 +3858,8 @@ async function runSQL(sql, ui) {
     }
     const data = JSON.parse(text);
     statusLine.textContent = data.row_count + " row" + (data.row_count === 1 ? "" : "s") +
-      " in " + data.elapsed_ms + " ms" + (data.truncated ? " (truncated)" : "");
+      " in " + data.elapsed_ms + " ms" + (data.truncated ? " (truncated)" : "") +
+      ((data.warnings && data.warnings.length) ? ". " + data.warnings.join(". ") : "");
     renderSQLResult(results, data);
   } catch (err) {
     if (err && err.name === "AbortError") { statusLine.textContent = "canceled"; return; }

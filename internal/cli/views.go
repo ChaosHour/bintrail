@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -35,7 +36,16 @@ The generated file defines:
 bintrail only writes the text: it never opens DuckDB and never runs what it
 prints. Nothing in the file writes, and no credentials appear in it — S3
 access goes through DuckDB's credential chain, the same way bintrail's own
-S3 reads do.
+S3 reads do. That S3 secret lives only in the DuckDB session that runs the
+file: views persist in a database file, secrets do not, so run the file in
+every session that reads S3 (.read views.sql, or duckdb -init views.sql).
+
+Archive sources discovered from the index are named so the file works from
+another machine: an archive registered with both a local path and an S3
+location is listed by its S3 location, and a local path appears only when
+the registry holds no S3 location the file can use. State views point wherever --baseline-dir/--baseline-s3
+points; a local baseline directory resolves only on the host that holds it.
+With --archive-dir/--archive-s3 the file lists exactly what you named.
 
 Archive sources come from the index's archive_state registry by default. Pass
 --archive-dir/--archive-s3 with --bintrail-id to name one explicitly instead;
@@ -49,8 +59,9 @@ Examples:
   # From the index's own registry, plus a local baseline directory
   bintrail views --index-dsn "..." --baseline-dir /data/baselines --out views.sql
 
-  # Straight to stdout, piped into DuckDB
-  bintrail views --index-dsn "..." --baseline-dir /data/baselines --out - | duckdb lake.db
+  # Open an interactive DuckDB with the views and the S3 secret loaded
+  bintrail views --index-dsn "..." --baseline-dir /data/baselines --out views.sql
+  duckdb -init views.sql lake.db
 
   # Without an index: name the archive and baseline locations directly
   bintrail views --archive-s3 s3://bucket/archives/ --bintrail-id <uuid> \
@@ -111,6 +122,7 @@ func runViews(cmd *cobra.Command, _ []string) error {
 		if err != nil {
 			return err
 		}
+		in.PortableRouting = true
 	}
 
 	if !vNoBaselines {
@@ -153,13 +165,24 @@ func explicitArchiveSources() []string {
 // not an error: an index whose partitions have never been archived legitimately
 // has no archive tier yet, and the generated file says so in a comment rather
 // than failing a command whose whole job is to describe what exists.
+//
+// The PORTABLE routing (S3 wherever registered) is deliberate: the file is
+// written to be run somewhere else, where this host's local copy does not
+// resolve (#1456). `bintrail query` on this host keeps the local-first routing.
 func discoverArchiveSources(ctx context.Context, dsn string) ([]string, error) {
 	db, err := config.Connect(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("connect to index DB: %w", err)
 	}
 	defer db.Close()
-	sources, err := query.ResolveArchiveSources(ctx, db)
+	return discoverArchiveSourcesFrom(ctx, db)
+}
+
+// discoverArchiveSourcesFrom is the DB-taking half, split out so the routing
+// choice (portable, not local-first) is pinned by a test on THIS surface: the
+// console half has its own, and a revert here would otherwise ship unnoticed.
+func discoverArchiveSourcesFrom(ctx context.Context, db *sql.DB) ([]string, error) {
+	sources, err := query.PortableArchiveSources(ctx, db)
 	if err != nil {
 		return nil, fmt.Errorf("resolve archive sources from archive_state: %w", err)
 	}

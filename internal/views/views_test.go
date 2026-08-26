@@ -22,6 +22,7 @@ func goldenInput() Input {
 			"/data/archives/bintrail_id=11111111-2222-3333-4444-555555555555",
 			"s3://my-bucket/archives/bintrail_id=66666666-7777-8888-9999-000000000000",
 		},
+		PortableRouting:  true,
 		ArchiveRegion:    "us-east-1",
 		BaselineSource:   "s3://my-bucket/baselines/",
 		BaselineSnapshot: time.Date(2026, 4, 30, 3, 0, 0, 0, time.UTC),

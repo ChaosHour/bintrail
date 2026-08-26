@@ -42,6 +42,22 @@ type Input struct {
 	// ArchiveSources are the archive base paths discovered from archive_state
 	// (each ending in the `bintrail_id=<id>` segment), local or s3://.
 	ArchiveSources []string
+	// PortableRouting is true when ArchiveSources were resolved by
+	// query.PortableArchiveSources (S3 wherever the registry has one), which
+	// is the only case in which the header may state that rule. It names the
+	// ROUTING, not the provenance: the console SQL panel's sources also come
+	// out of the registry, local-first, and leave this false. An operator who
+	// named the roots with --archive-dir/--archive-s3 gets exactly what they
+	// named, both of them if they passed both (#1456).
+	PortableRouting bool
+	// ArchiveDiscoveryFailed is set when the registry could not be read at
+	// all. The file then says so instead of "none registered", which would
+	// state a cause the caller does not know. A bool, not the error: the
+	// error text names the index host and the DB user (a dial error, a 1142),
+	// and this file is meant to be shared. The text goes to the console log,
+	// and to the 502 body when there is no baseline half to serve; `bintrail
+	// views` fails the command instead of setting this.
+	ArchiveDiscoveryFailed bool
 	// ArchiveRegion pins REGION in the S3 secret. Empty = let the credential
 	// chain resolve it, which is what every other bintrail S3 read does by
 	// default.
@@ -76,7 +92,7 @@ func Generate(in Input) string {
 	if in.needsS3() {
 		writeS3Preamble(&b, in.ArchiveRegion)
 	}
-	writeEventsView(&b, in.ArchiveSources, in.ExcludeEventColumns)
+	writeEventsView(&b, in)
 	writeStateViews(&b, in)
 	return b.String()
 }
@@ -90,7 +106,7 @@ func Generate(in Input) string {
 // setup does not hinge on the human-facing preamble.
 func GenerateViews(in Input) string {
 	var b strings.Builder
-	writeEventsView(&b, in.ArchiveSources, in.ExcludeEventColumns)
+	writeEventsView(&b, in)
 	writeStateViews(&b, in)
 	return b.String()
 }
@@ -118,14 +134,33 @@ func writeHeader(b *strings.Builder, in Input) {
 	b.WriteString("--\n")
 	b.WriteString("-- THIS FILE IS A SNAPSHOT OF THE LAYOUT, NOT A LIVE BINDING. The globs below\n")
 	b.WriteString("-- keep picking up newly rotated partitions on their own, but the baseline\n")
-	b.WriteString("-- state views point at ONE snapshot. Re-run `bintrail views` after taking or\n")
-	b.WriteString("-- refreshing a baseline, and whenever archive sources are added or removed.\n")
+	b.WriteString("-- state views point at ONE snapshot. Re-run `bintrail views` (or download the\n")
+	b.WriteString("-- file again from the console) after taking or refreshing a baseline, and\n")
+	b.WriteString("-- whenever archive sources are added or removed.\n")
 	b.WriteString("--\n")
 	b.WriteString("-- Nothing here writes: every view is a read over Parquet files you already own.\n")
 	b.WriteString("--\n")
 
-	b.WriteString("-- Archive sources:\n")
-	if len(in.ArchiveSources) == 0 {
+	// The path choice is stated where the paths are listed, and only when a
+	// choice was made over a real listing: portable routing names an archive
+	// registered with both a local path and an S3 location by the S3 one,
+	// because this file is meant to run on a machine that is not the one the
+	// local path belongs to (#1456). Explicitly named roots are listed as
+	// named, and a failed read lists nothing, so neither gets the sentence.
+	// Baseline state views are out of it on purpose: they point wherever the
+	// baseline root points.
+	if in.PortableRouting && !in.ArchiveDiscoveryFailed {
+		b.WriteString("-- Archive sources (an archive registered with both a local path and an S3\n")
+		b.WriteString("-- location is listed by its S3 location, so those reads work from another\n")
+		b.WriteString("-- machine; a local path below means the registry holds no S3 location this\n")
+		b.WriteString("-- file can use):\n")
+	} else {
+		b.WriteString("-- Archive sources:\n")
+	}
+	switch {
+	case in.ArchiveDiscoveryFailed:
+		b.WriteString("--   (could not be read from archive_state; the console log has the error)\n")
+	case len(in.ArchiveSources) == 0:
 		b.WriteString("--   (none registered in archive_state — no rotated partitions have been archived yet)\n")
 	}
 	for _, s := range in.ArchiveSources {
@@ -169,6 +204,18 @@ func writeS3Preamble(b *strings.Builder, region string) {
 	}
 	secret += ");\n"
 	b.WriteString(secret)
+	// The secret is TEMPORARY on purpose, and the file says so where the
+	// operator will look when a reopened database file cannot read S3. The
+	// PERSISTENT form is not offered: DuckDB resolves the credential chain at
+	// creation and writes the resulting keys to ~/.duckdb/stored_secrets, which
+	// would make a file that promises "no credentials" plant them on disk
+	// (#1456).
+	b.WriteString("-- This secret lives only in this DuckDB session. Views persist in a database\n")
+	b.WriteString("-- file; secrets do not. Reopening that file later and querying S3 fails with\n")
+	b.WriteString("-- \"No credentials are provided\": run this file again in every session that\n")
+	b.WriteString("-- reads S3 (`.read views.sql`, or `duckdb -init views.sql your.db`).\n")
+	b.WriteString("-- Do not make it PERSISTENT: DuckDB would resolve your credential chain now\n")
+	b.WriteString("-- and store the resulting keys on disk.\n")
 	b.WriteString("-- No credentials appear in this file by design. If the credential chain is not\n")
 	b.WriteString("-- available where you run this, replace the secret above with explicit keys:\n")
 	b.WriteString("--   CREATE OR REPLACE SECRET bintrail_s3_chain (\n")
@@ -193,13 +240,20 @@ const eventTypeCase = "CASE \"event_type\"\n" +
 // same slice the archiver writes with — so a column added or removed there
 // changes this output and breaks the golden test, rather than leaving the
 // generated schema quietly behind the files it describes.
-func writeEventsView(b *strings.Builder, sources []string, excludeCols []string) {
-	exclude := make(map[string]bool, len(excludeCols))
-	for _, c := range excludeCols {
+func writeEventsView(b *strings.Builder, in Input) {
+	sources := in.ArchiveSources
+	exclude := make(map[string]bool, len(in.ExcludeEventColumns))
+	for _, c := range in.ExcludeEventColumns {
 		exclude[strings.ToLower(c)] = true
 	}
 	b.WriteString("-- events: every archived binlog event, across all archive sources.\n")
-	if len(sources) == 0 {
+	switch {
+	case in.ArchiveDiscoveryFailed:
+		// The header already names the failure; the body must not contradict
+		// it with a cause nobody verified.
+		b.WriteString("-- (skipped: archive_state could not be read; see the header)\n\n")
+		return
+	case len(sources) == 0:
 		b.WriteString("-- (skipped: no archive sources are registered in archive_state)\n\n")
 		return
 	}
