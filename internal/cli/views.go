@@ -14,6 +14,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
+	"github.com/dbtrail/dbtrail/internal/storage"
 	"github.com/dbtrail/dbtrail/internal/views"
 )
 
@@ -114,14 +115,14 @@ func runViews(cmd *cobra.Command, _ []string) error {
 		ArchiveRegion: vRegion,
 	}
 
-	var err error
 	if explicitArchives {
 		in.ArchiveSources = explicitArchiveSources()
 	} else {
-		in.ArchiveSources, err = discoverArchiveSources(cmd.Context(), vIndexDSN)
+		sources, err := discoverArchiveSources(cmd.Context(), vIndexDSN)
 		if err != nil {
 			return err
 		}
+		in.ArchiveSources = sources
 		in.PortableRouting = true
 	}
 
@@ -129,6 +130,18 @@ func runViews(cmd *cobra.Command, _ []string) error {
 		if err := resolveBaselineViews(cmd.Context(), &in); err != nil {
 			return err
 		}
+	}
+
+	// After the layout is known, so a purely local one is not refused over an
+	// S3 variable it will never read. When the file DOES carry s3:// paths, a
+	// broken endpoint is fatal: the alternative is a file that silently sends
+	// the operator's DuckDB to AWS.
+	if in.NeedsS3() {
+		ep, err := storage.S3EndpointFromEnv()
+		if err != nil {
+			return err
+		}
+		in.S3Endpoint = ep
 	}
 
 	sql := views.Generate(in)

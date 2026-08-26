@@ -227,7 +227,9 @@ func fetchS3Direct(ctx context.Context, db *sql.DB, files []string, region strin
 	// credential_chain secret otherwise resolves region from the AWS SDK config,
 	// not the bucket. Both together cover every precedence model — and the SET
 	// still applies when the aws extension is unavailable and no secret exists.
-	duckdbutil.EnableS3CredentialChainRegion(ctx, db, region)
+	if err := duckdbutil.EnableS3CredentialChainRegion(ctx, db, region); err != nil {
+		return nil, err
+	}
 
 	threads := duckDBThreadCount(ctx, db)
 	warnAttrs := []any{"files", len(files), "duckdb_threads", threads}
@@ -318,7 +320,7 @@ func listS3ParquetScoped(ctx context.Context, source string, since, until *time.
 	// from us-east-1). This prevents 301 PermanentRedirect errors when the
 	// configured region doesn't match the bucket's location.
 	bucketRegion := cfg.Region
-	locClient := s3.NewFromConfig(cfg, func(o *s3.Options) {
+	locClient := storage.NewS3ClientFromConfig(cfg, func(o *s3.Options) {
 		o.Region = "us-east-1"
 	})
 	loc, locErr := locClient.GetBucketLocation(ctx, &s3.GetBucketLocationInput{
@@ -345,7 +347,7 @@ func listS3ParquetScoped(ctx context.Context, source string, since, until *time.
 		bucketRegion = r
 	}
 
-	client = s3.NewFromConfig(cfg, func(o *s3.Options) {
+	client = storage.NewS3ClientFromConfig(cfg, func(o *s3.Options) {
 		o.Region = bucketRegion
 	})
 

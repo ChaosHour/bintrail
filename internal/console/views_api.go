@@ -11,6 +11,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
+	"github.com/dbtrail/dbtrail/internal/storage"
 	"github.com/dbtrail/dbtrail/internal/views"
 )
 
@@ -68,6 +69,18 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) 
 			return views.Input{}, fmt.Errorf("read archive_state: %w", archiveErr)
 		}
 		return views.Input{}, errNoViewSources
+	}
+	// After the layout is known: a server whose archives are all local reads
+	// nothing through httpfs, so an unrelated S3 variable must not 502 its
+	// page. Where the file does name s3:// paths, the store this daemon reads
+	// from is the store the file must name, and an invalid value is an
+	// upstream fault worth reporting rather than a file that points at AWS.
+	if in.NeedsS3() {
+		ep, err := storage.S3EndpointFromEnv()
+		if err != nil {
+			return views.Input{}, fmt.Errorf("S3 endpoint configuration: %w", err)
+		}
+		in.S3Endpoint = ep
 	}
 	return in, nil
 }
