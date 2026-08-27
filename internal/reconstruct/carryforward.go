@@ -2,11 +2,14 @@ package reconstruct
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/dbtrail/dbtrail/internal/baselineintegrity"
 )
@@ -68,26 +71,44 @@ import (
 // # Hard link, then copy
 //
 // A link is tried first because the whole point is to stop paying for bytes
-// that did not change. Old and new snapshot directories live under the same
-// baseline root and therefore the same filesystem, so it normally succeeds.
+// that did not change. Under the daemon loop the old and new snapshot
+// directories live under one baseline root and therefore one filesystem, so it
+// normally succeeds. That is a property of the loop, not of the function: the
+// CLI's `baseline refresh --baseline-dir /a --output /b` is a documented shape
+// and puts the two on different devices, which is what the copy path is for.
 // Snapshot files are written once and never modified in place, so sharing an
 // inode between two snapshots is safe. The copy fallback covers a filesystem
 // that has no links and the cross-device case.
 //
 // One consequence to know: a prune that removes the older snapshot will not
 // reclaim a linked file's bytes while the newer one still references it. That
-// is correct (the data is still in use) but it means reclaimed-space figures
-// count the directory entry, not the blocks.
-func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table string) (linked bool, err error) {
+// is correct (the data is still in use) but it means the prune pass behind
+// `bintrail baseline --baseline-retain` reports reclaimed bytes it did not
+// reclaim: it sums file sizes, and a shared inode's blocks are counted whole.
+//
+// `du` is the narrower hazard it is tempting to state too broadly: one `du`
+// over the baseline root tracks inodes within its own traversal and reports the
+// truth. It is a `du` run per snapshot directory, as separate invocations, that
+// counts the shared file twice.
+// linkFile is os.Link, indirected so a test can drive the copy fallback.
+//
+// Every test machine has one filesystem, so os.Link always succeeds and the
+// copy branch never ran anywhere: replacing copyFile's call with `return nil`
+// published a snapshot MISSING the table's Parquet file and passed both tiers.
+// A missing file is not caught until a later reconstruct, verify or drill trips
+// over it, which is a long way from here.
+var linkFile = os.Link
+
+func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table string) error {
 	if err := ctx.Err(); err != nil {
-		return false, err
+		return err
 	}
 	if err := baselineintegrity.ValidateLocalFile(srcPath); err != nil {
-		return false, fmt.Errorf("validate the snapshot being carried forward: %w", err)
+		return fmt.Errorf("validate the snapshot being carried forward: %w", err)
 	}
 	dst := filepath.Join(snapshotDir, schema, table+".parquet")
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return false, err
+		return err
 	}
 	// Remove before writing, and the reason is the COPY path rather than the
 	// link path. os.Create truncates, and after a carry-forward the destination
@@ -96,16 +117,44 @@ func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table strin
 	// share before anything is written. (os.Link would also fail with EEXIST,
 	// though reconstruct's leftovers refusal already rules that out.)
 	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
-		return false, err
+		return err
 	}
-	if err := os.Link(srcPath, dst); err == nil {
-		return true, nil
+	linkErr := linkFile(srcPath, dst)
+	if linkErr == nil {
+		return nil
 	}
-	return false, copyFile(srcPath, dst)
+	// The copy is the designed fallback, not a failure, so the error is never
+	// returned. The LEVEL splits by cause, because the two causes are worlds
+	// apart. A cross-device destination is the documented shape (`--baseline-dir
+	// /a --output /b`): it copies by design, every time, and saying so at Warn
+	// would be a line per table per cycle forever. Anything else, a permission
+	// or a filesystem with no links, silently costs the operator the exact
+	// rewrite the opt-in was taken to avoid, and Debug is below the console
+	// binary's default level, so it would never be said at all.
+	if errors.Is(linkErr, syscall.EXDEV) {
+		slog.Debug("carry forward: source and destination are on different filesystems, copying instead",
+			"src", srcPath, "dst", dst)
+	} else {
+		slog.Warn("carry forward: could not hard link, so the file was COPIED and no disk space was saved. "+
+			"Reusing an unchanged table is meant to avoid rewriting it; a copy still writes every byte.",
+			"src", srcPath, "dst", dst, "error", linkErr)
+	}
+	return copyFile(srcPath, dst)
 }
 
 // carryForwardEligible reports whether a table can be published by carrying its
 // previous file forward instead of folding.
+//
+// # Off unless asked for
+//
+// enabled is the operator's explicit opt-in, and the default is off. The output
+// is the same rows either way, but the REPRESENTATION on disk is not: carrying
+// a file forward can leave two snapshots sharing one inode (a hard link where
+// the filesystem allows one, a copy otherwise), so a prune reports space it
+// will not reclaim while the newer snapshot references it, and one snapshot
+// ends up holding tables anchored at different binlog coordinates. Those are defensible trade-offs for a loop that would otherwise
+// rewrite terabytes to apply a handful of rows, and they are not something to
+// hand an operator without being asked.
 //
 // # A known capture gap disqualifies the table
 //
@@ -136,11 +185,11 @@ func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table strin
 // local-to-local; an S3 source would have to be downloaded, which buys the
 // re-encode back and reintroduces the cost this avoids. Those runs take the
 // ordinary merge path, which is correct, just not free.
-func carryForwardEligible(format, srcPath string, changes int, capGap *CaptureGap) bool {
+func carryForwardEligible(enabled bool, format, srcPath string, changes int, capGap *CaptureGap) bool {
 	// Mydumper output is a SQL dump for a human to load, not a snapshot to be
 	// discovered, so there is no previous file to carry: the rows still have
 	// to be emitted.
-	return format == OutputFormatParquet && changes == 0 && capGap == nil &&
+	return enabled && format == OutputFormatParquet && changes == 0 && capGap == nil &&
 		!strings.HasPrefix(srcPath, "s3://")
 }
 

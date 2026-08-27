@@ -18,6 +18,11 @@ type refreshRequest struct {
 	ServerName  string
 	IndexDSN    string
 	BaselineDir string
+	// CarryForwardUnchanged is the EFFECTIVE setting for this cycle: a console
+	// override if one is saved, else the daemon's own flag. Resolved per cycle
+	// rather than at boot so a change made in the settings panel takes effect
+	// on the next tick, the same way a rotation override does.
+	CarryForwardUnchanged bool
 }
 
 // TriggerRefresh starts a periodic baseline refresh for a server, sharing the
@@ -83,7 +88,7 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	// move the number this change exists to get right, in either direction.
 	// started stays for the RFC3339 stamp, which wants the wall clock.
 	elapsed := time.Now()
-	tables, refused, err := s.executeRefresh(req, at)
+	tables, refused, carried, err := s.executeRefresh(req, at)
 	// Measured HERE, on the far side of the `go` in TriggerRefresh, because
 	// this is where the fold actually happens. Timing the dispatch loop
 	// instead measures how long it takes to spawn a goroutine, which is
@@ -91,7 +96,7 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	took := time.Since(elapsed)
 	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
 		Kind: console.BaselineRunRefresh, StartedAt: started.Format(time.RFC3339),
-		SnapshotTime: publishedSnapshotTime(at, err), Tables: tables, Refused: refused,
+		SnapshotTime: publishedSnapshotTime(at, err), Tables: tables, Refused: refused, Carried: carried,
 	}, err)
 
 	s.mu.Lock()
@@ -101,12 +106,8 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 		st = &console.BaselineStatus{}
 		s.refreshes[req.ServerID] = st
 	}
-	st.FinishedAt = nowStamp()
-	st.Tables = tables
-	st.Refused = refused
+	applyFoldStatus(st, tables, refused, carried, err)
 	if err != nil {
-		st.State = "failed"
-		st.LastError = err.Error()
 		// Deliberately NO duration report here. reportRefreshDuration's advice
 		// is "raise the interval, or refresh fewer tables", which is the wrong
 		// remediation for a run that published nothing: a capture gap, a
@@ -121,10 +122,32 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 			"refused", refused, "error", err)
 		return
 	}
+	slog.Info("baseline refresh: published", "server", req.ServerName, "id", req.ServerID,
+		"tables", tables, "reused", carried)
+	reportRefreshDuration(req.ServerName, interval, took)
+}
+
+// applyFoldStatus writes a finished fold's outcome onto the status the console
+// polls. Shared by the refresh and the restore, which had byte-identical copies
+// of it.
+//
+// Split out for the reason the rest of this file keeps splitting things out:
+// both callers sit behind a `go` and a live fold, so nothing at the unit tier
+// could reach them, and dropping the reused count from either copy compiled and
+// passed the whole suite. It is also the deduplication: two copies of a
+// four-field assignment is exactly how one of them silently loses a field.
+func applyFoldStatus(st *console.BaselineStatus, tables, refused, carried int, err error) {
+	st.FinishedAt = nowStamp()
+	st.Tables = tables
+	st.Refused = refused
+	st.Carried = carried
+	if err != nil {
+		st.State = "failed"
+		st.LastError = err.Error()
+		return
+	}
 	st.State = "succeeded"
 	st.LastError = ""
-	slog.Info("baseline refresh: published", "server", req.ServerName, "id", req.ServerID, "tables", tables)
-	reportRefreshDuration(req.ServerName, interval, took)
 }
 
 // executeRefresh folds the newest snapshot forward. Returns the table count and
@@ -138,37 +161,98 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 // background refresh self-tune to ~80% of host RAM would starve the capture path
 // it depends on. If this ever needs to go faster, it needs its own bounded knob,
 // not the offline one.
-func (s *baselineSupervisor) executeRefresh(req refreshRequest, at time.Time) (tables, refused int, err error) {
+func (s *baselineSupervisor) executeRefresh(req refreshRequest, at time.Time) (tables, refused, carried int, err error) {
 	tableList, err := reconstruct.NewestSnapshotTables(s.ctx, req.BaselineDir)
 	if err != nil {
-		return 0, 0, fmt.Errorf("list the snapshot to refresh: %w", err)
+		return 0, 0, 0, fmt.Errorf("list the snapshot to refresh: %w", err)
 	}
 	if len(tableList) == 0 {
-		return 0, 0, fmt.Errorf("no baseline snapshot to refresh under %s", req.BaselineDir)
+		return 0, 0, 0, fmt.Errorf("no baseline snapshot to refresh under %s", req.BaselineDir)
 	}
 	return s.foldSnapshot(req, at, tableList)
+}
+
+// refreshFoldConfig is the configuration one refresh cycle folds with.
+//
+// Split out of foldSnapshot so the settings it carries are checkable without
+// standing up an index and a baseline: this is the last hop of the chain that
+// starts at a console toggle, and it was the only one nothing could observe.
+func refreshFoldConfig(req refreshRequest, at time.Time, tableList []string) reconstruct.FullTableConfig {
+	return reconstruct.FullTableConfig{
+		IndexDSN:              req.IndexDSN,
+		BaselineSrc:           req.BaselineDir,
+		Tables:                tableList,
+		At:                    at,
+		OutputDir:             req.BaselineDir,
+		OutputFormat:          reconstruct.OutputFormatParquet,
+		CarryForwardUnchanged: req.CarryForwardUnchanged,
+		// AllowGaps stays FALSE. An unattended job must never publish a
+		// knowingly-incomplete baseline: accepting a permanent capture loss is a
+		// decision with consequences for every future reconstruct, and nobody is
+		// watching this one to make it.
+	}
+}
+
+// countCarried counts the tables a fold published by reusing the previous
+// snapshot's file.
+//
+// A separate function for the same reason refreshFoldConfig is one: this is the
+// last hop of the reuse feature and the only evidence it produced anything, and
+// inside foldSnapshot nothing could reach it without standing up an index and a
+// baseline. Returning len(reports) here, or 0, compiles and passes every test
+// that does not call this directly.
+func countCarried(reports []*reconstruct.TableReport) (carried int) {
+	for _, rep := range reports {
+		if rep != nil && rep.CarriedForward {
+			carried++
+		}
+	}
+	return carried
 }
 
 // foldSnapshot is the fold both the periodic refresh and the point-in-time
 // restore share: reconstruct every table at `at` and publish the result as a
 // new snapshot in the server's own baseline store, all-or-nothing.
-func (s *baselineSupervisor) foldSnapshot(req refreshRequest, at time.Time, tableList []string) (tables, refused int, err error) {
-	_, failures, runErr := reconstruct.ReconstructTablesDetailed(s.ctx, reconstruct.FullTableConfig{
-		IndexDSN:     req.IndexDSN,
-		BaselineSrc:  req.BaselineDir,
-		Tables:       tableList,
-		At:           at,
-		OutputDir:    req.BaselineDir,
-		OutputFormat: reconstruct.OutputFormatParquet,
-		// AllowGaps stays FALSE. An unattended job must never publish a
-		// knowingly-incomplete baseline: accepting a permanent capture loss is a
-		// decision with consequences for every future reconstruct, and nobody is
-		// watching this one to make it.
-	})
+//
+// carried counts the tables published by reusing the previous snapshot's file.
+// It is read out of the per-table reports rather than inferred from the
+// setting, because asking for reuse is not getting it: a table with changes,
+// with a capture gap, or on the S3 path is folded anyway.
+func (s *baselineSupervisor) foldSnapshot(req refreshRequest, at time.Time, tableList []string) (tables, refused, carried int, err error) {
+	reports, failures, runErr := reconstruct.ReconstructTablesDetailed(s.ctx, refreshFoldConfig(req, at, tableList))
+	return foldOutcome(tableList, reports, failures, runErr)
+}
+
+// foldOutcome is everything foldSnapshot decides once the fold has run, split
+// out because the fold itself needs a live index and a real baseline and this
+// does not.
+//
+// Left inline, zeroing the carried count compiled and passed the entire suite:
+// the only path that reads it runs against real MySQL, so the number the
+// console reports had no unit-tier guard at all. That is the same shape as
+// refreshFoldConfig one function up.
+//
+// carried is reported even when runErr is set, and that is deliberate rather
+// than an oversight. Publication is all-or-nothing, so a failed run published
+// nothing at all; the count still describes the work the fold did, and the UI
+// renders it only under a succeeded state. ReconstructTablesDetailed routes a
+// failed table into failures and never into reports, so this can never count a
+// table that did not actually reuse its file.
+//
+// Residual, stated rather than papered over: the one-line delegation in
+// foldSnapshot is still only reachable with a live index and a real baseline,
+// and consoleapp has no fixture that stands those up. A mutation that bypasses
+// this function survives the unit tier. What the split buys is that the
+// unguarded surface is now a single call rather than the whole decision, and
+// the equivalent end-to-end behaviour is pinned at the integration tier by
+// internal/reconstruct's TestReconstructParquet_doesNotCarryForwardUnlessAsked.
+func foldOutcome(tableList []string, reports []*reconstruct.TableReport,
+	failures []reconstruct.TableFailure, runErr error) (tables, refused, carried int, err error) {
+	carried = countCarried(reports)
 	if runErr != nil {
-		return len(tableList), len(failures), runErr
+		return len(tableList), len(failures), carried, runErr
 	}
-	return len(tableList), 0, nil
+	return len(tableList), 0, carried, nil
 }
 
 // startBaselineRefreshLoop launches the opt-in periodic baseline refresh
@@ -179,7 +263,7 @@ func (s *baselineSupervisor) foldSnapshot(req refreshRequest, at time.Time, tabl
 // supervisor. A baseline that stopped refreshing is a degradation; a daemon that
 // stopped capturing is an outage, and the first must never cause the second.
 func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *baselineSupervisor,
-	globalDSN, globalBaselineDir, intervalRaw string) error {
+	globalDSN, globalBaselineDir, intervalRaw string, carryDefault bool) error {
 	if intervalRaw == "" {
 		return nil
 	}
@@ -197,7 +281,14 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 		return fmt.Errorf("internal: --baseline-refresh-interval was set without a baseline supervisor")
 	}
 	targets := baselineRefreshTargets(registryEntries(reg), globalDSN, globalBaselineDir)
-	slog.Info("baseline refresh loop enabled", "interval", interval, "servers", len(targets))
+	// Name the effective reuse setting AND where it came from, once, at the one
+	// moment an operator is reading the log to see whether their configuration
+	// took. A console override beats the command line silently by design, so
+	// without this line the only symptom of a stale saved toggle is work that
+	// keeps happening, or stops happening, for no stated reason.
+	carryOn, carrySource := carryForwardProvenance(reg, carryDefault)
+	slog.Info("baseline refresh loop enabled", "interval", interval, "servers", len(targets),
+		"reuse_unchanged", carryOn, "reuse_set_by", carrySource)
 	if len(targets) == 0 {
 		// WARN, not a refusal — and the distinction is load-bearing. Every tick
 		// recomputes the target set, so "nothing to refresh" is a state a daemon
@@ -233,7 +324,7 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				refreshTick(ctx, reg, sup, globalDSN, globalBaselineDir, interval)
+				refreshTick(ctx, reg, sup, globalDSN, globalBaselineDir, interval, carryDefault)
 			}
 		}
 	}()
@@ -325,9 +416,67 @@ func snapshotsPer30Days(interval time.Duration) int64 {
 // separately. That is the same shape this file already carries a correction
 // for one function over, so it gets a seam rather than a comment.
 func refreshTick(ctx context.Context, reg *console.Registry, sup *baselineSupervisor,
-	globalDSN, globalBaselineDir string, interval time.Duration) {
-	dispatched, skipped := runBaselineRefreshCycle(ctx, reg, sup, globalDSN, globalBaselineDir, interval)
-	reportDispatch(interval, dispatched, skipped)
+	globalDSN, globalBaselineDir string, interval time.Duration, carryDefault bool) {
+	dispatched, skipped, carry := runBaselineRefreshCycle(ctx, reg, sup, globalDSN, globalBaselineDir, interval, carryDefault)
+	// carry comes back from the cycle rather than being resolved again here: a
+	// PUT landing between the two reads would make the logged value disagree
+	// with what was actually dispatched, which is the one thing this log exists
+	// to settle.
+	reportDispatch(interval, dispatched, skipped, carry)
+}
+
+// refreshTargetsFor builds this cycle's requests with the effective settings
+// already applied.
+//
+// The resolution lives next to the target construction rather than inside the
+// cycle's loop body so that "what a request carries" is reachable without
+// running a refresh: the loop body is otherwise only observable by letting a
+// fold start.
+func refreshTargetsFor(reg *console.Registry, globalDSN, globalBaselineDir string, carryDefault bool) []refreshRequest {
+	return refreshTargetsWith(reg, globalDSN, globalBaselineDir, effectiveCarryForward(reg, carryDefault))
+}
+
+// refreshTargetsWith is the same thing with the setting ALREADY resolved, so
+// one cycle resolves it once and logs exactly the value it dispatched with.
+func refreshTargetsWith(reg *console.Registry, globalDSN, globalBaselineDir string, carry bool) []refreshRequest {
+	reqs := baselineRefreshTargets(registryEntries(reg), globalDSN, globalBaselineDir)
+	for i := range reqs {
+		reqs[i].CarryForwardUnchanged = carry
+	}
+	return reqs
+}
+
+// effectiveCarryForward resolves what this cycle should do: a console-saved
+// override wins over the daemon's own flag.
+//
+// Read per cycle, not cached at boot. A console override is meant to apply to a
+// loop that is already running, which is the same contract the rotation panel
+// has, and caching would make the panel look inert until a restart.
+//
+// A registry that cannot be consulted falls back to the daemon flag rather than
+// to false: the operator's explicit command line is a better answer than a
+// silent no.
+func effectiveCarryForward(reg *console.Registry, daemonDefault bool) bool {
+	on, _ := carryForwardProvenance(reg, daemonDefault)
+	return on
+}
+
+// carryForwardProvenance resolves the same value and also names WHERE it came
+// from, which is the half that has to be logged.
+//
+// The two sources disagree silently by design: a saved override of false beats
+// a command line saying true, and that is the point of the tri-state. It also
+// means an operator can pass the flag, watch every table get rewritten, and
+// have nothing anywhere tell them a console toggle from months ago is the
+// reason. The provenance string exists so one log line can.
+func carryForwardProvenance(reg *console.Registry, daemonDefault bool) (on bool, source string) {
+	if reg == nil {
+		return daemonDefault, "daemon flag or environment"
+	}
+	if bc, ok := reg.BaselineRefresh(); ok {
+		return bc.CarryForwardUnchanged, "console setting, which overrides the daemon flag"
+	}
+	return daemonDefault, "daemon flag or environment"
 }
 
 // runBaselineRefreshCycle triggers one refresh per eligible server.
@@ -337,16 +486,17 @@ func refreshTick(ctx context.Context, reg *console.Registry, sup *baselineSuperv
 // is establishing replication and opening its console would make every restart
 // the most expensive moment in the process's life.
 func runBaselineRefreshCycle(ctx context.Context, reg *console.Registry, sup *baselineSupervisor,
-	globalDSN, globalBaselineDir string, interval time.Duration) (dispatched, skipped int) {
+	globalDSN, globalBaselineDir string, interval time.Duration, carryDefault bool) (dispatched, skipped int, carry bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("baseline refresh cycle panicked; refreshes continue next tick", "panic", r)
 		}
 	}()
+	carry = effectiveCarryForward(reg, carryDefault)
 	if ctx.Err() != nil {
-		return dispatched, skipped
+		return dispatched, skipped, carry
 	}
-	for _, req := range baselineRefreshTargets(registryEntries(reg), globalDSN, globalBaselineDir) {
+	for _, req := range refreshTargetsWith(reg, globalDSN, globalBaselineDir, carry) {
 		switch err := sup.TriggerRefresh(req, interval); {
 		case err == nil:
 			dispatched++
@@ -371,7 +521,7 @@ func runBaselineRefreshCycle(ctx context.Context, reg *console.Registry, sup *ba
 			slog.Warn("baseline refresh: could not start", "server", req.ServerName, "error", err)
 		}
 	}
-	return dispatched, skipped
+	return dispatched, skipped, carry
 }
 
 // reportDispatch reports what a tick actually did, which is dispatch and
@@ -383,16 +533,17 @@ func runBaselineRefreshCycle(ctx context.Context, reg *console.Registry, sup *ba
 // refreshes are not keeping up, and it was previously logged at Debug where the
 // default level hides it. reportRefreshDuration carries the matching per-server
 // detail when the slow refresh eventually lands.
-func reportDispatch(interval time.Duration, dispatched, skipped int) {
+func reportDispatch(interval time.Duration, dispatched, skipped int, carry bool) {
 	if skipped == 0 {
-		slog.Debug("baseline refresh: dispatched", "servers", dispatched, "interval", interval)
+		slog.Debug("baseline refresh: dispatched", "servers", dispatched, "interval", interval,
+			"reuse_unchanged", carry)
 		return
 	}
 	slog.Info("baseline refresh: a server was still busy with another baseline job, so this tick did not start "+
 		"a refresh for it. That job is a refresh still folding, a manual dump, a restore or a SQL export: they "+
 		"share one lock per server. If it is the previous refresh, the interval is shorter than a refresh "+
 		"takes, and that refresh logs its own duration when it lands.",
-		"dispatched", dispatched, "skipped", skipped, "interval", interval)
+		"dispatched", dispatched, "skipped", skipped, "interval", interval, "reuse_unchanged", carry)
 }
 
 // refreshTargetDirs lists the directories that will grow, for the retention

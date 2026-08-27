@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -81,6 +82,7 @@ var (
 	upConsoleBaselineS3     string
 	upConsoleBaselineRetain string
 	upBaselineRefreshEvery  string
+	upBaselineCarryForward  bool
 	upConsoleServersFile    string
 	upConsoleAuthFile       string
 	upConsoleTLSCert        string
@@ -217,6 +219,11 @@ func init() {
 	watchCmd.Flags().StringVar(&upConsoleToken, "console-token", "", "Opt-in static token for API automation (never generated; humans use the console password)")
 	watchCmd.Flags().StringVar(&upConsoleBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots; enables the console's point-in-time Reconstruct surface")
 	watchCmd.Flags().StringVar(&upConsoleBaselineS3, "baseline-s3", "", "S3 prefix of baseline Parquet snapshots (s3://bucket/prefix/); enables Reconstruct")
+	watchCmd.Flags().BoolVar(&upBaselineCarryForward, "baseline-carry-forward-unchanged", false,
+		"When a refresh finds a table had no changes, publish its previous Parquet file instead of rewriting "+
+			"it (hard link where possible). Off by default: the rows are identical either way, but it links two "+
+			"snapshots to one file, so disk-usage and prune figures then count space they will not reclaim. "+
+			"Editable from the console settings panel, which overrides this flag.")
 	watchCmd.Flags().StringVar(&upBaselineRefreshEvery, "baseline-refresh-interval", "", "Periodically refresh each server's newest baseline snapshot from the index (Nm/Nh/Nd; default: off). Runs with the conservative DuckDB budget and never publishes over a known capture gap.")
 	watchCmd.Flags().StringVar(&upConsoleBaselineRetain, "baseline-retain", "", "Periodically prune local --baseline-dir snapshots older than this (Nd/Nh) once a durable copy exists in --baseline-s3 (never deletes the only copy or the newest snapshot per table)")
 	watchCmd.Flags().StringVar(&upConsoleServersFile, "console-servers-file", "", "Path to the console server registry YAML (default ~/.config/bintrail/console-servers.yaml)")
@@ -497,7 +504,7 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 
 	// Keep each server's newest snapshot moving forward from the index alone
 	// (#1171). Opt-in, and refused at startup when nothing can be refreshed.
-	if err := startBaselineRefreshLoop(ctx, registry, baselineSup, upIndexDSN, upConsoleBaselineDir, upBaselineRefreshEvery); err != nil {
+	if err := startBaselineRefreshLoop(ctx, registry, baselineSup, upIndexDSN, upConsoleBaselineDir, upBaselineRefreshEvery, upBaselineCarryForward); err != nil {
 		return err
 	}
 
@@ -700,7 +707,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 
 	// Keep each server's newest snapshot moving forward from the index alone
 	// (#1171). Opt-in, and refused at startup when nothing can be refreshed.
-	if err := startBaselineRefreshLoop(ctx, registry, baselineSup, upIndexDSN, upConsoleBaselineDir, upBaselineRefreshEvery); err != nil {
+	if err := startBaselineRefreshLoop(ctx, registry, baselineSup, upIndexDSN, upConsoleBaselineDir, upBaselineRefreshEvery, upBaselineCarryForward); err != nil {
 		return err
 	}
 
@@ -847,6 +854,32 @@ func newBaselineSupervisorFromConfig(ctx context.Context, stagingDir string) *ba
 	return sup
 }
 
+// envBoolOr reads a boolean environment variable, keeping fallback when the
+// variable is unset or does not parse.
+//
+// strconv.ParseBool rather than a hand-written value list, because the repo
+// already had two conventions for this (pflag's ParseBool behind
+// BINTRAIL_ULTRAFAST, any-non-empty behind BINTRAIL_DUCKDB_NO_AWS_EXT) and a
+// third one written inline would be the one nobody can predict. ParseBool is
+// the same set pflag accepts: 1/t/T/TRUE/true/True and their false twins.
+//
+// An unparseable value keeps the fallback rather than erroring, and that is the
+// conservative direction for every current caller: with no flag passed the
+// fallback is the safe default, so a typo can only fail to turn something on.
+func envBoolOr(name string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		slog.Warn("environment variable is not a true/false value, so it was ignored",
+			"variable", name, "value", raw, "using", fallback)
+		return fallback
+	}
+	return v
+}
+
 func resolveUpConsoleEnv(cmd *cobra.Command) error {
 	if !cmd.Flags().Changed("console-listen") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_LISTEN"); v != "" {
@@ -877,6 +910,9 @@ func resolveUpConsoleEnv(cmd *cobra.Command) error {
 		if v := os.Getenv("BINTRAIL_BASELINE_REFRESH_INTERVAL"); v != "" {
 			upBaselineRefreshEvery = v
 		}
+	}
+	if !cmd.Flags().Changed("baseline-carry-forward-unchanged") {
+		upBaselineCarryForward = envBoolOr("BINTRAIL_BASELINE_CARRY_FORWARD_UNCHANGED", upBaselineCarryForward)
 	}
 	if !cmd.Flags().Changed("console-servers-file") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_SERVERS"); v != "" {
@@ -1392,6 +1428,20 @@ func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Con
 			Interval:  upRotateInterval,
 			AddFuture: upRotateAddFuture,
 			Enabled:   upRotationCfg.Enabled,
+		},
+		// Same role for the baseline-refresh panel: what the daemon itself was
+		// told, reported when no console override is saved. Enabled is the
+		// loop's boot-time liveness, so the panel can say a saved setting is
+		// dormant instead of implying it is live.
+		BaselineRefreshDefaults: console.BaselineRefreshDefaults{
+			CarryForwardUnchanged: upBaselineCarryForward,
+			// Enabled is the OR because the restore consumes this setting too
+			// and is wired off the supervisor, which --baseline-trigger alone
+			// creates. Scheduled is the narrower interval-only fact. The two
+			// must be computed from the same expressions that gate the two
+			// consumers in runWatch, or the panel drifts from the daemon.
+			Enabled:   upBaselineRefreshEvery != "" || upConsoleBaselineTrigger,
+			Scheduled: upBaselineRefreshEvery != "",
 		},
 		AllowSetup: opts.AllowSetup,
 		Version:    appVersion,

@@ -3545,9 +3545,10 @@ async function renderStorage() {
   // instead of one error wiping the whole page. (A 401 inside api() raises the
   // sign-in gate and bumps serverGen, so the stale-render guard below bails.)
   const asErr = (err) => ({ error: (err && err.message) || String(err) });
-  const [serversRes, rotation, storage, baselines, telemetry] = await Promise.all([
+  const [serversRes, rotation, backupRefresh, storage, baselines, telemetry] = await Promise.all([
     api("/api/servers").catch(asErr),
     api("/api/rotation").catch(asErr),
+    api("/api/baseline-refresh").catch(asErr),
     api("/api/storage").catch(asErr),
     api("/api/baselines").catch(asErr),
     api("/api/telemetry").catch(asErr),
@@ -3556,13 +3557,13 @@ async function renderStorage() {
   // Same guard as renderOverview: a throw inside the build must show an
   // error, never leave the "Loading…" skeleton up forever.
   try {
-    buildStorage(serversRes, rotation, storage, baselines, telemetry);
+    buildStorage(serversRes, rotation, backupRefresh, storage, baselines, telemetry);
   } catch (err) {
     const v = VIEW(); clear(v); v.append(pageHead("Storage", null)); renderError(v, err);
   }
 }
 
-function buildStorage(serversRes, rotation, storage, baselines, telemetry) {
+function buildStorage(serversRes, rotation, backupRefresh, storage, baselines, telemetry) {
   // serversRes is the raw /api/servers payload or {error} — archivingPanel
   // must be able to tell "failed to load" from "genuinely no sources", or a
   // transient 500 would render the affirmative "No monitored sources yet" lie.
@@ -3577,6 +3578,7 @@ function buildStorage(serversRes, rotation, storage, baselines, telemetry) {
   const cards = el("div", { class: "cards" });
   const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
   cards.append(rotationCard(rotation));
+  cards.append(backupRefreshCard(backupRefresh));
   cards.append(credentialsCard(storage));
   cards.append(telemetryCard(telemetry));
   if (capsCache.views) cards.append(duckdbCard());
@@ -3708,11 +3710,93 @@ function rotationCard(rot) {
   kvRow(card, "retention", rot.retain);
   kvRow(card, "interval", rot.interval);
   kvRow(card, "future partitions", rot.add_future);
-  kvRow(card, "policy", rot.source === "override" ? "console override (live)" : "daemon defaults");
+  kvRow(card, "policy", rot.source === "override"
+    ? ("console override" + (rot.enabled ? " (live)" : ""))
+    : "daemon defaults");
   if (!rot.enabled) card.append(el("p", { class: "form-hint", text: "Rotation is turned off. Changes you save here won't take effect until the daemon restarts." }));
   card.append(el("div", { class: "stg-cardfoot" },
     el("button", { class: "btn btn-sm", type: "button", text: "Edit rotation…", onclick: showRotationDialog })));
   return card;
+}
+
+// backupRefreshCard exposes the one setting the automatic backup refresh has
+// that is safe to change while it runs. The schedule itself stays a daemon
+// flag, because starting a loop that was never booted needs a restart.
+//
+// The saving is real but it is not free of consequences, so the card states
+// them where the decision is made rather than in a doc nobody opens: where the
+// filesystem allows it, reusing a file leaves two backups sharing the same
+// bytes on disk, and after that, deleting the older backup does not give the
+// space back while the newer one still points at it.
+function backupRefreshCard(br) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Automatic backup refresh" }));
+  if (!br || br.error) {
+    card.append(el("p", { class: "form-hint", text: "Could not load the refresh settings" + (br && br.error ? ": " + br.error : ".") }));
+    return card;
+  }
+  const on = !!br.carry_forward_unchanged;
+  kvRow(card, "reuse files for unchanged tables", on ? "on" : "off");
+  // "(live)" is gated on enabled because the card also prints "nothing runs
+  // yet" three lines down, and one card must not make two opposite claims
+  // about the running system.
+  kvRow(card, "set by", br.source === "override"
+    ? (br.enabled ? "this page (live)" : "this page (not running yet)")
+    : "daemon default");
+  // Three states, not two. A daemon started with --baseline-trigger and no
+  // refresh schedule still applies this to restores, so calling it dormant
+  // there would let an operator hard link their files right after being told
+  // nothing runs.
+  card.append(el("p", { class: "form-hint", text: on
+    ? "A table with no changes keeps its previous file instead of being written again. Where the filesystem allows it the two backups then share the same bytes on disk, so deleting the older one frees nothing while the newer one still uses it."
+    : "Every table is written again on each refresh, even when nothing in it changed. Turning this on skips that work for unchanged tables. (CLI: --baseline-carry-forward-unchanged)" }));
+  if (!br.enabled) {
+    card.append(el("p", { class: "form-hint", text: "Nothing uses this setting yet. It applies once the daemon runs automatic refreshes or point in time restores." }));
+  } else if (!br.scheduled) {
+    card.append(el("p", { class: "form-hint", text: "No automatic refresh schedule is set, so this applies to restores you run from the Backups page. Add a schedule to have it apply to automatic refreshes too." }));
+  }
+  const foot = el("div", { class: "stg-cardfoot" },
+    el("button", {
+      class: "btn btn-sm", type: "button",
+      text: on ? "Turn off reuse" : "Turn on reuse",
+      onclick: () => saveBackupRefresh({ carry_forward_unchanged: !on }),
+    }));
+  // Only offered once something is saved here, because that is the only state
+  // it changes. Without it the toggle is a one-way door: the first save wins
+  // over the daemon flag forever, and an operator who set the flag on the
+  // command line has no way to hand the decision back short of editing the
+  // registry file by hand.
+  if (br.source === "override") {
+    foot.append(el("button", {
+      class: "btn btn-sm btn-ghost", type: "button",
+      text: "Use the daemon setting",
+      onclick: () => saveBackupRefresh({ use_default: true }),
+    }));
+  }
+  card.append(foot);
+  return card;
+}
+
+// saveBackupRefresh writes the setting and re-renders, so the card always shows
+// what the daemon will actually do rather than what was clicked.
+//
+// The confirmation is built from the RESPONSE, not from what was clicked or
+// from what the card was holding when it rendered. Those two can disagree with
+// the daemon: "Use the daemon setting" does not know in advance what the flag
+// says, and a card rendered before a restart carries a stale schedule. The PUT
+// already echoes the effective state, so reading it costs nothing.
+async function saveBackupRefresh(body) {
+  let now;
+  try {
+    now = await api("/api/baseline-refresh", { method: "PUT", body });
+  } catch (err) {
+    toastError("Could not save: " + ((err && err.message) || err));
+    return;
+  }
+  const on = !!(now && now.carry_forward_unchanged);
+  toast((now && now.enabled)
+    ? (on ? "Unchanged tables will be reused" : "Every table will be written again")
+    : "Saved. Nothing uses this setting yet, so it applies once something does.");
+  renderRoute();
 }
 
 function credentialsCard(storage) {
@@ -4025,7 +4109,17 @@ function baselineRefreshNote(rf) {
       text = "Automatic refresh running" + (rf.since ? " since " + utcLabel(rf.since) : "") + "…";
       break;
     case "succeeded":
-      text = "Automatic refresh: " + (rf.tables || 0) + " table(s) refreshed" + (when ? " at " + when : "") + ".";
+      // The two numbers PARTITION the run: rf.tables is every table, rf.carried
+      // the subset that was reused, so "refreshed" has to be the difference.
+      // Printing the total next to the subset read as "5 refreshed, 5 of them
+      // reused", which asks the operator to subtract and contradicts the rule
+      // the CLI summary follows: a reused table is not a refreshed one, and
+      // which tables actually cost a rewrite is the number worth seeing.
+      const reused = rf.carried || 0;
+      const rewritten = Math.max(0, (rf.tables || 0) - reused);
+      text = "Automatic refresh" + (when ? " at " + when : "") + ": " +
+        rewritten + " table(s) refreshed" +
+        (reused ? ", " + reused + " unchanged and reused" : "") + ".";
       break;
     case "failed":
       text = "Automatic refresh published nothing" + (when ? " at " + when : "") +
@@ -4485,8 +4579,12 @@ function backupRestoreCard(cur, b, restoreSt) {
       "Last restore published nothing: " + backupFoldError(rst.last_error || "unknown error") + " Nothing was overwritten." }));
     details.open = true;
   } else if (rst && rst.state === "succeeded") {
+    // The reused count belongs here for the same reason it belongs on the
+    // refresh note: a restore consumes the same reuse setting, and without the
+    // number nothing on this page confirms the setting did anything.
     body.append(el("p", { class: "form-hint", text:
-      "Last restore finished" + (rst.at ? ": the backup at " + utcLabel(rst.at) : "") + " is in the list below." }));
+      "Last restore finished" + (rst.at ? ": the backup at " + utcLabel(rst.at) : "") + " is in the list below." +
+      (rst.carried ? " " + rst.carried + " table(s) reused an unchanged file." : "") }));
   }
   details.append(body);
   return details;

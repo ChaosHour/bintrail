@@ -125,6 +125,16 @@ type FullTableConfig struct {
 	Parallelism int  // max concurrent tables (0 → runtime.NumCPU())
 	AllowGaps   bool // false = strict abort on gaps (default for reconstruct)
 
+	// CarryForwardUnchanged publishes a table that had NO events in the window
+	// by carrying its previous Parquet file forward (a hard link where the
+	// filesystem allows one) instead of folding an empty change map over it and
+	// re-emitting the same rows. OutputFormatParquet only.
+	//
+	// OPT-IN, and the zero value is the conservative one. The rows are the same
+	// either way; what changes is the representation on disk. See
+	// carryForwardEligible for the trade-offs an operator is agreeing to.
+	CarryForwardUnchanged bool
+
 	// WarnEventThreshold logs a loud warning when a table's fetched event count
 	// exceeds it: full-table reconstruct holds every event plus one change-map
 	// entry per touched PK in memory and can exhaust RAM at scale (#654). 0 =
@@ -1009,8 +1019,8 @@ func ReconstructTable(
 	// capGap is passed in because step 3c does NOT refuse under --allow-gaps:
 	// it returns the finding and lets the run proceed. See carryForwardEligible
 	// for why a known gap disqualifies a table from being carried at all.
-	if carryForwardEligible(cfg.OutputFormat, baselinePath, len(changes), capGap) {
-		linked, cerr := carryForward(ctx, baselinePath, cfg.snapshotDir, schema, table)
+	if carryForwardEligible(cfg.CarryForwardUnchanged, cfg.OutputFormat, baselinePath, len(changes), capGap) {
+		cerr := carryForward(ctx, baselinePath, cfg.snapshotDir, schema, table)
 		if cerr != nil {
 			return nil, fmt.Errorf("carry %s.%s forward unchanged: %w", schema, table, cerr)
 		}
@@ -1020,8 +1030,13 @@ func ReconstructTable(
 		// consumers join it themselves (internal/cli/drill.go does).
 		rep.Files = []string{filepath.Join(schema, table+".parquet")}
 		rep.Duration = time.Since(start)
+		// CarriedForward is set unconditionally above and deliberately does NOT
+		// distinguish a link from a copy: it means "published by reuse rather
+		// than by folding", which is true either way, and it is what the
+		// unchanged verdict and the console's reused count are derived from.
+		// carryForward logs the link-versus-copy split itself, with the cause.
 		slog.Info("table carried forward unchanged", "schema", schema, "table", table,
-			"linked", linked, "reason", "no events in the window")
+			"reason", "no events in the window")
 		return rep, nil
 	}
 

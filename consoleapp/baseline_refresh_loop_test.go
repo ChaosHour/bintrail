@@ -3,13 +3,17 @@ package consoleapp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/console"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
 func TestBaselineRefreshTargets(t *testing.T) {
@@ -85,7 +89,7 @@ func TestStartBaselineRefreshLoop_startupContract(t *testing.T) {
 		{"minutes are an interval", sup, "15m", "dsn", "/b", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := startBaselineRefreshLoop(ctx, nil, tc.sup, tc.dsn, tc.dir, tc.interval)
+			err := startBaselineRefreshLoop(ctx, nil, tc.sup, tc.dsn, tc.dir, tc.interval, false)
 			switch {
 			case tc.wantErr == "" && err != nil:
 				t.Fatalf("unexpected error: %v", err)
@@ -152,7 +156,7 @@ func TestRunBaselineRefreshCycle_survivesAPanic(t *testing.T) {
 			t.Fatalf("a panic escaped the refresh cycle: %v", r)
 		}
 	}()
-	runBaselineRefreshCycle(context.Background(), nil, &baselineSupervisor{}, "dsn", "/b", 0)
+	runBaselineRefreshCycle(context.Background(), nil, &baselineSupervisor{}, "dsn", "/b", 0, false)
 }
 
 // TestRunBaselineRefreshCycle_stopsOnCancel: shutdown must not start new work.
@@ -160,7 +164,7 @@ func TestRunBaselineRefreshCycle_stopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	sup := newBaselineSupervisor(ctx, t.TempDir(), baseline.DefaultLockMode)
-	runBaselineRefreshCycle(ctx, nil, sup, "dsn", "/b", 0)
+	runBaselineRefreshCycle(ctx, nil, sup, "dsn", "/b", 0, false)
 	if got := sup.RefreshStatus("default"); got.State != "idle" {
 		t.Fatalf("a cancelled cycle started work: %+v", got)
 	}
@@ -258,7 +262,7 @@ func TestRunBaselineRefreshCycle_countsAServerItCouldNotStart(t *testing.T) {
 	// shared single-flight refuse the refresh.
 	sup.jobs["default"] = &console.BaselineStatus{State: "running"}
 
-	dispatched, skipped := runBaselineRefreshCycle(ctx, nil, sup, "dsn", t.TempDir(), time.Minute)
+	dispatched, skipped, _ := runBaselineRefreshCycle(ctx, nil, sup, "dsn", t.TempDir(), time.Minute, false)
 	if dispatched != 0 || skipped != 1 {
 		t.Fatalf("cycle reported dispatched=%d skipped=%d, want 0 and 1: a busy server must be COUNTED, "+
 			"not swallowed at Debug where the default log level hides it", dispatched, skipped)
@@ -321,7 +325,7 @@ func TestReportDispatch_visibleOnlyWhenSomethingWasSkipped(t *testing.T) {
 	capture := func(dispatched, skipped int) string {
 		var buf bytes.Buffer
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-		reportDispatch(time.Minute, dispatched, skipped)
+		reportDispatch(time.Minute, dispatched, skipped, false)
 		return buf.String()
 	}
 
@@ -390,11 +394,368 @@ func TestRefreshTick_reportsTheCountersInTheRightOrder(t *testing.T) {
 	sup := newBaselineSupervisor(ctx, t.TempDir(), baseline.DefaultLockMode)
 	sup.jobs["default"] = &console.BaselineStatus{State: "running"}
 
-	refreshTick(ctx, nil, sup, "dsn", t.TempDir(), time.Minute)
+	refreshTick(ctx, nil, sup, "dsn", t.TempDir(), time.Minute, false)
 
 	out := buf.String()
 	if !strings.Contains(out, "skipped=1") || !strings.Contains(out, "dispatched=0") {
 		t.Errorf("the tick reported the counters swapped or not at all; the one busy server must read "+
 			"skipped=1 dispatched=0: %q", out)
 	}
+}
+
+// effectiveCarryForward is what makes the console panel able to change a
+// RUNNING loop, so its precedence is the contract worth pinning: a saved
+// override wins, absence falls back to the daemon flag, and an override that
+// says false must beat a daemon flag that says true (which is why the registry
+// stores a pointer and not a bare bool).
+func TestEffectiveCarryForward(t *testing.T) {
+	reg := func(t *testing.T, set *bool) *console.Registry {
+		t.Helper()
+		r, err := console.LoadRegistry(filepath.Join(t.TempDir(), "servers.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if set != nil {
+			if err := r.SetBaselineRefresh(&console.BaselineRefreshConfig{CarryForwardUnchanged: *set}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return r
+	}
+	yes, no := true, false
+
+	for _, tc := range []struct {
+		name          string
+		override      *bool
+		daemonDefault bool
+		want          bool
+	}{
+		{"no override falls back to the daemon flag (on)", nil, true, true},
+		{"no override falls back to the daemon flag (off)", nil, false, false},
+		{"an override wins when it says on", &yes, false, true},
+		// The case a bare bool in the registry could not express.
+		{"an override that says off beats a daemon flag that says on", &no, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := effectiveCarryForward(reg(t, tc.override), tc.daemonDefault); got != tc.want {
+				t.Errorf("effectiveCarryForward = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// A registry that is not there at all is not consent to change behaviour:
+	// the operator's own command line is a better answer than a silent no.
+	if !effectiveCarryForward(nil, true) {
+		t.Error("a nil registry discarded the daemon flag")
+	}
+}
+
+// The wiring, not the resolver: the value effectiveCarryForward computes has to
+// reach the requests the fold is built from. A resolver that is correct in
+// isolation proves nothing about whether the loop consults it.
+func TestRefreshTargetsFor_carriesTheEffectiveSettingIntoEveryRequest(t *testing.T) {
+	// Every leg runs against TWO servers, and every leg that asserts the
+	// setting reached the requests has a twin asserting TRUE. Both matter.
+	// With one target, gating the assignment on i == 0 is invisible. With the
+	// expected value false, so is dropping the assignment entirely: false is
+	// the zero value, so the field is already right for the wrong reason. The
+	// combination is what catches a daemon whose second and third servers
+	// silently ignore the flag and the console toggle.
+	newReg := func(t *testing.T, override *bool) *console.Registry {
+		t.Helper()
+		r, err := console.LoadRegistry(filepath.Join(t.TempDir(), "servers.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if override != nil {
+			if err := r.SetBaselineRefresh(&console.BaselineRefreshConfig{CarryForwardUnchanged: *override}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, name := range []string{"prod", "staging"} {
+			if _, err := r.Add(console.ServerEntry{
+				Name: name, DSN: "u:p@tcp(h:3306)/idx", BaselineDir: t.TempDir(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return r
+	}
+	yes, no := true, false
+
+	for _, tc := range []struct {
+		name     string
+		override *bool
+		daemon   bool
+		want     bool
+	}{
+		{"daemon flag on, nothing saved", nil, true, true},
+		{"daemon flag off, nothing saved", nil, false, false},
+		{"override on beats a flag saying off", &yes, false, true},
+		{"override off beats a flag saying on", &no, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reqs := refreshTargetsFor(newReg(t, tc.override), "dsn", "/b", tc.daemon)
+			if len(reqs) < 2 {
+				t.Fatalf("got %d targets, need at least 2 or a per-index bug stays invisible", len(reqs))
+			}
+			for i, req := range reqs {
+				if req.CarryForwardUnchanged != tc.want {
+					t.Errorf("target %d (%q): CarryForwardUnchanged = %v, want %v",
+						i, req.ServerName, req.CarryForwardUnchanged, tc.want)
+				}
+			}
+		})
+	}
+
+	// A nil registry is the source-less shape; it must still carry the flag.
+	for _, want := range []bool{true, false} {
+		reqs := refreshTargetsFor(nil, "dsn", "/b", want)
+		if len(reqs) == 0 {
+			t.Fatal("no targets, so the assertion below checks nothing")
+		}
+		for _, req := range reqs {
+			if req.CarryForwardUnchanged != want {
+				t.Errorf("daemon default %v did not reach the request for %q", want, req.ServerName)
+			}
+		}
+	}
+}
+
+// The last hop: what the request carries has to reach the fold's configuration.
+// Without this, the whole chain from the console toggle down could be correct
+// and the fold still run with the setting off, which is exactly what a mutation
+// of this line showed.
+func TestRefreshFoldConfig_carriesTheSettingAndKeepsGapsStrict(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		cfg := refreshFoldConfig(refreshRequest{
+			IndexDSN: "dsn", BaselineDir: "/b", CarryForwardUnchanged: want,
+		}, time.Now(), []string{"shop.orders"})
+		if cfg.CarryForwardUnchanged != want {
+			t.Errorf("CarryForwardUnchanged = %v, want %v", cfg.CarryForwardUnchanged, want)
+		}
+		// Pinned in the same place because it is the same class of setting and
+		// the opposite decision: an unattended job never publishes over a known
+		// permanent capture loss, whoever asked for what.
+		if cfg.AllowGaps {
+			t.Error("the refresh loop would publish over a known capture gap")
+		}
+		if cfg.OutputFormat != reconstruct.OutputFormatParquet {
+			t.Errorf("OutputFormat = %q, want parquet", cfg.OutputFormat)
+		}
+	}
+}
+
+// TestCountCarried: the reuse count is the only confirmation an operator gets
+// that the opt-in did anything, so it is derived from the per-table reports and
+// never from the setting. Asking for reuse is not getting it: a table with
+// changes, with a capture gap, or on the S3 path is folded anyway.
+func TestCountCarried(t *testing.T) {
+	rep := func(carried bool) *reconstruct.TableReport {
+		return &reconstruct.TableReport{CarriedForward: carried}
+	}
+	cases := []struct {
+		name    string
+		reports []*reconstruct.TableReport
+		want    int
+	}{
+		{"nothing folded", nil, 0},
+		{"every table rewritten", []*reconstruct.TableReport{rep(false), rep(false)}, 0},
+		{"every table reused", []*reconstruct.TableReport{rep(true), rep(true), rep(true)}, 3},
+		{"mixed, which is the normal case", []*reconstruct.TableReport{rep(true), rep(false), rep(true)}, 2},
+		{"a nil report is not a reuse", []*reconstruct.TableReport{rep(true), nil}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := countCarried(tc.reports); got != tc.want {
+				t.Errorf("countCarried = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCarryForwardProvenance: the value AND where it came from. The provenance
+// is the point: a saved override of false beats a command line saying true, and
+// without a name for that an operator watching every table get rewritten has
+// nothing anywhere telling them why.
+func TestCarryForwardProvenance(t *testing.T) {
+	cases := []struct {
+		name       string
+		override   *bool
+		daemon     bool
+		wantOn     bool
+		wantSource string
+	}{
+		{"no registry at all falls back to the flag", nil, true, true, "daemon flag or environment"},
+		{"no override, flag off", nil, false, false, "daemon flag or environment"},
+		{"override true over a flag saying false", boolPtr(true), false, true, "console setting, which overrides the daemon flag"},
+		{"override FALSE over a flag saying true", boolPtr(false), true, false, "console setting, which overrides the daemon flag"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var reg *console.Registry
+			if tc.override != nil {
+				r, err := console.LoadRegistry(filepath.Join(t.TempDir(), "servers.yaml"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := r.SetBaselineRefresh(&console.BaselineRefreshConfig{CarryForwardUnchanged: *tc.override}); err != nil {
+					t.Fatal(err)
+				}
+				reg = r
+			}
+			on, src := carryForwardProvenance(reg, tc.daemon)
+			if on != tc.wantOn {
+				t.Errorf("value = %v, want %v", on, tc.wantOn)
+			}
+			if src != tc.wantSource {
+				t.Errorf("source = %q, want %q", src, tc.wantSource)
+			}
+		})
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+// TestEnvBoolOr: the one input an operator can get wrong silently. An
+// unparseable value must keep the fallback, never be read as consent.
+func TestEnvBoolOr(t *testing.T) {
+	const name = "BINTRAIL_TEST_ENV_BOOL_OR"
+	cases := []struct {
+		raw      string
+		fallback bool
+		want     bool
+	}{
+		{"", false, false},
+		{"", true, true},
+		{"1", false, true},
+		{"true", false, true},
+		{"TRUE", false, true},
+		{"True", false, true},
+		{"t", false, true},
+		{"  true  ", false, true},
+		{"0", true, false},
+		{"false", true, false},
+		{"F", true, false},
+		// Not true/false values. Each must keep the fallback in BOTH
+		// directions: a typo can neither turn the setting on nor off.
+		{"yes", false, false},
+		{"on", false, false},
+		{"enabled", false, false},
+		{"tru", false, false},
+		{"yes", true, true},
+		{"off", true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.raw+"/"+strconv.FormatBool(tc.fallback), func(t *testing.T) {
+			t.Setenv(name, tc.raw)
+			if got := envBoolOr(name, tc.fallback); got != tc.want {
+				t.Errorf("envBoolOr(%q, fallback=%v) = %v, want %v", tc.raw, tc.fallback, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFoldOutcome: the numbers a fold reports.
+//
+// This is the hop the console's reused count travels through, and until it was
+// split out nothing at the unit tier could reach it: zeroing the count compiled
+// and passed the whole suite, because the only caller needs a live index and a
+// real baseline.
+func TestFoldOutcome(t *testing.T) {
+	rep := func(carried bool) *reconstruct.TableReport {
+		return &reconstruct.TableReport{CarriedForward: carried}
+	}
+	tables := []string{"shop.orders", "shop.users", "shop.audit"}
+
+	t.Run("clean run reports every table and the reused subset", func(t *testing.T) {
+		gotT, gotR, gotC, err := foldOutcome(tables,
+			[]*reconstruct.TableReport{rep(true), rep(false), rep(true)}, nil, nil)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if gotT != 3 || gotR != 0 || gotC != 2 {
+			t.Errorf("tables=%d refused=%d carried=%d, want 3/0/2", gotT, gotR, gotC)
+		}
+	})
+
+	t.Run("a clean run that reused nothing reports zero, not the total", func(t *testing.T) {
+		_, _, gotC, _ := foldOutcome(tables,
+			[]*reconstruct.TableReport{rep(false), rep(false), rep(false)}, nil, nil)
+		if gotC != 0 {
+			t.Errorf("carried=%d, want 0: every table was rewritten", gotC)
+		}
+	})
+
+	t.Run("a failed run still reports what the fold did", func(t *testing.T) {
+		want := errors.New("capture gap")
+		gotT, gotR, gotC, err := foldOutcome(tables,
+			[]*reconstruct.TableReport{rep(true)},
+			[]reconstruct.TableFailure{{}, {}}, want)
+		if !errors.Is(err, want) {
+			t.Fatalf("err = %v, want the run error", err)
+		}
+		// Publication is all-or-nothing, so nothing was published; the counts
+		// still describe the attempt, and refused comes from the failures.
+		if gotT != 3 || gotR != 2 || gotC != 1 {
+			t.Errorf("tables=%d refused=%d carried=%d, want 3/2/1", gotT, gotR, gotC)
+		}
+	})
+
+	t.Run("refused is zero on success even if failures were handed in", func(t *testing.T) {
+		// Guards the branch, not the caller: a clean run must report zero
+		// refused, so the success path cannot start leaking a failure count.
+		_, gotR, _, _ := foldOutcome(tables, nil, []reconstruct.TableFailure{{}}, nil)
+		if gotR != 0 {
+			t.Errorf("refused=%d on a clean run, want 0", gotR)
+		}
+	})
+}
+
+// TestApplyFoldStatus: what the console polls after a fold finishes.
+//
+// Both callers sit behind a `go` and a live fold, so this was unreachable at
+// the unit tier and existed as two byte-identical copies. Dropping the reused
+// count from either compiled and passed everything.
+func TestApplyFoldStatus(t *testing.T) {
+	t.Run("a clean run reports every count and clears the previous error", func(t *testing.T) {
+		st := &console.BaselineStatus{State: "failed", LastError: "the previous run's gap"}
+		applyFoldStatus(st, 7, 0, 3, nil)
+		if st.State != "succeeded" {
+			t.Errorf("State = %q, want succeeded", st.State)
+		}
+		if st.LastError != "" {
+			t.Errorf("LastError = %q, want cleared: a stale error outlives the run that caused it", st.LastError)
+		}
+		if st.Tables != 7 || st.Refused != 0 || st.Carried != 3 {
+			t.Errorf("tables=%d refused=%d carried=%d, want 7/0/3", st.Tables, st.Refused, st.Carried)
+		}
+		if st.FinishedAt == "" {
+			t.Error("FinishedAt is empty, so the console cannot say when this ran")
+		}
+	})
+
+	t.Run("a failed run keeps the counts and names the error", func(t *testing.T) {
+		st := &console.BaselineStatus{State: "running"}
+		applyFoldStatus(st, 7, 2, 1, errors.New("capture gap at 2026-01-01T00:00:00Z"))
+		if st.State != "failed" {
+			t.Errorf("State = %q, want failed", st.State)
+		}
+		if st.LastError == "" {
+			t.Error("LastError is empty on a failed run, so the console shows a failure with no cause")
+		}
+		if st.Tables != 7 || st.Refused != 2 || st.Carried != 1 {
+			t.Errorf("tables=%d refused=%d carried=%d, want 7/2/1", st.Tables, st.Refused, st.Carried)
+		}
+	})
+
+	t.Run("reused zero is written, not skipped", func(t *testing.T) {
+		// The field is omitempty on the wire, so a stale non-zero left behind
+		// by the PREVIOUS run would keep rendering. Assignment, not accumulation.
+		st := &console.BaselineStatus{Carried: 9}
+		applyFoldStatus(st, 2, 0, 0, nil)
+		if st.Carried != 0 {
+			t.Errorf("Carried = %d, want 0: the previous run's reuse count survived into this one", st.Carried)
+		}
+	})
 }
