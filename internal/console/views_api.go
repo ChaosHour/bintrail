@@ -63,6 +63,11 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) 
 					Schema: f.Schema, Table: f.Table, Path: f.Path,
 				})
 			}
+			// Column types for the state views' decimal casts. Best-effort and
+			// memoized per snapshot; serves the download and the SQL panel
+			// alike, both of which reach the same Parquet through the same
+			// views.
+			s.resolveBaselineDecimals(ctx, &in)
 		}
 	}
 	if len(in.ArchiveSources) == 0 && len(in.Baselines) == 0 {

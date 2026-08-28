@@ -76,8 +76,30 @@ Three properties worth knowing:
 - **The S3 secret lasts one session.** Views persist in a `.db` file; secrets do not. Reopen `lake.db` tomorrow and `SELECT * FROM events` fails with "No credentials are provided" until you run the file again (`.read views.sql`). Do not turn the secret into a `PERSISTENT` one: DuckDB resolves your credential chain at that moment and writes the resulting keys to `~/.duckdb/stored_secrets`.
 - **Archive sources are named for another machine.** An archive registered both on the generating host and in S3 is listed by its S3 location; a local path appears only when the registry holds no S3 location for it. State views point wherever `--baseline-dir`/`--baseline-s3` points, so a local baseline directory resolves only on the host that holds it. The console's own reads still prefer the local copy.
 - **It is a snapshot of the layout, not a live binding.** The event globs keep picking up newly rotated partitions on their own, but the `state_` views point at one baseline snapshot. Regenerate after taking or refreshing a baseline.
+- **Money columns are cast back to numbers.** MySQL `DECIMAL` and `NUMERIC` are stored as text in the Parquet, so that a value MySQL can hold is never rounded to fit a narrower type. The `state_` views cast them back to `DECIMAL(p,s)` using the precision and scale the column was declared with, so `sum()` and the rest work on them directly. See below for the two cases where a column stays text.
 
 `state_` views are the snapshot's rows, not the table's current state. To materialize a *later* point in time, use `bintrail reconstruct` — folding deltas back onto a baseline is what that command does, and it is not expressible as a view.
+
+### Decimal columns read as text without the views
+
+If you point DuckDB at a baseline Parquet yourself instead of using the generated views, every `DECIMAL` and `NUMERIC` column is a `VARCHAR`, and the first aggregate you write against a money column fails:
+
+```
+Binder Error: No function matches the given name and argument types 'sum(VARCHAR)'.
+```
+
+The data is fine. bintrail stores those columns as text on purpose. MySQL allows up to `DECIMAL(65,30)` while DuckDB stops at 38 digits of precision, so no single numeric type holds every value MySQL can, and picking a narrower one would silently drop digits from a value the operator chose that column to hold. The stored text is also what bintrail's own recovery paths join and compare on, byte for byte, against the value read out of the binlog.
+
+Cast it yourself, with the precision and scale from the source table:
+
+```sql
+SELECT sum(CAST(ol_amount AS DECIMAL(6,2))) FROM read_parquet('.../order_line.parquet');
+```
+
+Or generate the views and let them do it. Some columns still read as text even in the generated views, and the file names each affected table or column and says why:
+
+- **A column wider than 38 digits** has no DuckDB `DECIMAL` to be cast to. Cast it to `DOUBLE` if an approximate result answers your question.
+- **A file that carries no column types** casts nothing at all. The views read the precision out of the `CREATE TABLE` in each Parquet footer, and three kinds of file do not have one: a baseline taken before bintrail started embedding it, which gains the casts the next time it is taken or refreshed; a PostgreSQL-source baseline, which stores every value as text by design and will not gain them; and a footer that could not be read, which is the only one of the three that is a fault and the only one that puts an error in the bintrail log.
 
 ---
 

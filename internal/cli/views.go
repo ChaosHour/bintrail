@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
@@ -38,12 +40,21 @@ The generated file defines:
   state_<schema>_<table>     each table's contents as of the newest
                              discoverable baseline snapshot
 
-bintrail only writes the text: it never opens DuckDB and never runs what it
-prints. Nothing in the file writes, and no credentials appear in it — S3
-access goes through DuckDB's credential chain, the same way bintrail's own
-S3 reads do. That S3 secret lives only in the DuckDB session that runs the
-file: views persist in a database file, secrets do not, so run the file in
-every session that reads S3 (.read views.sql, or duckdb -init views.sql).
+DECIMAL and NUMERIC columns are stored as text, so that a value MySQL can hold
+is never rounded to fit a narrower type. The state views cast them back to
+DECIMAL with the precision and scale the column was declared with, read from
+each file's Parquet footer, so sum() and the rest work on them directly. A
+column too wide for DuckDB, or a baseline with no schema in its footer, stays
+text and is named in the file.
+
+bintrail never runs what it prints. It does open DuckDB once while generating,
+to read the column types out of the baseline files' Parquet footers, and that
+read touches footers only. Nothing in the file writes, and no credentials
+appear in it. S3 access goes through DuckDB's credential chain, the same way
+bintrail's own S3 reads do. That S3 secret lives only in the DuckDB session
+that runs the file: views persist in a database file, secrets do not, so run
+the file in every session that reads S3 (.read views.sql, or duckdb -init
+views.sql).
 
 Archive sources discovered from the index are named so the file works from
 another machine: an archive registered with both a local path and an S3
@@ -255,7 +266,25 @@ func resolveBaselineViews(ctx context.Context, in *views.Input) error {
 			Path:   f.Path,
 		})
 	}
+	resolveBaselineDecimals(ctx, in)
 	return nil
+}
+
+// resolveBaselineDecimals reads each table's column types out of its Parquet
+// footer, so the state views can cast the decimal columns back to numbers.
+//
+// Best-effort on purpose: types make the generated file better, they are not
+// what it is for. A footer that cannot be read costs those tables their casts
+// and says so in the file, rather than failing a command whose whole job is to
+// describe what exists.
+func resolveBaselineDecimals(ctx context.Context, in *views.Input) {
+	decimals, err := baseline.DecimalColumnsFor(ctx, in.BaselinePaths())
+	if err != nil {
+		slog.Warn("views: could not read baseline column types from the Parquet footers; "+
+			"the state views will not cast decimal columns", "error", err)
+		return
+	}
+	in.ApplyDecimals(decimals)
 }
 
 // writeViewsOutput sends the generated SQL to --out, or to stdout for "-".

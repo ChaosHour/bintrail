@@ -35,6 +35,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comment, which events it does not cover and how to add them.
 
 ### Fixed
+- **`sum()` works on a money column in the generated DuckDB views** (#1486).
+  MySQL `DECIMAL` and `NUMERIC` columns are stored as text in the baseline
+  Parquet, so the `state_<schema>_<table>` views handed DuckDB a `VARCHAR` and
+  the first aggregate anyone wrote against a money column died with
+  `No function matches the given name and argument types 'sum(VARCHAR)'`,
+  which reads like the data is wrong rather than like a storage choice. The
+  views now cast those columns back to `DECIMAL(p,s)`, using the precision and
+  scale read from the `CREATE TABLE` in each file's Parquet footer. This works
+  on baselines you already have: nothing about how a value is stored changed,
+  and nothing needs re-taking. Text remains the storage form on purpose, and
+  the reason is worth knowing before reaching for a wider type: MySQL allows
+  `DECIMAL(65,30)` while DuckDB stops at 38 digits, and the stored text is also
+  what the recovery paths join and compare on, byte for byte, against the value
+  read out of the binlog. Some columns still read as text, and the generated
+  file names each one and says why: a column wider than 38 digits has no DuckDB
+  `DECIMAL` to be cast to; a baseline taken before bintrail embedded the
+  `CREATE TABLE` in the footer carries no column types to read; and a
+  PostgreSQL-source baseline stores every value as text and never carries that
+  key, by design, so there is nothing to read. The console's SQL panel
+  executes these views and discards their
+  text, so when a file carries no column types it now says so next to the rows
+  instead of leaving a `sum(VARCHAR)` error unexplained. `docs/parquet-debugging.md`
+  covers casting by hand for anyone pointing DuckDB at the files without the
+  views.
 - **One primary-key limitation, one sentence, and `recover-cascade` no longer
   calls it a transient failure** (#1460, #1461). A primary key whose type the
   baseline canonicalizer cannot handle (`FLOAT`/`DOUBLE`, `TIME`, `BIT`,
