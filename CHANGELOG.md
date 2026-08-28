@@ -35,6 +35,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comment, which events it does not cover and how to add them.
 
 ### Fixed
+- **A crash while refreshing a schema snapshot no longer stops capture**
+  (#1497). Under `bintrail-console watch` one process is both the console and
+  the capture plane, and neither of the two goroutines behind the Status page's
+  **Refresh schema snapshot** button had a panic guard, so an internal error
+  while re-reading a source's column layout ended replication capture for every
+  monitored server. A schema snapshot that did not refresh is a degradation, a
+  daemon that stopped capturing is an outage, and the first must never cause
+  the second. This is the defect #1494 fixed for the four backup jobs, in the
+  file that fix did not cover.
+  Both goroutines are guarded now, and the guard is deliberately not a quiet
+  swallow, which would trade a loud outage for a silent one: the stack is
+  logged at error level, which is the only place it is recorded now that the
+  process does not die printing it, and the run is reported as **failed**
+  carrying the error. That second half matters as much as the first, because a
+  new snapshot is refused for a server whose previous one still reads as
+  running, so a guard that only logged would leave that server's button
+  answering "already running" until the daemon was restarted.
+  The report names the half that broke rather than hedging over both. An error
+  while reading the source's columns says capture was not touched, which the
+  ordering makes a fact rather than a guess. An error during the stream restart
+  says the schema snapshot itself was taken and recorded, keeps its table
+  counts, and says that this server's capture may now be stopped, naming the
+  page and the button that fix it (Manage servers, Start). Warning about
+  capture on every panic instead would have been a false alarm on a surface an
+  operator has to trust during an incident.
+  Two related repairs. Starting a monitored source reserves its slot before it
+  provisions, and a crash in that window used to end the process; now that one
+  can be recovered, the reserved slot is marked failed first, because nothing
+  else ever clears it and a later Start on it would have reported success while
+  doing nothing. And a snapshot that outlives its ten minute bound and then
+  crashes no longer leaves the earlier "the source did not answer" text
+  standing, which blamed the source for something this daemon did.
+  One gap is contained but not undone, and it is worth knowing about because
+  the cost is not only the stopped stream: while the restart is interrupted
+  that server can be missing from the daemon's list of active sources, so its
+  index is not archived or pruned on the rotation schedule until capture is
+  started again.
 - **The managed MCP token survives a container restart** (#1493). The token
   minted from **Settings → Connect AI** is stored as a SHA-256 hash in a file
   that had no path override, so it always resolved under `$HOME` inside the
