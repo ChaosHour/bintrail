@@ -35,6 +35,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comment, which events it does not cover and how to add them.
 
 ### Fixed
+- **One primary-key limitation, one sentence, and `recover-cascade` no longer
+  calls it a transient failure** (#1460, #1461). A primary key whose type the
+  baseline canonicalizer cannot handle (`FLOAT`/`DOUBLE`, `TIME`, `BIT`,
+  `JSON`, the spatial family) is refused on several surfaces, and each one used to word it
+  differently: full-table `reconstruct` said the type "is not in the supported
+  PK type set", the shim's full-table `_snapshot` said "the baseline merge
+  cannot canonicalize" it, and `verify` and single-row `reconstruct` said it
+  is "unsupported by the baseline canonicalizer". An operator who met two of
+  those had no way to tell it was the same refusal. All of them now render the
+  same sentence, the last one, inside whatever frame the surface needs, so
+  full-table `reconstruct` and the `_snapshot` wire error read differently
+  only where they name the table or point at `_flashback`. Full-table
+  `reconstruct` no longer ends with "file a follow-up issue if you need this
+  type"; the per-row message underneath it still carries that advice.
+  `recover-cascade` gets the bigger change. Its Phase-2 baseline lookup can
+  hit the same limit on a child table, and it used to arrive as an ordinary
+  error, which the engine filed under "baseline lookup failed ... (recovery
+  may be partial)". That reads as bad luck worth retrying, when nothing about
+  a retry can change the type of a column, and the engine re-ran the whole
+  lookup for every parent key on the edge to be refused identically each time.
+  The refusal is now recognized, reported once as a permanent property of the
+  table, and the lookup is attempted once per child table instead of once per
+  parent key. The binlog half of the recovery is untouched: only the baseline
+  join is blocked, so the children with an event inside the lookback window
+  are still reconstructed, and the ones untouched within that window are not.
+  The new caveat says exactly that, and it now says it for both kinds of root
+  event rather than assuming a deleted parent.
 - **A backup job that hits an internal error no longer stops capture**
   (#1472). Under `bintrail-console watch` one process is both the console and
   the capture plane. The four background baseline jobs (the scheduled refresh,
