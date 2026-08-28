@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.70.0] - 2026-08-28
+
 ### Added
 - **`bintrail views --include-live`** (#1480). The generated DuckDB views read
   the Parquet tier, which only holds partitions `rotate` has already archived,
@@ -33,6 +35,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index leg alone rather than no `events` view at all (#1485). Without the flag
   the file is unchanged except that it now states, in the `events` view's own
   comment, which events it does not cover and how to add them.
+
+- **S3-compatible object stores (MinIO, Wasabi, LocalStack) for every S3
+  path** (#1453, #1454). `BINTRAIL_S3_ENDPOINT=scheme://host[:port]` points
+  the SDK clients (rotation archiving, `upload`, baseline upload and prune,
+  `restore-index`, `archive reconcile`, `doctor`, `init`) AND every DuckDB
+  httpfs read (`query`/`recover` over archives, `reconstruct --baseline-s3`,
+  `verify`, the shim, the console, `--ultrafast`) at the same store; before,
+  the SDK half could follow `AWS_ENDPOINT_URL_S3` by accident while the DuckDB
+  half always went to `s3.amazonaws.com`, so a baseline that verifiably
+  existed read as missing. Bucket-in-path addressing is on by default with
+  `BINTRAIL_S3_ENDPOINT` (`BINTRAIL_S3_PATH_STYLE=false` for virtual-hosted-only
+  stores). `AWS_ENDPOINT_URL_S3`/`AWS_ENDPOINT_URL` are honored as fallbacks
+  and otherwise left to the SDK, so an environment already configured for the
+  AWS CLI keeps its behavior; an endpoint set only in `~/.aws/config` routes
+  the SDK half alone and now warns, since DuckDB reads no AWS configuration.
+  An invalid `BINTRAIL_S3_ENDPOINT` fails any command that reads or writes S3,
+  instead of falling back to AWS, on the baseline read paths too; a command
+  whose data is entirely local is not refused over a setting it never reads. Routing is applied with `SET GLOBAL`
+  rather than only inside the credentials secret, so it survives an air-gapped
+  host where the `aws` extension cannot be installed, and it reaches every
+  connection of a pool rather than the one that ran it. The
+  `views.sql` download and `bintrail views` name the endpoint in their routing
+  statements AND in their secret, so the file reads the same store from
+  another machine even when its secret fails (an interactive DuckDB continues
+  past a failed statement). Every S3 client in
+  the tree is now built by `storage.NewS3ClientFromConfig`, and CI runs the
+  round trip against a real MinIO.
 
 ### Fixed
 - **A crash while refreshing a schema snapshot no longer stops capture**
@@ -360,35 +389,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rebuilding reports the cancellation as an ordinary table failure, so only a
   shutdown observed while no table is in flight keeps its fragment.
 
-### Added
-- **S3-compatible object stores (MinIO, Wasabi, LocalStack) for every S3
-  path** (#1453, #1454). `BINTRAIL_S3_ENDPOINT=scheme://host[:port]` points
-  the SDK clients (rotation archiving, `upload`, baseline upload and prune,
-  `restore-index`, `archive reconcile`, `doctor`, `init`) AND every DuckDB
-  httpfs read (`query`/`recover` over archives, `reconstruct --baseline-s3`,
-  `verify`, the shim, the console, `--ultrafast`) at the same store; before,
-  the SDK half could follow `AWS_ENDPOINT_URL_S3` by accident while the DuckDB
-  half always went to `s3.amazonaws.com`, so a baseline that verifiably
-  existed read as missing. Bucket-in-path addressing is on by default with
-  `BINTRAIL_S3_ENDPOINT` (`BINTRAIL_S3_PATH_STYLE=false` for virtual-hosted-only
-  stores). `AWS_ENDPOINT_URL_S3`/`AWS_ENDPOINT_URL` are honored as fallbacks
-  and otherwise left to the SDK, so an environment already configured for the
-  AWS CLI keeps its behavior; an endpoint set only in `~/.aws/config` routes
-  the SDK half alone and now warns, since DuckDB reads no AWS configuration.
-  An invalid `BINTRAIL_S3_ENDPOINT` fails any command that reads or writes S3,
-  instead of falling back to AWS, on the baseline read paths too; a command
-  whose data is entirely local is not refused over a setting it never reads. Routing is applied with `SET GLOBAL`
-  rather than only inside the credentials secret, so it survives an air-gapped
-  host where the `aws` extension cannot be installed, and it reaches every
-  connection of a pool rather than the one that ran it. The
-  `views.sql` download and `bintrail views` name the endpoint in their routing
-  statements AND in their secret, so the file reads the same store from
-  another machine even when its secret fails (an interactive DuckDB continues
-  past a failed statement). Every S3 client in
-  the tree is now built by `storage.NewS3ClientFromConfig`, and CI runs the
-  round trip against a real MinIO.
-
-### Fixed
 - **`views.sql` names archives for another machine, and says how to keep S3 working**
   (#1456). The console download and `bintrail views` named an archive by its
   local path whenever a local copy with data existed on the generating host,
