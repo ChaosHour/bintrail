@@ -92,6 +92,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Fixed
+- **`export iceberg` renders a JSON column one way on both paths** (#1508).
+  The first load copied the baseline's text, which is MySQL's own rendering
+  of the document (keys in MySQL's order, a space after every comma), while
+  the deltas re-encoded the decoded row image (keys sorted, no spaces, `<`
+  escaped), so one value read as two texts depending on which run wrote the
+  row. Both paths now emit one rendering: keys sorted, no whitespace, `<`,
+  `>`, `&` and numbers as written. The load parses and re-emits the
+  baseline's text; a JSON column whose text does not parse refuses the load
+  instead of copying it. The first load records which columns it rendered
+  as JSON in the table's properties, in the same commit as the data, so
+  every later run renders the same columns whatever the schema snapshot
+  says, and a column changed between JSON and TEXT since the load is
+  refused like any other type change. A table loaded by a build without
+  this property keeps MySQL's text in its loaded rows until the table
+  directory is removed and reloaded.
 - **`list_schema_changes` keeps same-second DDLs in the order they ran**
   (#1441). `detected_at` has one-second resolution and a migration lands
   dozens of statements inside one second, but the tool sorted by that column
