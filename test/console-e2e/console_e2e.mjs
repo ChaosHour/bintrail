@@ -3671,7 +3671,12 @@ try {
   // open page counts against the cap. The cap (1500)
   // sits ~50% above the measured page (869-985 chars across the token states)
   // and 35% below the pre-simplify page (2304 measured, RED verified), so a
-  // copy edit breathes but a wall of text rings.
+  // copy edit breathes but a wall of text rings. The SQL client panel below
+  // the steps (#1446) is EXCLUDED from that measurement: the budget was
+  // calibrated on the three MCP steps, and the panel's enabled shape alone
+  // measures ~330 chars (1316 with it, 985 without), which would leave ~12%
+  // headroom and make a legit copy edit on the panel ring a guard about a
+  // different page. The panel has its own assertion further down.
   // Limit worth naming: run.sh builds without -ldflags, so this only ever
   // photographs the UNVERSIONED bundle arm.
   await page.evaluate(() => navigate("connect"));
@@ -3703,11 +3708,14 @@ try {
     const badges = Array.from(document.querySelectorAll(".view .card .cn-num")).map((n) => n.textContent).join("");
     const labels = Array.from(document.querySelectorAll(".cn-mock .cn-mock-label")).map((n) => n.textContent);
     const addrCard = document.querySelectorAll(".view .cn-card")[1];
-    const visible = (document.querySelector(".view") || { innerText: "" }).innerText;
+    const view = document.querySelector(".view") || { innerText: "", querySelector: () => null };
+    const visible = view.innerText;
+    const sqlPanel = view.querySelector(".cn-sql");
     return {
       badges,
       labels,
-      visibleChars: visible.length,
+      // Minus the SQL client panel's own text (see the budget note above).
+      visibleChars: visible.length - (sqlPanel ? sqlPanel.innerText.length : 0),
       fine: document.querySelectorAll(".view details.cn-fine").length,
       addrCopy: addrCard ? Array.from(addrCard.querySelectorAll("button")).some((b) => b.textContent === "Copy") : false,
       once: /shown only once/.test(visible),
@@ -3731,6 +3739,21 @@ try {
   (cn.once && cn.addrCopy && cn.downloadLinks === 0)
     ? ok("connect: one-time warning visible, address one click to copy, no 404able download link")
     : bad("connect: one-time warning visible, address one click to copy, no 404able download link", JSON.stringify({ once: cn.once, addrCopy: cn.addrCopy, downloadLinks: cn.downloadLinks }));
+  // The SQL client panel (#1446). run.sh opens the daemon's time-travel port,
+  // so the ENABLED shape is what gets photographed: a mysql line carrying the
+  // port and the selected server as its user (never a placeholder), with
+  // the console token nowhere on the page. The panel is NOT a .cn-card, so
+  // the three-badge assertion above stays at three.
+  const fbPort = process.env.E2E_FLASHBACK_PORT || "13308";
+  const sq = await page.evaluate(() => {
+    const p = document.querySelector(".view .cn-sql");
+    const code = p ? p.querySelector("code.cn-url") : null;
+    return { present: !!p, line: code ? code.textContent : "", text: p ? p.innerText : "" };
+  });
+  const sqLineRE = new RegExp("^mysql -h 127\\.0\\.0\\.1 -P " + fbPort + " -u \\S+ -p$");
+  (sq.present && sqLineRE.test(sq.line) && !sq.line.includes("<server") && !(TOKEN && sq.text.includes(TOKEN)))
+    ? ok("connect: SQL client panel shows the time-travel port with a mysql line for the selected server")
+    : bad("connect: SQL client panel shows the time-travel port with a mysql line for the selected server", JSON.stringify({ present: sq.present, line: sq.line }));
 
   // ── Scenario 17f — the Events skeleton is visible (#1397) ──
   //
