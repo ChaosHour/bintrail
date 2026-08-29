@@ -378,6 +378,48 @@ panel that answers whether a restore would work, far below the fold.
   empty states explain how to produce a first baseline (`bintrail dump` →
   `bintrail baseline`). When the **Create baseline** button is enabled it sits
   in this panel's header.
+- **Scheduled backups** (#1442) — a per-server timetable, set from this page:
+  every N minutes, hours or days (at least 15m), lined up on a UTC time of
+  day. The operator picks WHEN; HOW each run is made is the daemon's decision
+  per slot (`console.ChooseBackupMethod`), and the page says which one comes
+  next and why: backups that go to S3 are always **full backups** (the Create
+  backup job, reads the source, needs `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1`;
+  only a full backup uploads); a server with no previous backup on local disk
+  gets a full backup too; otherwise the newest backup is **updated from the
+  recorded changes** (the baseline-refresh fold: reads nothing from the
+  source, needs the server's own local backup directory). An update that
+  fails (a capture gap, a schema change, an internal error) falls back to a
+  full backup at the same slot when the daemon may take one (the creation
+  opt-in); otherwise that slot is recorded as skipped with both reasons.
+  Every run is a full-table snapshot, and on a server without an S3
+  destination nothing removes them automatically: the card shows the 30-day
+  count under the form, and the daemon logs it at save and at boot. Stored on the server's registry
+  entry (`backup_schedule`), read by the watch daemon every minute, so it
+  applies without a restart. The grid is fixed (`every 1d at 03:00` is 03:00
+  UTC daily; `every 6h at 03:00` is 03/09/15/21; an interval that does not
+  divide a day evenly, `5h` or `36h`, drifts through the day; the page shows
+  where it lands next). It fires only on a slot boundary the daemon is up to
+  see: a slot missed while stopped is not made up, and saving a schedule, new
+  or edited, never starts a backup on the spot (the API tells the loop the
+  save instant, so a boundary inside the next minute is not lost either). A
+  scheduled run that collides with a manual backup, restore or export skips
+  that slot rather than queuing, and the skip, like every scheduled run, is
+  written to the baseline run history (a streak of identical skips is one
+  record whose time moves to the latest missed slot) so the page shows the
+  last run, its result and the last skip after a restart too; the daemon's
+  own view of the job it last started fills in when the history file is
+  unavailable or a job died without writing one (the daemon watches every
+  job it starts, so that view is complete). When an update from the
+  recorded changes fails and a full backup is started in its place, the
+  page says so in red until a later scheduled update goes through. A
+  schedule the daemon cannot serve at all (no producer possible: creation
+  opt-in not set AND no local directory, a lock-mode misconfiguration on a
+  server whose backups go to S3, no destination) is refused on save with
+  the reason, and one already saved is reported as not runnable on the
+  page, never silently skipped.
+  `PUT`/`DELETE /api/servers/{id}/backup-schedule`; state on `GET /api/baselines`
+  (`schedule`). The daemon-wide `--baseline-refresh-interval` below is
+  independent and can run alongside.
 - **Automatic baseline refresh** — when `--baseline-refresh-interval` is set,
   the panel reports the daemon's last automatic refresh for the selected
   server: how many tables it published, or that it published nothing and why.
