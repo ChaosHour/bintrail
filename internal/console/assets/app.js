@@ -57,6 +57,27 @@ const ROUTES = ["overview", "events", "timetravel", "recover", "sql", "status", 
   // restorable", roughly two screens below the fold.
   "baselines", "verification"];
 
+// DOCS_PAGES maps a route to its page on www.dbtrail.com/docs (#1450), the
+// separately authored docs site. NOT this repo's docs/*.md: the site does not
+// serve those, and it answers HTTP 200 with a small shell for ANY /docs/
+// path, so neither a repo file nor a status code proves a link resolves.
+// assets_docs_links_test.go pins this table exactly and, with
+// BINTRAIL_CHECK_DOCS_LINKS=1, fetches each page and checks its title.
+// pageHead renders one plain link beside the title. Nothing here fetches:
+// air-gapped consoles are a first-class deployment, and a link is inert
+// offline. A view without a page of its own gets NO link on purpose
+// (Overview, Status, SQL): a link to the docs index would teach people the
+// button is noise. Extension views are out of scope.
+const DOCS_BASE = "https://www.dbtrail.com/docs/";
+const DOCS_PAGES = {
+  events: "guides/recovery",
+  recover: "guides/recovery",
+  baselines: "guides/backup-strategy",
+  verification: "guides/verify",
+  storage: "guides/capacity-planning",
+  connect: "claude/setup",
+};
+
 const MON_STATE_TITLES = {
   failed: "connection is failing and retrying automatically; press Start for details",
   stalled: "connected, but hasn't made progress for several minutes",
@@ -71,6 +92,7 @@ const ICONS = {
   warn: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>`,
   calendar: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M8 3v4M16 3v4M3 10h18"></path></svg>`,
   ext: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>`,
+  external: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"></path><path d="M20 4l-9 9"></path><path d="M19 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4"></path></svg>`,
   refresh: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>`,
 };
 
@@ -784,8 +806,25 @@ function renderNotes(node, notes) {
 
 function badge(type) { return el("span", { class: "badge " + badgeClass(type), text: type }); }
 
+// docsLink is the page-header Docs link for a route (#1450), or null when
+// DOCS_PAGES has no page for it. A plain anchor: no request, no probe.
+function docsLink(route) {
+  const slug = DOCS_PAGES[route];
+  if (!slug) return null;
+  const a = el("a", { class: "page-docs", href: DOCS_BASE + slug + "/", target: "_blank", rel: "noopener",
+    title: "Open the docs for this page in a new tab" });
+  a.append(el("span", { text: "Docs" }), icon("external"));
+  return a;
+}
+
 function pageHead(title, subNode) {
-  const head = el("div", { class: "page-head" }, el("h1", { class: "page-title", text: title }));
+  // The route is read from the location on every call, so the link follows
+  // every route change and re-render, not only the first paint. It sits
+  // BESIDE the h1, not inside it: the title wears a clipped text gradient and
+  // is read as a heading, and "Events Docs" is not the page's name.
+  const row = el("div", { class: "page-title-row" },
+    el("h1", { class: "page-title", text: title }), docsLink(routeFromLocation()));
+  const head = el("div", { class: "page-head" }, row);
   if (subNode) head.append(subNode);
   return head;
 }

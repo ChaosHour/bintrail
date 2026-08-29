@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Console pages link to their docs page** (#1450). Every view whose subject
+  has a page on www.dbtrail.com/docs now shows a small Docs link beside its
+  title, opening the page in a new tab: Events and Restore (the recovery
+  guide), Backups (backup strategy), Verification, Storage (capacity
+  planning) and Connect AI (Claude setup). It is a plain link, so an
+  air-gapped console makes no request for it. The route to page table lives
+  in one place in the console's app.js; a Go test pins it to that exact set
+  of pages, and `BINTRAIL_CHECK_DOCS_LINKS=1 go test ./internal/console/
+  -run Docs` fetches each page and checks it is the real page, not the
+  site's catch-all shell. Views with no page of their own show no link.
 - **The console's telemetry card shows the exact sample event** (#1447). The
   Usage telemetry card (Settings > Storage) gains a folded "Show a sample
   event" section with the JSON one event would carry, byte for byte as
