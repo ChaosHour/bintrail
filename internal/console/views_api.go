@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -36,11 +37,15 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) 
 	in := views.Input{
 		GeneratedAt: time.Now().UTC(),
 		Version:     s.version,
-		// The console has no --include-live and never sets LiveIndex, so the
-		// archives-only note must not tell this reader to "regenerate with a
-		// reachable index": they downloaded this file FROM a page served by
-		// that index, and regenerating gets them the same bytes.
-		LiveLegUnavailable: true,
+	}
+	// The download CAN carry the hot leg now (the "Include the live index"
+	// box), so the archives-only note names that box rather than a flag the
+	// reader is not at a command line to pass. A server this console cannot
+	// reach by host and port has no route at all, and says so instead.
+	if consoleCanOfferLiveLeg(b) {
+		in.LiveLegHowTo = liveLegHowTo
+	} else {
+		in.LiveLegUnavailable = true
 	}
 	var archiveErr error
 	in.ArchiveSources, archiveErr = consoleArchiveSources(ctx, b.db, portable)
@@ -100,6 +105,27 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) 
 	return in, nil
 }
 
+// parseIncludeLive reads the include_live parameter.
+//
+// isTrue is the house convention for a boolean query parameter and stays that
+// everywhere else, but it treats every unrecognized value as false, and here
+// false is not a harmless default: the reader gets a 200 and an archives-only
+// file whose own note tells them to tick the box they believe they ticked.
+// "on" is what a bare HTML checkbox posts, so it is a value a client really
+// sends. An unrecognized value is refused with the ones that work.
+func parseIncludeLive(v string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "":
+		return false, nil
+	case "1", "true":
+		return true, nil
+	case "0", "false":
+		return false, nil
+	}
+	return false, fmt.Errorf("include_live=%q is not a value this route understands; "+
+		"use include_live=1 to add the live index leg, or leave it out", v)
+}
+
 // handleViewsSQL serves GET /api/views.sql: the same DuckDB view definitions
 // `bintrail views` generates, with the paths resolved from the selected
 // server's bundle.
@@ -141,6 +167,12 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	includeLive, err := parseIncludeLive(r.URL.Query().Get("include_live"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	in, err := s.buildViewsInput(r.Context(), b, true)
 	switch {
 	case errors.Is(err, errNoViewSources):
@@ -155,6 +187,31 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		// the same 502 the baseline listing returns for it.
 		writeJSONError(w, http.StatusBadGateway, err.Error())
 		return
+	}
+
+	// The hot leg, only when the reader asked for it (#1480). Opt-in and never
+	// the default: it names the index by host and port in a file meant to be
+	// shared, and a query against the two-leg view reads the live capture
+	// index. Resolved AFTER the layout, so a server with nothing to describe
+	// still 404s on the cheaper answer.
+	if includeLive {
+		li, err := resolveConsoleLiveIndex(r.Context(), b)
+		var cfgErr *liveLegConfigError
+		switch {
+		case errors.As(err, &cfgErr):
+			// This server cannot carry the leg however it is asked for.
+			writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		case err != nil:
+			// The index could not be asked. Same upstream-fault answer the
+			// baseline listing gives, and never a file that silently drops
+			// the half the reader ticked a box for.
+			writeJSONError(w, http.StatusBadGateway, scrubDSNError(err, b.dsn))
+			return
+		}
+		in.LiveIndex = li
+		// A file that HAS the leg needs no note about how to add one.
+		in.LiveLegHowTo = ""
 	}
 
 	sqlText := views.Generate(in)
