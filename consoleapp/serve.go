@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -289,13 +290,48 @@ func runServe(cmd *cobra.Command, args []string) error {
 // the console's mode. The URL never carries a ?token= unless an explicit token
 // is the only credential (URL() handles that); a live credential does not
 // belong in logs or shell history.
-// sqlPanelEnabled reads the SQL panel opt-in (#1177). Env-only and off by
-// default, mirroring BINTRAIL_CONSOLE_BASELINE_TRIGGER: an explicit operator
-// assertion, not something a stray flag in a wrapper script flips on. Shared
-// by serve and watch.
+// sqlPanelEnabled resolves the SQL page's state (#1177). Env-only, ON by
+// default, and shared by serve and watch.
+//
+// The default lives here rather than in the bundled docker-compose.yml
+// (#1529). It used to be the other way round: the binary defaulted off and the
+// compose file turned it on. The compose file belongs to the operator and is
+// downloaded once, so pulling a newer image delivered the page to nobody, and
+// the product decision "this is on" sat in a file we cannot update.
+//
+// On by default is defensible because the page's other layers do not move
+// (internal/console/sqlpanel.go): POST /api/sql is behind console auth, carries
+// PermQueryExecute, is refused outright while an access-control profile is
+// active, answers SELECT only inside a sandboxed DuckDB session with no
+// filesystem access outside the resolved archive and baseline roots, and never
+// serves the paid forensics columns. It reads what the console already serves.
+//
+// The availability side, which those layers do not cover: under `watch` this
+// process is also the capture plane, so a panel query competes with capture for
+// the daemon's memory and CPU. What bounds it is the same for every install:
+// one query at a time per process, the conservative DuckDB budget (never
+// ultrafast), a hard timeout, and an authenticated caller. Turning the page on
+// by default extends that from the bundled stack to every bare `watch`, which
+// is the trade this default makes.
+//
+// It fails CLOSED, and NOT through envBoolOr. The variable is an opt-OUT now:
+// an operator types it when they want the page gone, and strconv.ParseBool
+// rejects "off", "no" and "disabled". Reading those as ON would keep a
+// server-side SQL surface open for someone who believes they closed it, with a
+// log line as the only signal. Under the old opt-in body every one of those
+// spellings meant off, so this keeps the direction that was already true.
 func sqlPanelEnabled() bool {
-	v := os.Getenv("BINTRAIL_CONSOLE_SQL_PANEL")
-	return v == "1" || v == "true"
+	raw := strings.TrimSpace(os.Getenv("BINTRAIL_CONSOLE_SQL_PANEL"))
+	if raw == "" {
+		return true
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		slog.Warn("BINTRAIL_CONSOLE_SQL_PANEL is not a true or false value, so the SQL page is hidden. Use 1 or 0",
+			"value", raw)
+		return false
+	}
+	return v
 }
 
 func printConsoleBanner(srv *console.Server, headline string) {

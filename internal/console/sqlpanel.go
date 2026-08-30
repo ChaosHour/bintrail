@@ -35,7 +35,16 @@ package console
 //     (console/sql.run) with its outcome (ok/refused/error) — including one the
 //     gate refuses. Only a request the client aborted mid-flight is silent
 //     (there is no one to answer, and it is not a policy event).
-//  6. Opt-in: off by default behind BINTRAIL_CONSOLE_SQL_PANEL=1.
+//  6. Reachable: ON by default, hidden by BINTRAIL_CONSOLE_SQL_PANEL=0. The
+//     default moved out of the bundled compose file and into the daemon in
+//     #1529 — a default that lives in a file the operator downloaded once
+//     reaches new installs only. It is layers 1-5, plus console sign-in, that
+//     make the page safe to reach; the switch decides whether it is offered,
+//     not whether it is guarded. Availability, which those layers do not
+//     cover: under `watch` this is also the capture process, so a query here
+//     competes with capture for memory and CPU. Bounded by 3 above plus an
+//     authenticated caller, and the default extends that from the bundled
+//     stack to every bare `watch` (see consoleapp.sqlPanelEnabled).
 //
 // Cancellation is the HTTP request's own lifetime: the browser aborts the
 // fetch, r.Context() dies, and the DuckDB query is interrupted through
@@ -179,7 +188,7 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 	reqStart := time.Now()
 	if !s.sqlPanel {
 		writeJSONError(w, http.StatusForbidden,
-			"the SQL panel is not enabled; start the console with BINTRAIL_CONSOLE_SQL_PANEL=1")
+			"the SQL page is turned off on this console by BINTRAIL_CONSOLE_SQL_PANEL; it is on by default")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, sqlPanelMaxStatementBytes)

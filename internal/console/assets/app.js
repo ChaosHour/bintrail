@@ -873,7 +873,10 @@ function navigate(route, params, push = true) {
   // snapshot listing and the verification runner). Same treatment, so a
   // bookmark to either lands on Overview rather than an empty page.
   if ((route === "baselines" || route === "verification") && !capsCache.monitor) route = "overview";
-  // The SQL panel is opt-in (BINTRAIL_CONSOLE_SQL_PANEL) and per-server gated.
+  // The SQL panel is on unless BINTRAIL_CONSOLE_SQL_PANEL turns it off (0,
+  // false, or any value the daemon cannot read as true or false, which fails
+  // closed), and per-server gated (a server with no archive or baseline
+  // layout to query has no page).
   if (route === "sql" && !capsCache.sql) route = "overview";
   const qs = params && Object.keys(params).length
     ? "?" + new URLSearchParams(params).toString() : "";
@@ -5472,7 +5475,7 @@ function verifyRegions(servers, opts) {
       el("div", { class: "stg-empty" },
         el("p", { class: "stg-empty-lead", text: "Verification from the console is turned off." }),
         el("p", { class: "stg-empty-sub", text:
-          "Ask whoever manages this server to turn it on (set BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 and restart). Already on the default setup? Re-download docker-compose.yml, because \"docker compose pull\" alone does not add new settings to a file you already have." })));
+          "Ask whoever manages this server to turn it on (set BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 and restart). Already on the default setup? Take the current docker-compose.yml beside yours and merge your edits in, because \"docker compose pull\" alone does not add new settings to a file you already have." })));
     return [card];
   }
   if (!cur || !cur.id) {
