@@ -124,6 +124,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Fixed
+- **`export iceberg` no longer records `snapshot_id: 0` for a zero-row first
+  load** (#1509). A baseline with zero rows commits the table and its cursor
+  and no data file, so the table has no Iceberg snapshot; the audit event
+  named snapshot `0`, an id no snapshot has. The event still fires (a table
+  and a cursor were written) with `rows: 0` and no `snapshot_id`. The
+  `--format json` outcome already left the field out, but only because 0 is
+  the zero value; it now leaves it out on absence. `Outcome.SnapshotID` and
+  `Commit.SnapshotID` are `*int64`, nil when absent.
 - **`export iceberg` renders a JSON column one way on both paths** (#1508).
   The first load copied the baseline's text, which is MySQL's own rendering
   of the document (keys in MySQL's order, a space after every comma), while
