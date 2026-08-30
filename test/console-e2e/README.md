@@ -53,6 +53,7 @@ down.
 | overview: window honesty (×2) | `buildOverview` window line uses the fetched window's own bounds, never `status.coverage` (#679/#686) |
 | storage: Create-baseline gates (×5) | the button's double-gate (#686): live enabled arm, destination-missing arm, capability-off arm; the fixture snapshot listed |
 | telemetry: sample event (×3) | the Storage card's "Show a sample event" fold (#1447): closed by default, opens to a read-only `<pre>` carrying the daemon's `sample_event` string verbatim (never re-serialized in the frontend) |
+| access profiles (×6) | the Settings > Access profiles page (#1445): reachable from the sidebar on a fresh index, the real forms author a flag, a profile and a deny rule onto the index, a refusal shows the shared message, and the Remove buttons take everything back off |
 | no uncaught JS errors | any thrown error over the whole drive |
 
 Adding a scenario: append an `ok(...)`/`bad(...)` block in `console_e2e.mjs`.

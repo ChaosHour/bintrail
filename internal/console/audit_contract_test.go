@@ -54,6 +54,10 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 		wantActor  string
 		wantSchema string
 		wantTable  string
+		// wantDetail is the part of Detail that names WHAT changed (the
+		// flag, profile or rule); a verb audited without it says only that
+		// something was edited.
+		wantDetail map[string]string
 		call       func(t *testing.T)
 	}{
 		{
@@ -158,6 +162,117 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 				}
 			},
 		},
+		// The six access-profile verbs (#1445): each drives its real handler
+		// over a sqlmock index whose Exec succeeds, then the readback the
+		// handler answers with. The emission sits after the write and before
+		// the readback, so a readback failure still leaves the change audited.
+		{
+			name:       "flag add",
+			action:     "flag.add",
+			wantActor:  tokenActor,
+			wantSchema: "app",
+			wantTable:  "users",
+			wantDetail: map[string]string{"flag": "pii", "column": "email", "server": bootServerID},
+			call: func(t *testing.T) {
+				db, mock, closeDB := newSQLMock(t)
+				defer closeDB()
+				expectFlagLookup(mock, nil)
+				mock.ExpectExec("INSERT INTO table_flags").WillReturnResult(sqlmock.NewResult(1, 1))
+				expectAccessDoc(mock)
+				w := driveAccess(t, newBootServer(db), (*Server).handleAccessFlagAdd,
+					`{"flag":"pii","schema":"app","table":"users","column":"email"}`)
+				if w.Code != http.StatusOK {
+					t.Fatalf("flag add: code=%d body=%s", w.Code, w.Body.String())
+				}
+			},
+		},
+		{
+			name:       "flag remove",
+			action:     "flag.remove",
+			wantActor:  tokenActor,
+			wantSchema: "app",
+			wantTable:  "users",
+			wantDetail: map[string]string{"flag": "pii", "column": "email", "server": bootServerID},
+			call: func(t *testing.T) {
+				db, mock, closeDB := newSQLMock(t)
+				defer closeDB()
+				mock.ExpectExec("DELETE FROM table_flags").WillReturnResult(sqlmock.NewResult(0, 1))
+				expectAccessDoc(mock)
+				w := driveAccess(t, newBootServer(db), (*Server).handleAccessFlagRemove,
+					`{"flag":"pii","schema":"app","table":"users","column":"email"}`)
+				if w.Code != http.StatusOK {
+					t.Fatalf("flag remove: code=%d body=%s", w.Code, w.Body.String())
+				}
+			},
+		},
+		{
+			name:       "profile add",
+			action:     "profile.add",
+			wantActor:  tokenActor,
+			wantDetail: map[string]string{"profile": "marketing", "server": bootServerID},
+			call: func(t *testing.T) {
+				db, mock, closeDB := newSQLMock(t)
+				defer closeDB()
+				expectProfileLookup(mock, "")
+				mock.ExpectExec("INSERT INTO profiles").WillReturnResult(sqlmock.NewResult(1, 1))
+				expectAccessDoc(mock)
+				w := driveAccess(t, newBootServer(db), (*Server).handleAccessProfileAdd, `{"name":"marketing"}`)
+				if w.Code != http.StatusOK {
+					t.Fatalf("profile add: code=%d body=%s", w.Code, w.Body.String())
+				}
+			},
+		},
+		{
+			name:       "profile remove",
+			action:     "profile.remove",
+			wantActor:  tokenActor,
+			wantDetail: map[string]string{"profile": "marketing", "server": bootServerID},
+			call: func(t *testing.T) {
+				db, mock, closeDB := newSQLMock(t)
+				defer closeDB()
+				mock.ExpectExec("DELETE FROM profiles").WillReturnResult(sqlmock.NewResult(0, 1))
+				expectAccessDoc(mock)
+				w := driveAccess(t, newBootServer(db), (*Server).handleAccessProfileRemove, `{"name":"marketing"}`)
+				if w.Code != http.StatusOK {
+					t.Fatalf("profile remove: code=%d body=%s", w.Code, w.Body.String())
+				}
+			},
+		},
+		{
+			name:       "access rule add",
+			action:     "access.add",
+			wantActor:  tokenActor,
+			wantDetail: map[string]string{"profile": "marketing", "flag": "pii", "permission": "deny", "server": bootServerID},
+			call: func(t *testing.T) {
+				db, mock, closeDB := newSQLMock(t)
+				defer closeDB()
+				mock.ExpectQuery("SELECT id FROM profiles").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(7)))
+				mock.ExpectExec("INSERT INTO access_rules").WillReturnResult(sqlmock.NewResult(1, 1))
+				expectAccessDoc(mock)
+				w := driveAccess(t, newBootServer(db), (*Server).handleAccessRuleAdd,
+					`{"profile":"marketing","flag":"pii","permission":"deny"}`)
+				if w.Code != http.StatusOK {
+					t.Fatalf("rule add: code=%d body=%s", w.Code, w.Body.String())
+				}
+			},
+		},
+		{
+			name:       "access rule remove",
+			action:     "access.remove",
+			wantActor:  tokenActor,
+			wantDetail: map[string]string{"profile": "marketing", "flag": "pii", "server": bootServerID},
+			call: func(t *testing.T) {
+				db, mock, closeDB := newSQLMock(t)
+				defer closeDB()
+				mock.ExpectExec("DELETE ar FROM access_rules").WillReturnResult(sqlmock.NewResult(0, 1))
+				expectAccessDoc(mock)
+				w := driveAccess(t, newBootServer(db), (*Server).handleAccessRuleRemove,
+					`{"profile":"marketing","flag":"pii"}`)
+				if w.Code != http.StatusOK {
+					t.Fatalf("rule remove: code=%d body=%s", w.Code, w.Body.String())
+				}
+			},
+		},
 		{
 			name:      "authz denial",
 			action:    "authz.denied",
@@ -229,6 +344,11 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 			}
 			if tc.wantSchema != "" && (ev.Schema != tc.wantSchema || ev.Table != tc.wantTable) {
 				t.Errorf("schema/table = %q/%q, want %q/%q", ev.Schema, ev.Table, tc.wantSchema, tc.wantTable)
+			}
+			for k, want := range tc.wantDetail {
+				if got, ok := ev.Detail[k]; !ok || got != want {
+					t.Errorf("Detail[%q] = %q (present=%v), want %q: the event must name what changed", k, got, ok, want)
+				}
 			}
 			observed = append(observed, audittest.Pair{Surface: ev.Surface, Action: ev.Action})
 		})
