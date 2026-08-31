@@ -4172,91 +4172,84 @@ function stagingCard(storage, servers) {
 // toggle. Turning it off here stops THIS running daemon's beacons immediately
 // (the daemon wired its live client) and persists the choice for every bintrail
 // process on the machine.
-// duckdbCard offers the generated DuckDB schema for this server's Parquet
-// layout. The console does not run the SQL and gains no query engine: the file
-// is executed by the operator's own DuckDB, on their machine, which is why
-// "unrestricted SQL over your lake" needs no sandbox, timeout or result cap here.
+// duckdbShape draws what the downloaded file will contain, instead of
+// describing it (#1549 follow-up). The card used to carry three checkboxes and
+// three multi-line caveats; the one decision a reader actually makes is whether
+// to include the change log, and its whole cost is a shape: your tables are one
+// file each, the change log is one file per archived hour and grows forever.
 //
-// It was titled "Query in DuckDB" (#1528). No query happens here, and /sql is
-// the page that DOES run DuckDB, server-side. The two are NOT merged: they are
-// gated by different capabilities (views vs sql), so on a daemon with views on
-// and sql off the merge would make this card unreachable. Rename only.
+// Ticking the box LIGHTS THE STRIP. That is the cost statement: three tiles
+// against a run of bars that is CLIPPED on purpose and fades off the edge,
+// because the claim is that it grows without end -- a row stopping flush at a
+// right edge draws a closed set, and the reader counts it. Built with el() and not svgEl,
+// which only DOMParses static icon constants (see the note at the top of this
+// file).
 //
-// The title is load-bearing beyond this card: liveLegHowTo (views_live.go)
-// names it inside the generated views.sql, so the two are pinned together by a
-// guard.
-function duckdbCard() {
-  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Download a DuckDB schema" }));
-  card.append(el("p", { class: "form-hint", text:
-    "Download a ready-made schema over your backups: one view per table, as of the newest " +
-    "backup. Run it in your own DuckDB; nothing runs here." }));
-  card.append(el("p", { class: "form-hint", text:
-    "No credentials are in the file, so it is safe to share." }));
-  // Following the newest backup is the default (#1484), so the box offers the
-  // opposite: an operator who wants a fixed point in time asks for it. The
-  // hint describes what leaving the box off ASKS FOR, not what the file will
-  // necessarily do: a backup folder written by an older build carries no
-  // pointer to follow until its next backup completes, and an S3 destination
-  // has none at all. The generated file states which of the two it did, which
-  // is why the hint says to read it there rather than hedging every case here.
-  // The three options are FOLDED (#1549). They moved onto Connect, a page whose
-  // e2e budget caps visible text because #1430 established that spelling every
-  // contingency out in the open reads as a wall: the card arrived at 2052 chars
-  // against a 1500 budget and failed that guard. cnFine is the page's own
-  // mechanism for exactly this, so the facts stay on the page and stop being
-  // the first thing a first-time reader meets.
-  const opts = [];
-  const pin = el("input", { type: "checkbox", name: "pin_snapshot" });
-  opts.push(el("label", { class: "check" }, pin,
-    el("span", { text: "Pin to the backup that exists now" })));
-  opts.push(el("p", { class: "form-hint", text:
-    "Left off, the views follow the newest backup where the backup folder supports it, so a " +
-    "scheduled backup reaches this file without downloading it again. Tick it to keep the rows " +
-    "as they are today. The file says which one it did. (CLI: bintrail views --pin-snapshot)" }));
-  // The change log (#1535). Opt-in since it stopped being the default: defining
-  // that view opens one Parquet footer per archived file before it returns a row,
-  // so a reader who only wanted their tables used to pay for the whole archive to
-  // get them. The cost is stated on the page, not only in the generated file:
-  // by the time they read the file, the bind is already running.
-  const events = el("input", { type: "checkbox", name: "include_events" });
-  opts.push(el("label", { class: "check" }, events,
-    el("span", { text: "Include the change log" })));
-  opts.push(el("p", { class: "form-hint", text:
-    "Adds a view over every archived change. It takes longer to open the further back your " +
-    "archive goes, because it reads a piece of every archived file before answering anything. " +
-    "(CLI: bintrail views --include-events)" }));
-  // The live leg (#1480) is a leg OF the change-log view, so it is nested under
-  // it rather than offered beside it: ticked alone it would ask for a leg of a
-  // view this file would not define, which the route refuses.
-  const live = el("input", { type: "checkbox", name: "include_live", disabled: true });
-  const liveLabel = el("label", { class: "check check-sub" }, live,
-    el("span", { text: "…and the live index" }));
-  opts.push(liveLabel);
-  const liveHint = el("p", { class: "form-hint form-hint-sub", text:
-    "Adds the most recent changes, the ones not archived yet. Every query over that leg scans the whole live capture index and competes " +
-    "with capture on that server. The file will hold the index host and user, never its password: " +
-    "fill that in when you run it. (CLI: bintrail views --include-live)" });
-  opts.push(liveHint);
-  events.onchange = () => {
-    live.disabled = !events.checked;
-    // Cleared, not merely disabled: a disabled box KEEPS its checked state and
-    // the request reads .checked, so leaving it set would send include_live=1
-    // for a file with no change log, which the route refuses.
-    if (!events.checked) live.checked = false;
-    liveLabel.classList.toggle("is-disabled", !events.checked);
-    liveHint.classList.toggle("is-disabled", !events.checked);
+// The picture can lie in a way prose cannot, so it is pinned: the strip is
+// rendered only for the parameter the card can actually send, and the guard in
+// assets_duckdbcard_test.go fails if the two come apart.
+function duckdbShape() {
+  const tiles = (n, cls, rowCls) => {
+    const row = el("div", { class: "dk-row" + (rowCls ? " " + rowCls : "") });
+    for (let i = 0; i < n; i++) row.append(el("span", { class: cls }));
+    return row;
   };
-  card.append(cnFine("Change what the file covers", ...opts));
+  const state = el("div", { class: "dk-part" },
+    tiles(3, "dk-tile"),
+    el("div", { class: "dk-cap", text: "your tables" }));
+  const events = el("div", { class: "dk-part dk-off" },
+    tiles(60, "dk-bar", "dk-strip"),
+    el("div", { class: "dk-cap", text: "every change, hour by hour" }));
+  return { el: el("div", { class: "dk-shape" }, state, events), events };
+}
+
+// duckdbPanel offers the generated DuckDB schema for this server's Parquet.
+//
+// It is NOT the console SQL page, which #1549 removed: nothing here executes.
+// The title is load-bearing beyond this panel and must not be renamed casually
+// (it was "Query in DuckDB" until #1528).
+function duckdbPanel() {
+  // A section, not a .cn-card. sqlClientPanel already drew this line for the
+  // identical case: "the three numbered cards are the Connect AI how-to, and
+  // this is a different client". A schema file for the reader's own DuckDB is
+  // one step further out — it never talks to this console at all.
+  //
+  // Staying in the grid was not a styling choice to undo later: .cards tints
+  // every child by position, so the card took amber and read as a fourth step
+  // in a page that promises three. And the tint was eating the drawing —
+  // style.css records --surface-3 at 1.021 against orange-tint, under the 1.02
+  // identity floor, which is exactly the fill the tiles and bars are drawn in.
+  // Out here they get their hairline back.
+  const card = el("section", { class: "ov-panel cn-dk", style: "margin-top:18px" });
+  card.append(el("div", { class: "ov-panel-head" },
+    el("h2", { class: "ov-panel-title", text: "Download a DuckDB schema" })));
+  const body = el("div", { class: "cn-dk-body" });
+  card.append(body);
+  const shape = duckdbShape();
+  body.append(shape.el);
+
+  // One checkbox. --pin-snapshot and --include-live are still route parameters
+  // and CLI flags; they are not decisions to put in front of a first-time
+  // reader. The live leg in particular can compete with capture on the source,
+  // which is not something to offer two clicks from a page that explains
+  // nothing.
+  const events = el("input", { type: "checkbox", name: "include_events" });
+  body.append(el("label", { class: "check" }, events,
+    el("span", { text: "Include the change log" })));
+  events.onchange = () => shape.events.classList.toggle("dk-off", !events.checked);
   events.onchange();
-  const btn = el("button", { class: "btn btn-sm", type: "button", text: "Open in DuckDB…" });
+
+  body.append(cnFine("More about this file",
+    el("p", { class: "form-hint", text:
+      "Runs in your own DuckDB. Nothing runs here, and no credentials are in the file." }),
+    el("p", { class: "form-hint", text:
+      "The views follow your newest backup where the backup folder supports it. (CLI: bintrail views)" })));
+
+  const btn = el("button", { class: "btn btn-sm", type: "button", text: "Download views.sql" });
   btn.onclick = async () => {
     btn.disabled = true;
     try {
-      const params = [];
-      if (pin.checked) params.push("pin_snapshot=1");
-      if (events.checked) params.push("include_events=1");
-      if (events.checked && live.checked) params.push("include_live=1");
-      const sql = await apiText("/api/views.sql" + (params.length ? "?" + params.join("&") : ""));
+      const sql = await apiText("/api/views.sql" + (events.checked ? "?include_events=1" : ""));
       downloadBlob("views.sql", sql, "text/plain");
       toast("views.sql downloaded. In DuckDB run .read views.sql, once per session.");
     } catch (err) {
@@ -4265,7 +4258,7 @@ function duckdbCard() {
       btn.disabled = false;
     }
   };
-  card.append(el("div", { class: "stg-cardfoot" }, btn));
+  body.append(el("div", { class: "stg-cardfoot" }, btn));
   return card;
 }
 
@@ -6410,8 +6403,8 @@ function buildConnect(servers, tokStatus, minted, fbStatus) {
   // file executes nothing. That page is now gone entirely, so this is the only
   // route to the download. Appended LAST so the .cards nth-child(4n+1) tint
   // keeps landing on the same card it does today.
-  if (capsCache.views) cards.append(duckdbCard());
   v.append(cards);
+  if (capsCache.views) v.append(duckdbPanel());
   if (capsCache.mcp) v.append(otherClientsPanel(servers));
   v.append(sqlClientPanel(servers, fbStatus));
   viewEnter();
