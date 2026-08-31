@@ -139,11 +139,7 @@ func TestPGBaseline_Integration(t *testing.T) {
 	}
 
 	// ── Snapshot directory, markers, manifest ──
-	entries, err := os.ReadDir(outDir)
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("expected exactly one snapshot dir in %s: %v (%d entries)", outDir, err, len(entries))
-	}
-	snapDir := filepath.Join(outDir, entries[0].Name())
+	snapDir := singleSnapshotDir(t, outDir)
 	if _, err := os.Stat(filepath.Join(snapDir, baseline.SuccessMarker)); err != nil {
 		t.Errorf("_SUCCESS marker missing: %v", err)
 	}
@@ -284,11 +280,7 @@ func TestPGBaseline_Integration(t *testing.T) {
 	if stats2.AnchorLSN < stats.AnchorLSN {
 		t.Errorf("re-baseline anchor %d < first anchor %d — anchors must be monotonic", stats2.AnchorLSN, stats.AnchorLSN)
 	}
-	entries2, err := os.ReadDir(outDir2)
-	if err != nil || len(entries2) != 1 {
-		t.Fatalf("re-baseline snapshot dir: %v (%d entries)", err, len(entries2))
-	}
-	snapDir2 := filepath.Join(outDir2, entries2[0].Name())
+	snapDir2 := singleSnapshotDir(t, outDir2)
 	if !baseline.SnapshotComplete(snapDir2) {
 		t.Error("re-baseline snapshot not complete")
 	}
