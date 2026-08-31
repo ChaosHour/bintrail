@@ -33,10 +33,17 @@ var errNoViewSources = errors.New("this server has no archived partitions and no
 // so it takes the S3 location whenever one is registered (#1456); the SQL panel
 // runs in this daemon and keeps the local-first routing every other console
 // read uses.
-func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) (views.Input, error) {
+// omitEvents is a PARAMETER rather than something the caller sets afterwards:
+// NeedsS3 below asks whether the rendered file reads any s3:// path, and the
+// events view is the half that reads the archives. Set after this returns, the
+// gate ran with the zero value and a default download 502'd over an S3 variable
+// its file never touches -- while the CLI, which knows before it asks, did not.
+// The SQL panel passes false: it decides through OnlyViews.
+func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable, omitEvents bool) (views.Input, error) {
 	in := views.Input{
 		GeneratedAt: time.Now().UTC(),
 		Version:     s.version,
+		OmitEvents:  omitEvents,
 	}
 	// The download CAN carry the hot leg now (the "Include the live index"
 	// box), so the archives-only note names that box rather than a flag the
@@ -114,6 +121,18 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) 
 // "on" is what a bare HTML checkbox posts, so it is a value a client really
 // sends. An unrecognized value is refused with the ones that work.
 func parseIncludeLive(v string) (bool, error) {
+	return parseStrictInclude("include_live", "add the live index leg", v)
+}
+
+// parseIncludeEvents reads the include_events parameter (#1535). Same strictness
+// and for the same reason as include_live: a silently-false unrecognized value
+// hands back a 200 and a file missing the very view the reader asked for, and
+// the file's own note then tells them to ask for it.
+func parseIncludeEvents(v string) (bool, error) {
+	return parseStrictInclude("include_events", "add the events view", v)
+}
+
+func parseStrictInclude(name, does, v string) (bool, error) {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "":
 		return false, nil
@@ -122,8 +141,8 @@ func parseIncludeLive(v string) (bool, error) {
 	case "0", "false":
 		return false, nil
 	}
-	return false, fmt.Errorf("include_live=%q is not a value this route understands; "+
-		"use include_live=1 to add the live index leg, or leave it out", v)
+	return false, fmt.Errorf("%s=%q is not a value this route understands; "+
+		"use %s=1 to %s, or leave it out", name, v, name, does)
 }
 
 // handleViewsSQL serves GET /api/views.sql: the same DuckDB view definitions
@@ -172,8 +191,24 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	includeEvents, err := parseIncludeEvents(r.URL.Query().Get("include_events"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// The same refusal the CLI gives, for the same reason: the live leg hangs
+	// on the events view, so asking for it without the view is a request the
+	// route cannot honour. Refused rather than quietly upgraded — the events
+	// view is the expensive one and turning it on unasked is a cost the reader
+	// pays on every query.
+	if includeLive && !includeEvents {
+		writeJSONError(w, http.StatusBadRequest,
+			"include_live adds a leg to the events view, which this file would not define: "+
+				"pass include_events=1 with it")
+		return
+	}
 
-	in, err := s.buildViewsInput(r.Context(), b, true)
+	in, err := s.buildViewsInput(r.Context(), b, true, !includeEvents)
 	switch {
 	case errors.Is(err, errNoViewSources):
 		// Nothing to describe. A file of comments explaining that would be a
@@ -212,6 +247,20 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		in.LiveIndex = li
 		// A file that HAS the leg needs no note about how to add one.
 		in.LiveLegHowTo = ""
+	}
+
+	// AFTER the live leg is resolved, since that leg can be the only thing
+	// defining the events view. errNoViewSources above answers "this server has
+	// nothing to describe"; this answers the narrower and newer case: sources
+	// exist, but with the events view left out and no baseline snapshot to
+	// build state views from, the file would carry no view at all. Served as a
+	// 200 it looked like a successful download of an empty schema.
+	if !in.RendersAnyView() {
+		writeJSONError(w, http.StatusNotFound,
+			"this would define no view at all: no baseline snapshot was found to build "+
+				"state views from, and the change log is not included. Take a backup, or "+
+				"tick \"Include the change log\" to get a view over the archived changes")
+		return
 	}
 
 	sqlText := views.Generate(in)

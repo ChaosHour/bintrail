@@ -34,11 +34,16 @@ read_parquet globs.
 
 The generated file defines:
 
-  events                     every archived binlog event across all archive
-                             sources, with event_type decoded and the commit
-                             timestamp typed
   state_<schema>_<table>     each table's contents as of the newest
                              discoverable baseline snapshot
+  events                     every archived binlog event across all archive
+                             sources, with event_type decoded and the commit
+                             timestamp typed -- only with --include-events
+
+The events view is opt-in because defining it is expensive: DuckDB opens one
+Parquet footer per archived file before the view returns a single row, so the
+cost grows with the archive and is paid by every reader of the file, including
+one who only wanted their tables. The state views read one file per table.
 
 DECIMAL and NUMERIC columns are stored as text, so that a value MySQL can hold
 is never rounded to fit a narrower type. The state views cast them back to
@@ -67,16 +72,21 @@ Archive sources come from the index's archive_state registry by default. Pass
 --archive-dir/--archive-s3 with --bintrail-id to name one explicitly instead;
 in that case --index-dsn is not needed at all.
 
-The file is a snapshot of the layout, not a live binding. The event globs keep
-picking up newly rotated partitions on their own, but the state views point at
-one snapshot: regenerate after taking or refreshing a baseline. A daemon running
-bintrail-console watch --baseline-refresh-interval publishes a new snapshot
-every interval and this file does not follow it, with no error and no warning,
-so regenerate on that same schedule.
+The file is a snapshot of the layout, not a live binding. The state views point
+at one snapshot: regenerate after taking or refreshing a baseline. A daemon
+running bintrail-console watch --baseline-refresh-interval publishes a new
+snapshot every interval and this file does not follow it, with no error and no
+warning, so regenerate on that same schedule. (With --include-events, that
+view's globs DO keep picking up newly rotated partitions on their own -- it is
+the one self-following part of the file.)
 
 Examples:
-  # From the index's own registry, plus a local baseline directory
+  # One view per table, as of the newest baseline snapshot
   bintrail views --index-dsn "..." --baseline-dir /data/baselines --out views.sql
+
+  # Add the change log across every archive source
+  bintrail views --index-dsn "..." --baseline-dir /data/baselines \
+    --include-events --out views.sql
 
   # Open an interactive DuckDB with the views and the S3 secret loaded
   bintrail views --index-dsn "..." --baseline-dir /data/baselines --out views.sql
@@ -89,16 +99,17 @@ Examples:
 }
 
 var (
-	vIndexDSN    string
-	vArchiveDir  string
-	vArchiveS3   string
-	vBintrailID  string
-	vRegion      string
-	vBaselineDir string
-	vBaselineS3  string
-	vOut         string
-	vNoBaselines bool
-	vIncludeLive bool
+	vIndexDSN      string
+	vArchiveDir    string
+	vArchiveS3     string
+	vBintrailID    string
+	vRegion        string
+	vBaselineDir   string
+	vBaselineS3    string
+	vOut           string
+	vNoBaselines   bool
+	vIncludeLive   bool
+	vIncludeEvents bool
 )
 
 func init() {
@@ -109,7 +120,8 @@ func init() {
 	viewsCmd.Flags().StringVar(&vRegion, "region", "", "AWS region to pin in the generated S3 secret (default: resolved by the credential chain)")
 	viewsCmd.Flags().StringVar(&vBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots")
 	viewsCmd.Flags().StringVar(&vBaselineS3, "baseline-s3", "", "S3 URL prefix of baseline Parquet snapshots (e.g. s3://bucket/baselines/)")
-	viewsCmd.Flags().BoolVar(&vNoBaselines, "no-baselines", false, "Emit only the events view, skipping the baseline state views")
+	viewsCmd.Flags().BoolVar(&vNoBaselines, "no-baselines", false, "Skip the baseline state views (requires --include-events, or the file would define nothing)")
+	viewsCmd.Flags().BoolVar(&vIncludeEvents, "include-events", false, "Add the events view over every archived binlog event. Left out by default because defining it opens one Parquet footer per archived file before it returns a row, a cost that grows with the archive and is paid by every reader of the file, including one who only wanted their tables")
 	viewsCmd.Flags().BoolVar(&vIncludeLive, "include-live", false, "Add a live leg to the events view so it also covers events the index holds but rotation has not archived yet. Requires --index-dsn. The leg queries the index server directly, and the view cannot push a filter down to it, so every query is a full scan of binlog_events that competes with capture on that server: for a narrow read query the attached binlog_events directly, or point --index-dsn at a read replica of the index. The generated file carries the index host, port, database and user, and never its password: fill that in before running")
 	viewsCmd.Flags().StringVar(&vOut, "out", "views.sql", "Output file, or - for stdout")
 }
@@ -120,6 +132,19 @@ func runViews(cmd *cobra.Command, _ []string) error {
 	}
 	if vBaselineDir != "" && vBaselineS3 != "" {
 		return fmt.Errorf("--baseline-dir and --baseline-s3 are mutually exclusive")
+	}
+	// Both refusals name a file that would define NOTHING or a leg with no view
+	// to hang on. Refused rather than silently adjusted: turning on an expensive
+	// view because the operator asked for its leg is a surprise they pay for on
+	// every query, and an empty file is a successful command that produced no
+	// schema.
+	if vNoBaselines && !vIncludeEvents {
+		return fmt.Errorf("--no-baselines leaves nothing to define: the events view is not included " +
+			"by default. Add --include-events for an events-only file, or drop --no-baselines")
+	}
+	if vIncludeLive && !vIncludeEvents {
+		return fmt.Errorf("--include-live adds a leg to the events view, which this file would not " +
+			"define: pass --include-events with it")
 	}
 	explicitArchives := vArchiveDir != "" || vArchiveS3 != ""
 	if vIndexDSN == "" && !explicitArchives {
@@ -133,6 +158,7 @@ func runViews(cmd *cobra.Command, _ []string) error {
 		// Region is only meaningful for the S3 secret; a local-only layout
 		// never emits the preamble that would use it.
 		ArchiveRegion: vRegion,
+		OmitEvents:    !vIncludeEvents,
 	}
 
 	if explicitArchives {
@@ -160,6 +186,21 @@ func runViews(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
+	// Keyed on what the file WOULD contain, not on the flags that got here: the
+	// flag refusals above catch --no-baselines, and this catches the identical
+	// empty file reached by simply not naming a baseline location. Before the
+	// S3 probe, so a render with nothing in it is refused for the reason that
+	// matters rather than over a bucket it would never read.
+	if !in.RendersAnyView() {
+		if in.OmitEvents {
+			return fmt.Errorf("this would define no view at all: no baseline snapshot was " +
+				"found to build state views from. Name one with --baseline-dir/--baseline-s3, " +
+				"or pass --include-events for a file over the archived change log")
+		}
+		return fmt.Errorf("this would define no view at all: no baseline snapshot was found " +
+			"and there is no archive source to build the events view from")
+	}
+
 	// After the layout is known, so a purely local one is not refused over an
 	// S3 variable it will never read. When the file DOES carry s3:// paths, a
 	// broken endpoint is fatal: the alternative is a file that silently sends
@@ -182,8 +223,16 @@ func runViews(cmd *cobra.Command, _ []string) error {
 	// names, no row ever read — which puts it in the same metadata-only class as
 	// `status`. Auditing it would report a data access that did not happen.
 	if vOut != "-" {
-		fmt.Fprintf(cmd.OutOrStdout(), "wrote %s (%d archive source(s), %d state view(s))\n",
-			vOut, len(in.ArchiveSources), len(in.Baselines))
+		// The events view is named either way. Reporting the archive-source
+		// COUNT for a file that reads no archive path was the shape that made
+		// the flip invisible to an unchanged scripted invocation: same exit
+		// code, same-looking line, a view silently gone.
+		events := "omitted (pass --include-events)"
+		if in.RendersEventsView() {
+			events = fmt.Sprintf("over %d archive source(s)", len(in.ArchiveSources))
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "wrote %s (%d state view(s), events view: %s)\n",
+			vOut, len(in.Baselines), events)
 	}
 	return nil
 }
