@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.74.0] - 2026-08-31
+
 ### Changed
 - **The `state_*` views in a generated `views.sql` now follow the newest
   baseline snapshot** (#1484). A baselines root gains a `current` symlink beside
