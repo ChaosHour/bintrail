@@ -8,6 +8,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **The `state_*` views in a generated `views.sql` now follow the newest
+  baseline snapshot** (#1484). A baselines root gains a `current` symlink beside
+  its timestamped snapshot directories, updated when a NEWER snapshot completes,
+  and the state views read through it. (A snapshot produced for a past instant,
+  such as a point-in-time restore, completes normally and does not take it.) A snapshot published after the file was
+  written therefore reaches it with nothing to re-run — which is the case the
+  file used to warn about and could do nothing else about: a daemon running
+  `bintrail-console watch --baseline-refresh-interval` publishes on a timer, and
+  nobody performs an action "regenerate this file" could attach to. All the
+  views move together, because replacing the pointer is a single `rename(2)`, so
+  no path ever resolves into a half-published snapshot and a running query
+  finishes against the files it opened. (Two views resolved either side of that
+  one step can still land on different snapshots; the window is the swap itself,
+  not the hours a stale file spans.)
+
+  What does not follow is the file's idea of the SHAPE of the data: which views
+  exist, and the precision each `DECIMAL` column is read at, are still decided
+  from the snapshot named in the header, so regenerate after a table is added or
+  dropped or a column changes type. The generated file says which of the two it
+  did rather than leaving the reader to work it out.
+
+  Following is the default and pinning is the opt-out: `bintrail views
+  --pin-snapshot`, or the **Pin to the backup that exists now** checkbox on the
+  console download (`pin_snapshot=1`). Several shapes pin regardless, and the file always says
+  which it did: an S3 baseline root, which has no pointer to follow (copying
+  every table object to a second prefix is not atomic across tables, so a query
+  could read half of one snapshot and half of another); a root whose `current`
+  is a real directory, which is never replaced; a root written by an older
+  bintrail, until its next snapshot completes; and a pointer naming a snapshot
+  other than the one the views were resolved from. The pointer is invisible to recovery: discovery and
+  prune both enumerate with `ReadDir`+`IsDir`, which reports false for a
+  symlink, and additionally require a timestamp name, so it can never be
+  selected as a baseline. Retention also keeps whatever it names, so it cannot be
+  left dangling by a publish that failed and left the pointer behind, and a
+  snapshot dated in the FUTURE never takes it (`--timestamp` has no upper bound,
+  and one future-dated snapshot would otherwise outrank every real one after it
+  and freeze the pointer permanently).
+
+  Publishing is serialized by an flock on the baselines root. Deciding whether a
+  snapshot outranks the newest complete one and then renaming the link are two
+  syscalls, and a peer completing a newer snapshot in between made the older one
+  win: measured at 118 in 400 concurrent pairs comparing against the pointer,
+  and still 12 in 400 after moving the comparison to the directory listing.
+  flock rather than a sentinel file, as elsewhere in this project, because the
+  kernel releases it when the process dies.
+
+  The SQL panel pins rather than follows. It executes the views it builds, so
+  following buys it nothing and costs it per-statement consistency: a join over
+  two state views resolves two paths, and a pointer swap between them would
+  return a join of two snapshots that never coexisted. The downloadable file
+  discloses that window in its header; the panel has no header to disclose it
+  in.
+
 - **`bintrail views` no longer emits the `events` view by default; add
   `--include-events`** (#1535). Defining that view makes DuckDB open one Parquet
   footer per archived file before it returns a single row — `union_by_name` is
@@ -99,6 +152,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same rows, just not free.
 
 ### Fixed
+- **Baseline upload to S3 no longer fails on the baselines root's `current`
+  pointer, and no longer skips a symlinked table file.** `Upload` walks with `filepath.WalkDir`, which does not follow
+  symlinks, so a link to a directory arrived with `IsDir()` false and was handed
+  to the file uploader, which opens the path, follows it to a directory, and
+  fails with "is a directory" — taking the whole upload down. Found while adding
+  the `current` pointer above, which is exactly such a link. The walk now skips
+  the pointer and its staging links by name, and RESOLVES every other
+  non-regular entry rather than skipping it: an operator who symlinks one large
+  table's Parquet onto another volume had it uploaded before and must keep
+  having it, since skipping quietly would publish `_SUCCESS` over a snapshot
+  missing a table and the loss would only surface mid-recovery. Something that
+  is neither the pointer nor a file is now a loud refusal instead. The pointer's
+  lock file is skipped by name: it is a regular file, so the symlink test cannot
+  see it and it would otherwise be published as snapshot data.
+
 - **views.sql: an index this machine cannot reach no longer costs you the whole
   file** (#1536). `duckdb -init` aborts the session at the first error, and the
   `ATTACH` was emitted ahead of every view, so an unreachable index host left

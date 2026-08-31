@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/archive"
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/storage"
 )
@@ -175,6 +176,16 @@ type Input struct {
 	// the header. BaselineSnapshot is that snapshot's timestamp.
 	BaselineSource   string
 	BaselineSnapshot time.Time
+	// FollowsSnapshot records that the state view paths name the baselines
+	// root's `current` pointer instead of a snapshot directory, so a later
+	// snapshot reaches this file without regenerating it (#1484).
+	//
+	// It changes only what the file SAYS; the following itself is in the paths
+	// the producer put in Baselines. A producer sets it when it rewrote those
+	// paths AND the pointer names the snapshot it selected — following a
+	// pointer that names something else would serve rows the header does not
+	// describe. S3 roots never set it: there is no pointer there to follow.
+	FollowsSnapshot bool
 	// Baselines are the tables of the NEWEST discoverable snapshot only. An
 	// older snapshot's rows are a different point in time, and a view union-ing
 	// two of them would silently mix states that never coexisted.
@@ -494,7 +505,36 @@ func writeHeader(b *strings.Builder, in Input) {
 		orUnknown(in.Version), in.GeneratedAt.UTC().Format(time.RFC3339))
 	b.WriteString("--\n")
 	b.WriteString("-- THIS FILE IS A SNAPSHOT OF THE LAYOUT, NOT A LIVE BINDING. ")
-	if in.rendersEvents() {
+	if in.FollowsSnapshot {
+		// The state views follow too, so the sentence above is now only about
+		// SHAPE. Say which shape, concretely: a reader who knows a new table
+		// will not appear on its own can schedule a regeneration; one told
+		// only "not a live binding" cannot tell what still needs doing.
+		if in.rendersEvents() {
+			b.WriteString("The globs below\n")
+			b.WriteString("-- keep picking up newly rotated partitions, and the baseline state views\n")
+			b.WriteString("-- follow the `" + baseline.CurrentLinkName + "` pointer, so a refreshed baseline reaches them\n")
+		} else {
+			b.WriteString("The baseline state\n")
+			b.WriteString("-- views follow the `" + baseline.CurrentLinkName + "` pointer, so a refreshed baseline reaches them\n")
+		}
+		b.WriteString("-- on its own. What does NOT follow is this file's idea of the SHAPE of the\n")
+		b.WriteString("-- data: which views exist, and how each DECIMAL column is read, were decided\n")
+		b.WriteString("-- from the snapshot named below. Re-run `bintrail views` (or download the file\n")
+		b.WriteString("-- again from the console) after a table is added or dropped, after a column\n")
+		b.WriteString("-- changes type, and whenever archive sources are added or removed.\n")
+		b.WriteString("--\n")
+		b.WriteString("-- Which of those you will notice follows one rule: this file names only the\n")
+		b.WriteString("-- PATHS and the DECIMAL columns, so only those two can fail. A table that\n")
+		b.WriteString("-- leaves the newest snapshot stops resolving and DuckDB names the missing\n")
+		b.WriteString("-- path; a DECIMAL column that is renamed or dropped fails the whole script.\n")
+		b.WriteString("-- Everything else is QUIET, because `SELECT *` passes it through untouched:\n")
+		b.WriteString("-- a table added to the source has no view here, a DECIMAL whose scale grew is\n")
+		b.WriteString("-- read at the old scale with the extra digits rounded away, a column that\n")
+		b.WriteString("-- changes to some other type arrives as whatever the new file holds (an\n")
+		b.WriteString("-- ORDER BY can start sorting text), and an archive source added later is\n")
+		b.WriteString("-- simply not here. None of those raise an error.\n")
+	} else if in.rendersEvents() {
 		// The one self-following half of the file, and only the events view
 		// has it: its globs are evaluated per query. Claimed only when that
 		// view is actually here, or a state-only file would promise a
@@ -516,22 +556,37 @@ func writeHeader(b *strings.Builder, in Input) {
 	// to (#1484). Naming the flag WITH its binary is what separates the two
 	// readers, and `bintrail views` is not that binary.
 	//
-	// Unconditional, and phrased so it stays true with no state views at all
-	// ("ANY state view below"): gating it would add a branch whose only effect
-	// is to withhold the warning, and the paragraph directly above is
-	// unconditional about the same views for the same reason. Neither asserts
-	// that a state view exists.
+	// Two renderings, one for each behaviour, rather than one paragraph plus a
+	// caveat: the pinned half warns that the rows stop changing, and under
+	// following that warning is simply false. The pinned arm stays phrased so
+	// it holds with no state views at all ("ANY state view below"); the
+	// following arm may assert they exist, because FollowsSnapshot is only ever
+	// set alongside a non-empty Baselines.
 	//
 	// "nothing regenerates this file", NOT "nothing re-runs this command": the
 	// console download is produced by a page, not a command, which is the same
 	// distinction Input.LiveLegUnavailable exists to make. The paragraph above
 	// already names both routes.
 	b.WriteString("--\n")
-	b.WriteString("-- A daemon running `bintrail-console watch --baseline-refresh-interval`\n")
-	b.WriteString("-- publishes a new snapshot every interval, and nothing regenerates this file.\n")
-	b.WriteString("-- Any state view below stays bound to the snapshot it was generated against,\n")
-	b.WriteString("-- with no error and no warning: its rows just stop changing. Regenerate this\n")
-	b.WriteString("-- file on the same schedule that refresh runs on.\n")
+	if in.FollowsSnapshot {
+		// The paragraph this replaces exists because a timer-published
+		// snapshot has no operator action to attach "regenerate" to. Following
+		// removes that need for ROWS and leaves it for SHAPE, so the same
+		// reader is now told the one thing still on their plate.
+		b.WriteString("-- A daemon running `bintrail-console watch --baseline-refresh-interval`\n")
+		b.WriteString("-- publishes a new snapshot every interval, and the state views below move to\n")
+		b.WriteString("-- it when it completes. Replacing the pointer is a single step, so no path\n")
+		b.WriteString("-- ever resolves into a half-published snapshot, and a query already running\n")
+		b.WriteString("-- finishes against the files it opened. Two views resolved either side of that\n")
+		b.WriteString("-- one step can still land on different snapshots; the window is the swap\n")
+		b.WriteString("-- itself, not the hours a file left behind would span.\n")
+	} else {
+		b.WriteString("-- A daemon running `bintrail-console watch --baseline-refresh-interval`\n")
+		b.WriteString("-- publishes a new snapshot every interval, and nothing regenerates this file.\n")
+		b.WriteString("-- Any state view below stays bound to the snapshot it was generated against,\n")
+		b.WriteString("-- with no error and no warning: its rows just stop changing. Regenerate this\n")
+		b.WriteString("-- file on the same schedule that refresh runs on.\n")
+	}
 	b.WriteString("--\n")
 	b.WriteString("-- Nothing here writes: every view is a read over Parquet files you already own.\n")
 	b.WriteString("--\n")
@@ -570,6 +625,14 @@ func writeHeader(b *strings.Builder, in Input) {
 	default:
 		fmt.Fprintf(b, "--   %s at %s (%d table(s))\n",
 			in.BaselineSource, in.BaselineSnapshot.UTC().Format(time.RFC3339), len(in.Baselines))
+		if in.FollowsSnapshot {
+			// Name the timestamp AND the pointer: the timestamp is what the
+			// column types were read from, the pointer is what the views
+			// actually open. Reporting only one of the two would make a
+			// followed file indistinguishable from a pinned one.
+			fmt.Fprintf(b, "--   read through %s/%s, which is that snapshot right now\n",
+				strings.TrimSuffix(in.BaselineSource, "/"), baseline.CurrentLinkName)
+		}
 	}
 	b.WriteString("\n")
 }
@@ -1297,7 +1360,12 @@ func writeStateViews(b *strings.Builder, in Input) bool {
 	if in.OnlyViews != nil && len(wanted) == 0 {
 		return false
 	}
-	b.WriteString("-- state_<schema>_<table>: each table's full contents as of the baseline snapshot.\n")
+	if in.FollowsSnapshot {
+		b.WriteString("-- state_<schema>_<table>: each table's full contents as of the snapshot the\n")
+		b.WriteString("-- `" + baseline.CurrentLinkName + "` pointer names, which is whichever one completed most recently.\n")
+	} else {
+		b.WriteString("-- state_<schema>_<table>: each table's full contents as of the baseline snapshot.\n")
+	}
 	b.WriteString("--\n")
 	b.WriteString("-- These are the SNAPSHOT's rows, not the table's current state: changes after\n")
 	if in.rendersEvents() {
