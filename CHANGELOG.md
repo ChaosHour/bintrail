@@ -23,8 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same data. The Backups summary card is gone: Backups has its own sidebar
   entry, and the pointer existed only because the page it pointed away from
   was a drawer. Existing `/storage` links still work and land on Retention.
-
-### Changed
 - **A scheduled backup on a server whose backups go to S3 no longer forces a
   full read of your database every slot** (#1539). The daemon has two ways to
   produce a backup: a full one it dumps from the source, and an update of the
@@ -71,6 +69,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishes a table by hard-linking the previous file, which needs both on a
   filesystem — so those runs take the ordinary merge path: correct, and the
   same rows, just not free.
+
+### Fixed
+- **views.sql: an index this machine cannot reach no longer costs you the whole
+  file** (#1536). `duckdb -init` aborts the session at the first error, and the
+  `ATTACH` was emitted ahead of every view, so an unreachable index host left
+  the reader with nothing: no `events` view and no `state_*` views, even though
+  all of them read Parquet and needed nothing from the index. The `state_*`
+  views are now defined first, then the `ATTACH`, then the `events` view that
+  reads through it. DuckDB keeps what ran before the aborting statement, so the
+  table snapshots survive an index this machine cannot reach — in a session
+  that outlives the error: `.read views.sql` from an open DuckDB, or
+  `duckdb -init views.sql your.db` and then reopen `your.db`. A bare
+  `duckdb -init views.sql` exits and its in-memory database goes with it, so
+  nothing is kept; the generated file says which is which, and says plainly
+  that nothing survives when the file defines no `state_*` view at all.
+  The deliberate trade: under `--include-live` a failed `ATTACH` costs the
+  `events` view entirely, not just its hot leg. Defining it archives-only
+  beforehand and replacing it afterwards would bind the archive file list twice,
+  and that bind is the expensive statement in the file — `union_by_name` opens
+  one Parquet footer per archived file at `CREATE VIEW` time (#1535), measured
+  at ~7s over 120 files with the second definition costing ~3.6s more, whether
+  it repeats the literal or just references the first view.
+- **views.sql warns when the index host is a bare name** (#1536). A console
+  running under Docker Compose emits its compose service name (`index-mysql`),
+  which resolves for containers on that network and nowhere else, so a
+  downloaded file failed with `Unknown server host` the first time it was run.
+  The existing warning covered only loopback addresses. A single-label host now
+  gets its own note, kept separate because the two fail differently: loopback
+  resolves everywhere and quietly answers from a different index, while a bare
+  name usually does not resolve at all.
 
 ## [0.73.0] - 2026-08-30
 

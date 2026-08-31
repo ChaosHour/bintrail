@@ -510,6 +510,12 @@ func TestLivePreamble_declaresEveryExtensionItUses(t *testing.T) {
 
 // eventsComment returns the events view's comment block, so an assertion about
 // what the file SAYS cannot pass on a sentence somewhere else in it.
+//
+// strings.Index, deliberately: the events view is defined exactly ONCE per file
+// (see Generate), so there is only one block to find — and if a change ever
+// reintroduces a second definition, taking the FIRST makes the wording tests
+// fail rather than quietly re-aim at the survivor. Pointing this at the last
+// block would hide exactly the regression live_order_test.go's count guards.
 func eventsComment(out string) string {
 	start := strings.Index(out, "-- events:")
 	if start < 0 {

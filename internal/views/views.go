@@ -258,13 +258,66 @@ func Generate(in Input) string {
 			// looks to understand why their read failed.
 			region = ""
 		}
+		// Stays ahead of every view, and is the one statement the reordering
+		// below does NOT protect anyone from: baselines can live on S3 too, so
+		// a secret emitted after the state views would break the layout this
+		// preamble exists to serve. Its CREATE SECRET aborts the session when
+		// no credential resolves, which costs the reader every view emitted
+		// after it — including purely local state views, on a layout whose
+		// baselines are local and whose archives are on S3. The degrade
+		// documented below is about the ATTACH, not about credentials.
 		writeS3Preamble(&b, region, in.S3Endpoint, in.RegionAmbiguous)
 	}
-	if in.LiveIndex != nil {
+	// The state views FIRST, then the ATTACH, then the events view that needs
+	// it.
+	//
+	// `duckdb -init` aborts the session at the first error, and the ATTACH is
+	// the one statement in this file that depends on reaching another machine:
+	// a host that does not resolve, a password left blank, an index that is
+	// down. Emitted ahead of the views, as it used to be, that single failure
+	// cost the reader the whole file — no events view, no state views, nothing
+	// — even though the state views read one Parquet file per table and needed
+	// nothing from the index. DuckDB commits what ran before the aborting
+	// statement, so moving them ahead of the ATTACH turns that total loss into
+	// a degrade: the table snapshots are already created and the reader loses
+	// the events view plus a message naming what could not be reached.
+	//
+	// "Already created" is not the same as "still reachable", and
+	// writeAttachDegradeNote is where that distinction is spelled out for the
+	// reader rather than assumed here.
+	//
+	// The events view is defined ONCE, here at the end, rather than
+	// archives-only above the ATTACH and CREATE OR REPLACEd below it. Two
+	// definitions would bind the archive file list twice, and that bind is the
+	// expensive statement in this file: `union_by_name` opens one Parquet
+	// footer per archived file before the view returns a row (#1535). Measured
+	// over 120 files, the second bind costs about half the first (7.1s then
+	// 3.6s), and writing it as a reference to the first view instead of
+	// repeating the literal costs the same 3.6s — DuckDB re-binds a view per
+	// statement, so there is no cheap way to say it twice.
+	//
+	// The deliberate trade: under --include-live an unreachable index costs the
+	// events view ENTIRELY, not just its hot leg. The state views are what
+	// survive. A leg over the archives alone would have to be paid for with a
+	// second full bind on every generated file, including the ones whose index
+	// is reachable.
+	//
+	// "Survive" is conditional on HOW the file is run, and the note the events
+	// view carries says so rather than asserting the good case. Verified in
+	// DuckDB v1.5.5 with a failing ATTACH: `.read` in an open session reports
+	// the error and keeps going; `duckdb -init file.sql your.db` exits but the
+	// views are in your.db when it is reopened; a bare `duckdb -init file.sql`
+	// exits and the in-memory database dies with it, so nothing survives —
+	// and that last one is an invocation `bintrail views --help` names.
+	stateSurvives := writeStateViews(&b, in)
+	// The preamble is gated on the events view being RENDERED, not merely on an
+	// index being configured: under OnlyViews the ATTACH would otherwise be
+	// emitted with no view reading through it, above a comment introducing a
+	// hot leg that is not there.
+	if in.LiveIndex != nil && in.OnlyViews.wants(eventsViewName) {
 		writeLivePreamble(&b, in.LiveIndex)
 	}
-	writeEventsView(&b, in)
-	writeStateViews(&b, in)
+	writeEventsView(&b, in, stateSurvives)
 	return b.String()
 }
 
@@ -285,7 +338,11 @@ func GenerateViews(in Input) string {
 	// the same Input; the caller gets the archives-only view, which is what
 	// this entry point can actually back.
 	in.LiveIndex = nil
-	events := writeEventsView(&b, in)
+	// stateSurvives is false because this entry point emits no ATTACH: with
+	// nothing that can abort, there is no degrade to describe. (It also emits
+	// the state views AFTER this call, so the good answer is not available
+	// here either.)
+	events := writeEventsView(&b, in, false)
 	state := writeStateViews(&b, in)
 	if !events && !state {
 		// Not one view was emitted, so whatever is in the builder is comments.
@@ -575,7 +632,14 @@ func writeLivePreamble(b *strings.Builder, li *LiveIndex) {
 	fmt.Fprintf(b, "    USER %s,\n", sqlString(li.User))
 	b.WriteString("    PASSWORD ''  -- <- your index password\n")
 	b.WriteString(");\n")
-	if isLoopbackHost(li.Host) {
+	// Normalized ONCE for both predicates. A DNS root-anchored form
+	// ("localhost.", from a DSN the driver resolves the same as "localhost")
+	// used to reach the single-label branch, because only that predicate
+	// trimmed the trailing dot: the reader was told their host resolves in one
+	// network and nowhere else, about a name that resolves everywhere to the
+	// wrong index. The two branches must classify the same string.
+	host := strings.TrimSuffix(li.Host, ".")
+	if isLoopbackHost(host) {
 		// Observed: the host IS a loopback address. NOT stated: why it is one
 		// (an omitted address in the DSN, an SSH tunnel, a sidecar). The file
 		// says what it can see, and what that costs a reader elsewhere.
@@ -584,6 +648,23 @@ func writeLivePreamble(b *strings.Builder, li *LiveIndex) {
 		b.WriteString("-- whatever that machine runs on the same port. That may answer, with\n")
 		b.WriteString("-- entirely plausible rows from a different index. Change HOST to a name that\n")
 		b.WriteString("-- resolves from where you run this.\n")
+	} else if isSingleLabelHost(host) {
+		// Observed: the host is a bare name with no domain. NOT stated: why
+		// (a Docker Compose service, a Kubernetes service, a /etc/hosts entry,
+		// a search-domain suffix that happens to be configured here). Each of
+		// those resolves inside one network and nowhere else, and this file is
+		// built to be carried out of it.
+		//
+		// A separate branch from the loopback one rather than a widened
+		// predicate: loopback resolves everywhere and silently answers with the
+		// WRONG index, while this one usually fails to resolve at all. The
+		// costs differ, so the sentences do.
+		b.WriteString("-- HOST above is a bare name with no domain, which usually resolves only\n")
+		b.WriteString("-- inside the network this file was generated in — a Docker Compose or\n")
+		b.WriteString("-- Kubernetes service name resolves for containers on that network and for\n")
+		b.WriteString("-- nothing outside it. Run this file elsewhere and the ATTACH below fails\n")
+		b.WriteString("-- with an unknown-host error. Change HOST to an address that resolves\n")
+		b.WriteString("-- from where you run this, or open a tunnel to it first.\n")
 	}
 	writeLiveCaptureNote(b)
 	fmt.Fprintf(b, "ATTACH '' AS %s (TYPE mysql, SECRET %s, READ_ONLY);\n\n",
@@ -644,13 +725,80 @@ func isLoopbackHost(host string) bool {
 	if strings.EqualFold(host, "localhost") {
 		return true
 	}
+	// An empty host reaches the driver as localhost (a DSN like `tcp(:3306)`),
+	// so it is a loopback for the reader's purposes and gets the loopback
+	// warning rather than falling through to no warning at all.
+	if host == "" {
+		return true
+	}
 	ip := net.ParseIP(strings.Trim(host, "[]"))
 	return ip != nil && ip.IsLoopback()
 }
 
+// isSingleLabelHost reports whether the generated ATTACH names a host with no
+// domain part: `index-mysql`, not `index.example.com` and not an address.
+//
+// Callers must ask isLoopbackHost FIRST — `localhost` is single-label too, and
+// it has its own warning because it fails in the opposite way (it resolves, and
+// answers with the wrong index).
+//
+// An IP literal is not single-label whatever it looks like, so it is excluded
+// by parse rather than by counting dots: an IPv6 address has no dots at all,
+// and a bracketed one is still an address.
+func isSingleLabelHost(host string) bool {
+	h := strings.TrimSuffix(strings.Trim(host, "[]"), ".")
+	if h == "" || net.ParseIP(h) != nil {
+		return false
+	}
+	return !strings.Contains(h, ".")
+}
+
+// writeAttachDegradeNote states what a reader is left holding when the ATTACH
+// above this view fails, which is the whole point of the ordering (#1536) and
+// the one thing that reader cannot work out for themselves — their session
+// either died or is showing them one error and no view.
+//
+// stateSurvives says whether any state view was actually defined above the
+// ATTACH. It has to be asked rather than assumed: a file generated with archive
+// sources, an index, and no --baseline-dir defines none, and telling that
+// reader their snapshots are safe would send them looking for views that were
+// never written.
+//
+// coldLegAvailable says whether regenerating without the live index would still
+// produce an events view. With no archive source it would not, so no remedy is
+// offered instead of one that yields an empty file.
+func writeAttachDegradeNote(b *strings.Builder, stateSurvives, coldLegAvailable bool) {
+	b.WriteString("--\n")
+	b.WriteString("-- Defined AFTER the ATTACH above, so an index this machine cannot reach\n")
+	if stateSurvives {
+		b.WriteString("-- leaves this view undefined and the state_ views above already created.\n")
+		b.WriteString("-- Keeping them takes a session that outlives the error: `.read` this file\n")
+		b.WriteString("-- from an open DuckDB, or run `duckdb -init <this file> your.db` and then\n")
+		b.WriteString("-- reopen your.db. A bare `duckdb -init <this file>` exits on the error and\n")
+		b.WriteString("-- the in-memory database goes with it, so nothing is left.\n")
+	} else {
+		b.WriteString("-- leaves you with no view at all: this file defines no state_ view either\n")
+		b.WriteString("-- (it names no baseline snapshot), so there is nothing here to fall back\n")
+		b.WriteString("-- on. Point the generator at a baseline location to get one.\n")
+	}
+	if coldLegAvailable {
+		b.WriteString("-- Regenerating WITHOUT the live index gives an events view over the\n")
+		b.WriteString("-- archives alone, which needs nothing from the index.\n")
+	}
+	b.WriteString("--\n")
+	b.WriteString("-- It is deliberately not ALSO defined over the archives alone beforehand:\n")
+	b.WriteString("-- union_by_name opens one Parquet footer per archived file at CREATE VIEW\n")
+	b.WriteString("-- time, so a second definition pays that bind again in every generated\n")
+	b.WriteString("-- file, whether or not the index turns out to be reachable.\n")
+}
+
 // writeEventsView returns whether it emitted a view definition (as opposed to
-// nothing, or a comment explaining why there is none).
-func writeEventsView(b *strings.Builder, in Input) bool {
+// nothing, or a comment explaining why there is none). It is called ONCE per
+// rendered file — see Generate for why the view is never redefined.
+//
+// stateSurvives is Generate's answer for writeAttachDegradeNote; GenerateViews
+// emits no ATTACH and passes false.
+func writeEventsView(b *strings.Builder, in Input, stateSurvives bool) bool {
 	// Not wanted: emit NOTHING, comments included. A filtered render is executed
 	// by its caller, and a script of only comments is an error there.
 	if !in.OnlyViews.wants(eventsViewName) {
@@ -706,6 +854,7 @@ func writeEventsView(b *strings.Builder, in Input) bool {
 		b.WriteString("-- index row has to derive or forgo them. Letting the index win would\n")
 		b.WriteString("-- replace a known source with NULL for every event in the overlap, and a\n")
 		b.WriteString("-- WHERE bintrail_id = ... would then miss rows the archives hold.\n")
+		writeAttachDegradeNote(b, stateSurvives, true)
 		writeLiveCostNote(b, true)
 		b.WriteString("CREATE OR REPLACE VIEW \"events\" AS\n")
 		b.WriteString("  WITH cold AS (\n")
@@ -726,6 +875,9 @@ func writeEventsView(b *strings.Builder, in Input) bool {
 		b.WriteString("-- header above says why. It covers whatever the index still holds, and\n")
 		b.WriteString("-- rotation dropping a partition removes those events from it. Archive and\n")
 		b.WriteString("-- take a baseline before that matters, then regenerate this file.\n")
+		// No cold leg to fall back to: the index IS the only source this file
+		// names, so regenerating without it would define no events view at all.
+		writeAttachDegradeNote(b, stateSurvives, false)
 		writeLiveCostNote(b, false)
 		b.WriteString("CREATE OR REPLACE VIEW \"events\" AS\n")
 		writeEventSelect(b, in, true, "  ")
@@ -1057,11 +1209,11 @@ func writeStateViews(b *strings.Builder, in Input) bool {
 	b.WriteString("-- state_<schema>_<table>: each table's full contents as of the baseline snapshot.\n")
 	b.WriteString("--\n")
 	b.WriteString("-- These are the SNAPSHOT's rows, not the table's current state: changes after\n")
-	b.WriteString("-- the snapshot live in `events` above. To materialize a later point in time,\n")
-	b.WriteString("-- use `bintrail reconstruct`. Folding the deltas back onto a baseline is what\n")
-	b.WriteString("-- that command does, and it is not expressible as a view.\n")
+	b.WriteString("-- the snapshot live in the `events` view. To materialize a later point in\n")
+	b.WriteString("-- time, use `bintrail reconstruct`. Folding the deltas back onto a baseline\n")
+	b.WriteString("-- is what that command does, and it is not expressible as a view.\n")
 	if len(in.Baselines) == 0 {
-		b.WriteString("-- (skipped: no baseline snapshot was discovered)\n")
+		b.WriteString("-- (skipped: no baseline snapshot was discovered)\n\n")
 		return false
 	}
 	writeDecimalNote(b, in)
