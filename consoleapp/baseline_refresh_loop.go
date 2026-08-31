@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
@@ -29,6 +32,18 @@ type refreshRequest struct {
 	// when the per-server backup schedule started this fold, empty for the
 	// daemon-wide interval loop.
 	Trigger string
+	// BaselineS3, when set, is the destination the finished snapshot is
+	// uploaded to, and the source the fold reads its previous snapshot from.
+	//
+	// This field is what decides whether this loop uploads at all, and that is
+	// deliberate (#1539). The daemon-wide --baseline-refresh-interval leaves it
+	// EMPTY and keeps the original behaviour, because that flag names no
+	// destination and a loop uploading on the operator's behalf would be
+	// deciding something it was not told. The per-server schedule sets it from
+	// the server's own configured backup destination, which IS a destination
+	// the operator named. The gate is therefore data rather than a mode flag:
+	// there is no way to reach the upload without a destination to reach.
+	BaselineS3 string
 }
 
 // TriggerRefresh starts a periodic baseline refresh for a server, sharing the
@@ -107,6 +122,23 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	// fold has run its own files are in there too. See claimSnapshotDir.
 	unclaimed := claimSnapshotDir(refreshSnapshotDir(req, at))
 	tables, refused, carried, err := s.executeRefresh(req, at)
+	// Publishing is not finished until the snapshot is where this server's
+	// backups live. A fold that wrote a perfect local snapshot for a server
+	// whose destination is S3 has produced a copy on one box, which is not
+	// what "the backups go to S3" promises: it is outside retention (a prune
+	// confirms the S3 copy), outside anything reading the bucket, and gone
+	// with the host. Reporting that as published would be reporting a backup
+	// the destination does not have.
+	//
+	// Ordered AFTER the fold and gated on its success: there is nothing to
+	// upload otherwise, and an incomplete snapshot must never reach the
+	// destination. baseline.Upload writes the _INCOMPLETE marker first and
+	// _SUCCESS last, so a crash mid-upload leaves the remote copy excluded from
+	// discovery rather than half-visible.
+	var uploaded int
+	if err == nil && req.BaselineS3 != "" {
+		uploaded, err = uploadRefreshedSnapshot(s.ctx, req, at)
+	}
 	// Measured HERE, on the far side of the `go` in TriggerRefresh, because
 	// this is where the fold actually happens. Timing the dispatch loop
 	// instead measures how long it takes to spawn a goroutine, which is
@@ -115,6 +147,11 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
 		Kind: console.BaselineRunRefresh, Trigger: req.Trigger, StartedAt: started.Format(time.RFC3339),
 		SnapshotTime: publishedSnapshotTime(at, err), Tables: tables, Refused: refused, Carried: carried,
+		// Zero means "nothing was sent" for a server with no destination AND
+		// "these files reached the bucket" otherwise, so the count is what
+		// makes a successful upload visible at all: without it the only
+		// evidence the snapshot got there is the absence of a failure line.
+		Uploaded: uploaded,
 	}, err)
 	if err != nil {
 		// Reported and reclaimed OUTSIDE s.mu. Deleting a directory is
@@ -144,9 +181,78 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 		// advice above the actual cause.
 		return
 	}
-	slog.Info("baseline refresh: published", "server", req.ServerName, "id", req.ServerID,
-		"tables", tables, "reused", carried)
+	pub := []any{"server", req.ServerName, "id", req.ServerID, "tables", tables, "reused", carried}
+	// A reused count of zero reads as "nothing happened to be unchanged", which
+	// is indistinguishable from "this path cannot reuse anything" — and on an
+	// S3 source it is always the second (carryForwardEligible refuses any
+	// s3:// previous snapshot, since carrying a file forward means hard-linking
+	// it). The operator turned the setting on and the console said "Unchanged
+	// tables will be reused", so a count that CANNOT be nonzero has to say so.
+	if req.CarryForwardUnchanged && strings.HasPrefix(baselineFoldSource(req), "s3://") {
+		pub = append(pub, "reuse_unchanged", "not applicable: the previous backup is read from S3, and reusing a file means linking it on disk")
+	}
+	slog.Info("baseline refresh: published", pub...)
 	reportRefreshDuration(req.ServerName, interval, took)
+}
+
+// baselineFoldSource is where this request's fold reads the PREVIOUS snapshot
+// from. Mirrors console.BaselineFoldSource, on the loop's own request type.
+func baselineFoldSource(req refreshRequest) string {
+	if req.BaselineS3 != "" {
+		return req.BaselineS3
+	}
+	return req.BaselineDir
+}
+
+// errSnapshotNotUploaded marks the ONE failure that leaves a complete snapshot
+// behind: the fold finished and marked it, and only sending it to the backup
+// destination failed.
+//
+// It exists because the scheduled watcher takes a FULL backup whenever an
+// update fails (backup_schedule_loop.go, fallBack), on the reasoning that the
+// update produced nothing so a backup is still owed. That reasoning does not
+// survive this failure: the update DID produce a snapshot, and a full backup
+// would have to clear the very upload gate that just refused it. Falling back
+// here would answer one S3 permission error with a full lock-and-read of
+// production that publishes nothing new, which is the exact cost #1539 exists
+// to remove.
+//
+// A sentinel, not a message match: the verdict must not depend on wording that
+// an edit to a string can change.
+var errSnapshotNotUploaded = errors.New("the snapshot was not sent to the backup destination")
+
+// foldPublished reports whether a finished fold left a complete snapshot in the
+// server's local directory, which is true both when the run fully succeeded and
+// when only the upload failed. Callers that ask "is a backup owed?" must use
+// this rather than err == nil.
+func foldPublished(err error) bool {
+	return err == nil || errors.Is(err, errSnapshotNotUploaded)
+}
+
+// uploadRefreshedSnapshot copies the snapshot this cycle just published to the
+// server's configured S3 destination.
+//
+// The URL is the destination root joined with the snapshot's OWN directory
+// name, and baseline.Upload builds its keys relative to the directory it is
+// given. Passing the destination root and the local ROOT instead would upload
+// every snapshot on disk on every cycle; passing the destination root and the
+// SNAPSHOT directory would drop the timestamp level and write one table's
+// Parquet where the snapshot directory belongs, which discovery reads as a
+// snapshot with no tables.
+func uploadRefreshedSnapshot(ctx context.Context, req refreshRequest, at time.Time) (int, error) {
+	name := reconstruct.SnapshotDirName(at)
+	dest := strings.TrimSuffix(req.BaselineS3, "/") + "/" + name
+	n, err := uploadSnapshot(ctx, refreshSnapshotDir(req, at), dest, "", false)
+	if err != nil {
+		// Names the local path on purpose: the snapshot itself is intact and
+		// complete, and an operator reading this needs to know the run's work
+		// still exists rather than that a backup was lost.
+		return 0, fmt.Errorf("%w: it was written to %s but could not be uploaded to %s. The next update folds a NEW "+
+			"snapshot rather than re-sending this one; a full backup uploads the whole directory, so one of those "+
+			"sweeps it up: %w",
+			errSnapshotNotUploaded, refreshSnapshotDir(req, at), dest, err)
+	}
+	return n, nil
 }
 
 // refreshSnapshotDir names the directory one refresh cycle folds into: the
@@ -199,6 +305,14 @@ func claimSnapshotDir(dir string) string {
 func reportRefusedRefresh(req refreshRequest, at time.Time, refused int, unclaimed string, err error) {
 	args := []any{"server", req.ServerName, "id", req.ServerID, "refused", refused, "error", err}
 	args = append(args, reclaimPartialSnapshot(refreshSnapshotDir(req, at), refused, unclaimed)...)
+	if errors.Is(err, errSnapshotNotUploaded) {
+		// A different headline, because operators alert on this one. Saying
+		// "published nothing" over a finished snapshot sends them looking for
+		// a fold problem that did not happen, and the remedy (the credentials
+		// or the bucket policy) is not where that message points.
+		slog.Warn("baseline refresh: the snapshot was written but not sent to the backup destination", args...)
+		return
+	}
 	slog.Warn("baseline refresh: published nothing", args...)
 }
 
@@ -211,15 +325,17 @@ func reportRefusedRefresh(req refreshRequest, at time.Time, refused int, unclaim
 // result is unusable. On a server where one table carries a permanent capture
 // gap, every cycle therefore leaves a near-complete snapshot that discovery
 // correctly ignores and that retention cannot reclaim, because a prune needs a
-// confirmed S3 copy and this loop never uploads. At a one-hour interval that is
-// 24 a day; at the one-minute floor it is 1440.
+// confirmed S3 copy and a refused cycle never reaches the upload (which is
+// gated on the fold succeeding). At a one-hour interval that is 24 a day; at
+// the one-minute floor it is 1440.
 //
 // Only the LOOP does this. The CLI and the operator-triggered point-in-time
 // restore share the same fold and keep their fragments: someone who typed a
 // command is watching its output and may want to look at what came out. An
 // unattended job that will repeat in a minute is the case where nobody will.
 func reclaimPartialSnapshot(dir string, refused int, unclaimed string) []any {
-	if reason := keepPartialSnapshotBecause(refused, unclaimed, holdsTableData(dir)); reason != "" {
+	published := snapshotPublished(dir)
+	if reason := keepPartialSnapshotBecause(refused, unclaimed, holdsTableData(dir), published); reason != "" {
 		if !dirExists(dir) {
 			// The run failed before it created the directory (no snapshot to
 			// fold, an unreachable index). Naming a path that is not there
@@ -233,6 +349,14 @@ func reclaimPartialSnapshot(dir string, refused int, unclaimed string) []any {
 			// backup published into the same second. Calling that
 			// partial_snapshot invites a cleanup script to delete it.
 			return []any{"unclaimed_dir", dir, "kept_because", reason}
+		}
+		if published {
+			// Its own key for the same reason, and a stronger one (#1539):
+			// this directory is a FINISHED, marked snapshot whose upload
+			// failed, which makes it the operator's whole remaining result. A
+			// cleanup script keyed on partial_snapshot would delete exactly
+			// the thing this branch exists to preserve.
+			return []any{"published_snapshot", dir, "kept_because", reason}
 		}
 		return []any{"partial_snapshot", dir, "kept_because", reason}
 	}
@@ -332,15 +456,47 @@ func holdsTableData(dir string) bool {
 // only a cancellation observed while no table is in flight that returns with no
 // failure recorded and keeps its fragment. Rare, bounded by restarts rather
 // than by the interval, and the direction to be wrong in.
-func keepPartialSnapshotBecause(refused int, unclaimed string, holdsData bool) string {
+func keepPartialSnapshotBecause(refused int, unclaimed string, holdsData, published bool) string {
 	if unclaimed != "" {
 		return unclaimed
+	}
+	if published {
+		// The only way to reach the refusal path with the completeness marker
+		// already written is an upload that failed after a fold that did not
+		// (#1539). Saying so beats the heuristic below, which would report a
+		// finished, marked snapshot as one that "may be complete" and "failed
+		// to be marked" — both halves false, on the one shape where the local
+		// copy is the operator's whole remaining result.
+		return "the fold finished and marked the snapshot; only sending it to the backup destination failed"
 	}
 	if refused == 0 && holdsData {
 		return "the fold reported no table failure, so what is on disk may be a complete snapshot that only " +
 			"failed to be marked"
 	}
 	return ""
+}
+
+// snapshotPublished reports whether dir carries the completeness marker the
+// fold writes last.
+//
+// Deliberately NOT baseline.SnapshotComplete, which answers true for a
+// directory carrying NEITHER marker (legacy snapshots are complete by
+// default). Here the question is whether THIS run finished and marked it, and
+// a markerless directory is the shape a killed daemon leaves, which the
+// caller must keep for a different reason and under a different key.
+func snapshotPublished(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, baseline.SuccessMarker))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		// Not "not published": an unreadable marker is a real IO answer, and
+		// answering false would send a finished snapshot down the heuristic
+		// below, which reports it as possibly-partial under the key a cleanup
+		// script deletes. Same treatment as snapshotDirsWithSuccess, which
+		// refuses the same swallow for the same reason.
+		slog.Warn("baseline refresh: could not read the completeness marker, so the snapshot is kept rather than "+
+			"judged", "dir", dir, "error", err)
+		return true
+	}
+	return err == nil
 }
 
 // dirExists reports whether path is an existing directory.
@@ -363,6 +519,10 @@ func applyFoldStatus(st *console.BaselineStatus, tables, refused, carried int, e
 	st.Tables = tables
 	st.Refused = refused
 	st.Carried = carried
+	// Set on BOTH branches, never left from a previous run: this is what the
+	// scheduled watcher reads to decide whether a full backup is still owed,
+	// and a stale true there is a skipped backup.
+	st.Published = foldPublished(err)
 	if err != nil {
 		st.State = "failed"
 		st.LastError = err.Error()
@@ -391,12 +551,19 @@ func applyFoldStatus(st *console.BaselineStatus, tables, refused, carried int, e
 // WarnEventThreshold (zero means the volume warning never fires). Those two are
 // therefore set explicitly in refreshFoldConfig; see the constants above it.
 func (s *baselineSupervisor) executeRefresh(req refreshRequest, at time.Time) (tables, refused, carried int, err error) {
-	tableList, err := reconstruct.NewestSnapshotTables(s.ctx, req.BaselineDir)
+	// Listed where the fold READS (refreshFoldConfig's BaselineSrc), not where
+	// it writes. On an S3-backed server those differ, and listing the local
+	// directory here would refuse with "no baseline snapshot" on exactly the
+	// server the scheduler just picked this producer for: its previous
+	// snapshots live in the bucket, and the local directory holds only what
+	// this daemon has folded since it started.
+	src := baselineFoldSource(req)
+	tableList, err := newestSnapshotTables(s.ctx, src)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("list the snapshot to refresh: %w", err)
 	}
 	if len(tableList) == 0 {
-		return 0, 0, 0, fmt.Errorf("no baseline snapshot to refresh under %s", req.BaselineDir)
+		return 0, 0, 0, fmt.Errorf("no baseline snapshot to refresh under %s", src)
 	}
 	return s.foldSnapshot(req, at, tableList)
 }
@@ -463,8 +630,15 @@ const (
 // starts at a console toggle, and it was the only one nothing could observe.
 func refreshFoldConfig(req refreshRequest, at time.Time, tableList []string) reconstruct.FullTableConfig {
 	return reconstruct.FullTableConfig{
-		IndexDSN:              req.IndexDSN,
-		BaselineSrc:           req.BaselineDir,
+		IndexDSN: req.IndexDSN,
+		// Read from the bucket when there is one, write to the filesystem
+		// always. On an S3-backed server the previous snapshot may exist ONLY
+		// in the bucket, so folding from the local directory would find nothing
+		// to fold from; BaselineSrc takes an s3:// URL and FindBaseline
+		// dispatches on the prefix. OutputDir cannot follow it: the Parquet
+		// writer needs a real directory, and the upload below is what moves the
+		// finished snapshot to the destination.
+		BaselineSrc:           baselineFoldSource(req),
 		Tables:                tableList,
 		At:                    at,
 		OutputDir:             req.BaselineDir,
@@ -528,6 +702,16 @@ func (s *baselineSupervisor) foldSnapshot(req refreshRequest, at time.Time, tabl
 // state: the jobs run in their own goroutines, and restoring while one is
 // still folding is a data race on this variable.
 var foldTables = reconstruct.ReconstructTablesDetailed
+
+// newestSnapshotTables and uploadSnapshot are indirected for the same reason
+// foldTables is, and carry the same rule about when a test may restore them:
+// since #1539 both address the server's S3 destination on an S3-backed server,
+// and a unit test that reached a bucket would be neither hermetic nor
+// offline-safe.
+var (
+	newestSnapshotTables = reconstruct.NewestSnapshotTables
+	uploadSnapshot       = baseline.Upload
+)
 
 // foldOutcome is everything foldSnapshot decides once the fold has run, split
 // out because the fold itself needs a live index and a real baseline and this
@@ -606,19 +790,25 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 		// console that is not running. The visibility this warning gives is what
 		// the refusal was actually for.
 		slog.Warn("baseline refresh: no server is refreshable yet, so nothing will run until one has BOTH an " +
-			"index DSN and a LOCAL baseline directory (a refresh reads the previous snapshot and writes the new " +
-			"one on disk; an S3-only baseline destination cannot be refreshed in place). Servers added later are " +
+			"index DSN and a LOCAL baseline directory (a refresh writes Parquet to a filesystem, so it needs one " +
+			"to fold into; its previous snapshot may be in the bucket). Servers added later are " +
 			"picked up automatically.")
 	}
 	// RETENTION INTERPLAY (#616), stated at startup on purpose. A refreshed
 	// snapshot is written locally and is NOT uploaded, and baseline.PruneLocal
 	// only reclaims a snapshot whose _SUCCESS marker it can confirm in S3 — so
-	// nothing this loop publishes is prunable, with or without an S3 destination
-	// configured. Unattended that is one full-table snapshot per interval,
+	// nothing THIS loop publishes is prunable, with or without an S3 destination
+	// configured.
+	//
+	// Scoped to this loop, and since #1539 that scope is load-bearing: a
+	// PER-SERVER schedule on a server with an S3 destination uploads what it
+	// folds, so those snapshots ARE prunable (baselinePruneTargets already
+	// covers any entry with both a directory and a bucket). This flag names no
+	// destination, which is exactly why its own output stays local. Unattended that is one full-table snapshot per interval,
 	// forever. An operator who discovers this from a full disk discovers it far
 	// too late, and the loop has no business quietly deciding to upload on their
 	// behalf.
-	slog.Warn("baseline refresh: snapshots from this loop are written locally and never uploaded, so retention "+
+	slog.Warn("baseline refresh: snapshots from this interval are written locally and never uploaded, so retention "+
 		"cannot reclaim them (a prune needs a confirmed S3 copy of the snapshot). Upload and prune on your own "+
 		"schedule, or size the disk for one full-table snapshot per server per interval, at the rate below.",
 		diskArgs(interval, targets)...)
@@ -897,7 +1087,7 @@ func baselineRefreshTargets(entries []console.ServerEntry, globalDSN, globalBase
 	for _, e := range entries {
 		if e.DSN != "" && e.BaselineDir == "" && e.BaselineS3 != "" {
 			slog.Warn("baseline refresh: server has an S3-only baseline destination and will not be refreshed "+
-				"(a refresh reads and writes snapshot files on disk)", "server", e.Name)
+				"(a refresh writes Parquet to a filesystem, so it needs a local directory to fold into)", "server", e.Name)
 			continue
 		}
 		add(e.ID, e.Name, e.DSN, e.BaselineDir)

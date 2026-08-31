@@ -2,6 +2,7 @@ package baseline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -105,6 +106,21 @@ func uploadWithOps(ctx context.Context, outputDir, prefix string, retry bool, op
 	if err != nil {
 		return 0, err
 	}
+	// Steps 1 and 4 are the only readers of snapDirs; the walk that uploads the
+	// data and the deferred _SUCCESS are not gated on it. So an empty snapDirs
+	// does not upload nothing — it uploads EVERYTHING except the crash-safety
+	// bracket, and a remote snapshot carrying neither marker is complete by
+	// default (#467). An upload interrupted at three tables of twelve would
+	// then be discoverable and readable and wrong.
+	//
+	// Every caller reaches here right after a successful Run or fold, so a
+	// completed snapshot is always present and this costs them nothing. It is
+	// the assertion they were already relying on, now stated.
+	if len(snapDirs) == 0 {
+		return 0, fmt.Errorf("refusing to upload %q: no completed snapshot was found in it or under it, so the "+
+			"%s marker cannot be written and an interrupted upload would read as a complete backup",
+			outputDir, IncompleteMarker)
+	}
 	incompleteKey := func(snapDir string) (string, error) {
 		return storage.BuildS3Key(outputDir, filepath.Join(snapDir, IncompleteMarker), prefix)
 	}
@@ -162,10 +178,28 @@ func uploadWithOps(ctx context.Context, outputDir, prefix string, retry bool, op
 	return count, nil
 }
 
-// snapshotDirsWithSuccess returns the immediate child snapshot directories of
-// outputDir that carry a local _SUCCESS marker (i.e. completed snapshots). The
-// baseline layout is <output>/<timestamp>/..., so only one level is scanned.
+// snapshotDirsWithSuccess returns the completed snapshot directories under
+// outputDir. The baseline layout is <output>/<timestamp>/..., so only one
+// level of children is scanned.
+//
+// outputDir may also BE a single snapshot directory, which is how the
+// scheduled refresh uploads the one snapshot it just folded (#1539) instead of
+// re-walking every snapshot the server ever wrote. Without this branch that
+// call found no snapshot, so steps 1 and 4 silently did nothing: the data and
+// _SUCCESS still landed in the right keys, and only the crash-safety marker
+// went missing — an interrupted upload would then read as COMPLETE, because a
+// snapshot with neither marker is complete-by-default (#467).
 func snapshotDirsWithSuccess(outputDir string) ([]string, error) {
+	switch _, err := os.Stat(filepath.Join(outputDir, SuccessMarker)); {
+	case err == nil:
+		return []string{outputDir}, nil
+	case !errors.Is(err, fs.ErrNotExist):
+		// Anything but "it is not there" is a real IO answer, and swallowing it
+		// would send a single-snapshot upload down the children scan, which
+		// finds no snapshot and reports none — the markerless upload the
+		// caller's guard exists to refuse.
+		return nil, fmt.Errorf("look for the %s marker in %q: %w", SuccessMarker, outputDir, err)
+	}
 	entries, err := os.ReadDir(outputDir)
 	if err != nil {
 		return nil, fmt.Errorf("read output directory %q: %w", outputDir, err)

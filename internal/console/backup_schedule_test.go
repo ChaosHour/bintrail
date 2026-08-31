@@ -204,13 +204,14 @@ func TestCheckBackupSchedule(t *testing.T) {
 		{"read-only console", ready, BackupScheduleGates{ReadOnlyConsole: true}, "watch daemon"},
 		{"watch without any baseline feature", ready, BackupScheduleGates{}, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1 and no refresh interval is set (CLI: --baseline-refresh-interval)"},
 		{"creation off but a rebuild is possible", ready, BackupScheduleGates{LoopRunning: true}, ""},
-		{"creation off and no local dir", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, BackupScheduleGates{LoopRunning: true}, "go to S3, which only a full backup can upload, and creating backups"},
+		{"creation off and no local dir", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, BackupScheduleGates{LoopRunning: true}, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1); an update from the recorded changes needs a local backup directory"},
 		{"lock mode misconfigured but a rebuild is possible", ready, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, ""},
-		{"lock mode misconfigured, S3-only", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, "go to S3, which only a full backup can upload, and bad lock mode"},
-		// S3 AND a local dir: the rebuild is not a candidate producer (S3
-		// forces full), so the creation opt-in being off makes this a timer
-		// nothing would honour. Refused, not saved.
-		{"creation off, S3 and a local dir", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: "/b", BaselineS3: "s3://b/"}, BackupScheduleGates{LoopRunning: true}, "go to S3, which only a full backup can upload, and creating backups"},
+		{"lock mode misconfigured, S3-only", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, "bad lock mode; an update from the recorded changes needs a local backup directory"},
+		// S3 AND a local dir: since #1539 the rebuild IS a candidate producer
+		// there (it reads the bucket, writes the local directory, uploads),
+		// so the creation opt-in being off no longer makes this a timer
+		// nothing would honour. Saved, not refused.
+		{"creation off, S3 and a local dir", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: "/b", BaselineS3: "s3://b/"}, BackupScheduleGates{LoopRunning: true}, ""},
 		{"postgres ignores the lock mode", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/", Flavor: FlavorPostgres, SourceSlot: "s", SourcePublication: "p"},
 			BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, ""},
 		{"no source, local dir: rebuild only, fine", ServerEntry{DSN: "idx", BaselineDir: "/b"}, live, ""},
@@ -261,9 +262,9 @@ func fakeSnapshot(t *testing.T, dir string) {
 }
 
 // How the next run is made is the daemon's decision, and the rule has to be
-// the one the docs state: S3 means full, no previous backup means full,
-// otherwise rebuild; a rule that lands on a producer this daemon cannot run
-// says so.
+// the one the docs state: no local backup directory means full, no previous
+// backup means full, otherwise rebuild; a rule that lands on a producer this
+// daemon cannot run says so.
 func TestChooseBackupMethod(t *testing.T) {
 	withSnap := t.TempDir()
 	fakeSnapshot(t, withSnap)
@@ -277,23 +278,63 @@ func TestChooseBackupMethod(t *testing.T) {
 		wantMethod string
 		wantWhy    string
 		wantErr    string
+		s3Has      []string // the newest snapshot in the bucket, when there is one
+		s3Err      error    // what listing the bucket answers with, when it fails
+		wantProbe  string   // where the previous backup had to be looked for
 	}{
-		{"local dir with a backup: rebuild", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: withSnap}, live, BackupMethodRefresh, "no load on your database", ""},
-		{"local dir with a backup, creation off: still rebuild", ServerEntry{DSN: "idx", BaselineDir: withSnap}, off, BackupMethodRefresh, "no load", ""},
-		{"local dir, no backup yet: full", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty}, live, BackupMethodFull, "no previous backup", ""},
+		{"local dir with a backup: rebuild", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: withSnap}, live, BackupMethodRefresh, "no load on your database", "", nil, nil, ""},
+		{"local dir with a backup, creation off: still rebuild", ServerEntry{DSN: "idx", BaselineDir: withSnap}, off, BackupMethodRefresh, "no load", "", nil, nil, ""},
+		{"local dir, no backup yet: full", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty}, live, BackupMethodFull, "no previous backup", "", nil, nil, ""},
 		// The directory the first full backup has not created yet is the
 		// same case, not an unreadable one.
-		{"local dir that does not exist yet: full", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: filepath.Join(empty, "not-yet")}, live, BackupMethodFull, "no previous backup", ""},
-		{"local dir, no backup yet, creation off: nothing can run", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty}, off, BackupMethodFull, "", "no previous backup to update"},
-		{"S3 destination: full", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, live, BackupMethodFull, "backups go to S3", ""},
-		{"S3 AND local dir with a backup: still full (the S3 copy must stay fresh)", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: withSnap, BaselineS3: "s3://b/"}, live, BackupMethodFull, "backups go to S3", ""},
-		{"S3 destination, creation off: nothing can run", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, off, BackupMethodFull, "", "only a full backup can upload"},
-		{"no destination at all: nothing can run", ServerEntry{DSN: "idx", SourceDSN: "src"}, live, BackupMethodFull, "", "no baseline location"},
-		{"lock mode misconfigured with a backup on disk: rebuild", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: withSnap}, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock"}, BackupMethodRefresh, "no load", ""},
+		{"local dir that does not exist yet: full", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: filepath.Join(empty, "not-yet")}, live, BackupMethodFull, "no previous backup", "", nil, nil, ""},
+		{"local dir, no backup yet, creation off: nothing can run", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty}, off, BackupMethodFull, "", "no previous backup to update", nil, nil, ""},
+		// S3 with no local directory is the one shape that still forces a
+		// full backup, and the why names the setting that unlocks the cheap
+		// path rather than the destination the operator cannot change.
+		{"S3 destination, no local dir: full", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, live, BackupMethodFull, "needs a local backup directory", "", nil, nil, ""},
+		// #1539: the previous backup is looked for in the BUCKET, so an
+		// S3-backed server whose local directory is empty (every backup it
+		// has was uploaded) still rebuilds. Under the old rule this was a
+		// full dump of production every slot.
+		{"S3 and a local dir, a backup in the bucket: rebuild", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty, BaselineS3: "s3://b/"}, live, BackupMethodRefresh, "no load on your database", "", []string{"app.orders"}, nil, "s3://b/"},
+		// The mirror: a local snapshot does NOT stand in for an empty
+		// bucket. Folding the local one would publish an update of a
+		// backup no reader of the bucket has ever seen.
+		{"S3 and a local dir, nothing in the bucket yet: full", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: withSnap, BaselineS3: "s3://b/"}, live, BackupMethodFull, "no previous backup", "", nil, nil, "s3://b/"},
+		{"S3 destination, creation off, no local dir: nothing can run", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, off, BackupMethodFull, "", "needs a local backup directory", nil, nil, ""},
+		// A bucket that will not answer must not cost the slot: before #1539
+		// these servers were guaranteed a full backup without touching the
+		// network, and a throttled listing that skipped the night would be a
+		// worse trade than an expensive backup.
+		{"S3 listing fails, a full backup is possible: full, with the real cause", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty, BaselineS3: "s3://b/"}, live, BackupMethodFull, "could not be read from the backup destination", "", nil, errors.New("throttled"), "s3://b/"},
+		{"S3 listing fails and no full backup is possible: the slot is refused", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty, BaselineS3: "s3://b/"}, off, BackupMethodFull, "", "could not be read", nil, errors.New("throttled"), "s3://b/"},
+		{"S3 and a local dir, creation off, empty bucket: nothing can run", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty, BaselineS3: "s3://b/"}, off, BackupMethodFull, "", "no previous backup to update under s3://b/", nil, nil, "s3://b/"},
+		{"no destination at all: nothing can run", ServerEntry{DSN: "idx", SourceDSN: "src"}, live, BackupMethodFull, "", "no baseline location", nil, nil, ""},
+		{"lock mode misconfigured with a backup on disk: rebuild", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: withSnap}, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock"}, BackupMethodRefresh, "no load", "", nil, nil, ""},
 	}
+	real := newestSnapshotTables
+	t.Cleanup(func() { newestSnapshotTables = real })
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			// Only the bucket is stubbed; a local source still runs the real
+			// listing, so the cases that pin the on-disk behaviour keep
+			// exercising it. The probed source is recorded because WHERE the
+			// previous backup is looked for is the whole of #1539: a stub
+			// that answered for any source would let a case pass while the
+			// decision read the wrong place.
+			var probed string
+			newestSnapshotTables = func(ctx context.Context, src string) ([]string, error) {
+				if !strings.HasPrefix(src, "s3://") {
+					return real(ctx, src)
+				}
+				probed = src
+				return c.s3Has, c.s3Err
+			}
 			method, why, err := ChooseBackupMethod(context.Background(), c.e, c.gates)
+			if probed != c.wantProbe {
+				t.Fatalf("looked for the previous backup in %q, want %q", probed, c.wantProbe)
+			}
 			if method != c.wantMethod {
 				t.Fatalf("method = %q, want %q (why=%q err=%v)", method, c.wantMethod, why, err)
 			}
@@ -313,9 +354,16 @@ func TestChooseBackupMethod(t *testing.T) {
 	}
 }
 
-// An unreadable backup directory is its own verdict, never "no backup yet":
+// An unreadable backup location is its own verdict, never "no backup yet":
 // calling it absent would turn the no-load rebuild into a nightly full read
 // of production while the page named a false reason.
+//
+// A LOCAL one still refuses, and the scope matters: an unreadable directory is
+// persistent, and the full backup that would stand in writes into that same
+// directory, so degrading would trade a precise alarm for an expensive dump
+// that fails on the way out. Only a REMOTE source degrades (#1539), because a
+// bucket error is usually transient and those servers were guaranteed a full
+// backup before this change without touching the network.
 func TestChooseBackupMethod_unreadableDirIsNotNoBackup(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0); err != nil {
@@ -330,7 +378,12 @@ func TestChooseBackupMethod_unreadableDirIsNotNoBackup(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "could not be read") || !strings.Contains(err.Error(), dir) {
 		t.Fatalf("err = %v (why=%q), want the unreadable directory named", err, why)
 	}
+	if strings.Contains(err.Error(), "no previous backup") {
+		t.Fatalf("err = %v, want the real cause, not the absent-backup one", err)
+	}
 }
+
+
 
 // Same verdict for a path that is a FILE (ENOTDIR): this one runs as root
 // too, where a mode-000 directory reads fine and the test above skips.

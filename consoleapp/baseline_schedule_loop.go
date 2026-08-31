@@ -391,10 +391,22 @@ func (b *backupScheduler) fire(e console.ServerEntry, p console.ParsedBackupSche
 		b.skip(e, now, console.RefusalReason(err))
 		return
 	}
-	method, _, err := console.ChooseBackupMethod(b.sup.ctx, e, gates)
+	method, why, err := console.ChooseBackupMethod(b.sup.ctx, e, gates)
 	if err != nil {
 		b.skip(e, now, err.Error())
 		return
+	}
+	// A full backup chosen because the previous one could not be READ is not
+	// the plan the operator set, and it is the expensive producer. Carried into
+	// the run record so the history says why, and logged because the page's own
+	// reason is recomputed live: by the time anyone looks, a transient bucket
+	// error is gone and the page would show the cheap producer as if that is
+	// what ran.
+	degraded := ""
+	if method == console.BackupMethodFull && strings.Contains(why, "could not be read") {
+		degraded = why
+		slog.Warn("backup schedule: taking a full backup because the previous one could not be read",
+			"server", e.Name, "id", e.ID, "reason", why)
 	}
 	stamp := now.Format(time.RFC3339)
 	if method == console.BackupMethodRefresh {
@@ -410,7 +422,7 @@ func (b *backupScheduler) fire(e console.ServerEntry, p console.ParsedBackupSche
 		}
 		return
 	}
-	if b.startFull(e, stamp, now, "") {
+	if b.startFull(e, stamp, now, degraded) {
 		b.watch(e, stamp, method)
 	}
 }
@@ -438,6 +450,10 @@ func (b *backupScheduler) gates() console.BackupScheduleGates {
 func (b *backupScheduler) startRebuild(e console.ServerEntry, p console.ParsedBackupSchedule, stamp string) error {
 	req := refreshRequest{
 		ServerID: e.ID, ServerName: e.Name, IndexDSN: e.DSN, BaselineDir: e.BaselineDir,
+		// The destination this server's backups already go to. Set ONLY here:
+		// it is what lets the fold reach S3 (#1539), and the daemon-wide
+		// interval loop must keep leaving it empty. See refreshRequest.
+		BaselineS3:            e.BaselineS3,
 		CarryForwardUnchanged: effectiveCarryForward(b.reg, b.carryDefault),
 		Trigger:               console.BaselineRunTriggerScheduled,
 	}
@@ -498,9 +514,11 @@ var fallbackPoll = time.Second
 // full backup that panicked (no history record, by the guard's contract)
 // is on the page even if a manual job takes the slot before anyone loads
 // it. And for an update from the recorded changes that failed, it takes a
-// full backup at the same slot (fallBack). Any failure of the update
-// qualifies, a crash included: the output is the same as a full backup's,
-// and a backup is what the operator scheduled. Nothing is started when the
+// full backup at the same slot (fallBack). Any failure that PUBLISHED
+// NOTHING qualifies, a crash included: the output is the same as a full
+// backup's, and a backup is what the operator scheduled. An update whose
+// fold finished and whose upload failed is the exception and takes no
+// fallback (see the Published check below). Nothing is started when the
 // daemon is shutting down, when the schedule was forgotten or a newer
 // scheduled slot superseded this one (logged), or when another job took the
 // supervisor slot before this job's end was seen (a recorded skip: the
@@ -538,7 +556,12 @@ func (b *backupScheduler) watchScheduled(e console.ServerEntry, stamp, method st
 		if st.Running {
 			continue
 		}
-		if method == console.BackupMethodRefresh && st.Last.State == "failed" {
+		// Published, not State: an update whose fold finished and whose UPLOAD
+		// failed already produced the snapshot a backup would have produced,
+		// and a full backup would have to clear the same upload gate that just
+		// refused it. Falling back there answers one S3 permission error with a
+		// full lock-and-read of production that publishes nothing new (#1539).
+		if method == console.BackupMethodRefresh && st.Last.State == "failed" && !st.Last.Published {
 			b.fallBack(e, st.Last.LastError)
 		}
 		return

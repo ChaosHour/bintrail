@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **A scheduled backup on a server whose backups go to S3 no longer forces a
+  full read of your database every slot** (#1539). The daemon has two ways to
+  produce a backup: a full one it dumps from the source, and an update of the
+  newest backup folded from the recorded changes, which touches the source not
+  at all. An S3 destination used to force the full one at every slot, on the
+  reasoning that only a full backup uploads, so the cheapest producer was
+  unreachable on exactly the servers most likely to run nightly: a schedule
+  that was supposed to be free became a nightly full read of production.
+  The scheduled update now reads its previous snapshot straight from the
+  bucket, folds into the server's local backup directory, and uploads the
+  result to the same destination a full backup would have written to, with the
+  same crash-safe ordering (`_INCOMPLETE` first, `_SUCCESS` last), so a run
+  interrupted mid-upload leaves the remote copy excluded from discovery rather
+  than half-visible and readable. An upload that finds no completed snapshot to
+  bracket is now refused outright rather than sending the data unmarked, which
+  is the shape that would have read as a complete backup. A local backup directory is still required,
+  because the fold writes Parquet to a filesystem, and a server that has only
+  an S3 destination still gets a full backup: the reason the page now shows
+  names that setting, which is the one that unlocks the cheap path, rather than
+  the destination, which is not the thing to change. Publishing is not counted as finished until the
+  upload succeeds, and a failed upload keeps the finished local snapshot and
+  says the fold itself worked. The daemon-wide `--baseline-refresh-interval`
+  is unchanged: it names no destination, so its snapshots stay local.
+  Two failures had to stop meaning what they used to. A failed upload does NOT
+  trigger the stand-in full backup: that fallback exists because a failed
+  update produced nothing, and here it produced a snapshot, so falling back
+  would answer one S3 permission error with a full lock-and-read of production
+  that publishes nothing new. And a previous backup that cannot be READ (a
+  throttled bucket, an expired credential) no longer costs the slot: it takes a
+  full backup, naming the real cause, because before this change those servers
+  were guaranteed one without touching the network. That degrade is scoped to a
+  REMOTE source: an unreadable local directory still refuses the slot, because
+  it is persistent and the full backup that would stand in writes into that
+  same directory. Both the console and the run history now say when a scheduled
+  update wrote its backup but could not send it, rather than reporting that
+  nothing was published, a successful upload records how many files it sent,
+  and the prune pass reports the snapshots it could not reclaim instead of only
+  the ones it did.
+  Two consequences worth knowing. Retention improves: `PruneLocal` reclaims a
+  local snapshot once it can confirm its `_SUCCESS` in S3, so the snapshots a
+  scheduled update publishes on an S3-backed server are now prunable, where
+  before nothing this fold produced ever was. And carry-forward of unchanged
+  tables does not apply when the previous snapshot is read from a bucket — it
+  publishes a table by hard-linking the previous file, which needs both on a
+  filesystem — so those runs take the ordinary merge path: correct, and the
+  same rows, just not free.
+
 ## [0.73.0] - 2026-08-30
 
 ### Added
