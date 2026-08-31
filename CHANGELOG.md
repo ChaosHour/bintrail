@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **The console's SQL page and `POST /api/sql`** (#1549). The page answered
+  free-form `SELECT`s with DuckDB running inside the daemon, which is why it
+  needed a sandbox, a statement gate, a table-function allowlist, a
+  forensics-column filter, two timeout budgets and a single-query latch. The
+  download it sat next to needs none of that: it hands you a schema over files
+  you already own and executes nothing.
+
+  It was also not usable on a real archive. Defining the `events` view opens one
+  Parquet footer per archived file before returning a row (`union_by_name` is
+  load-bearing for correctness, so the read cannot be skipped) — 114.2s over
+  1886 files, against a 30s setup budget. `SHOW TABLES`, the only way to learn
+  the derived `state_*` names, built the whole catalog and hit that budget; and
+  the page's one on-screen example named `events`, so it failed the same way.
+  The page could not answer its own example, and the way out of that was the
+  query that timed out.
+
+  Query the same Parquet in your own DuckDB instead: **Download a DuckDB
+  schema** on **Connect** writes a `views.sql` over the same files, with no row
+  cap and no time limit. `BINTRAIL_CONSOLE_SQL_PANEL` is still read for one
+  release and warns that it no longer does anything; a later release stops
+  reading it. `GET /api/views.sql` is unaffected.
+
+### Changed
+- **The Download a DuckDB schema card moved from the SQL page to Connect**
+  (#1549). `GET /api/views.sql` requires `settings:read`, but its only route in
+  the UI was a nav item gated `data-perm="query:execute"` and on the `sql`
+  capability. So a `settings:read` role could not reach a download the server
+  would have authorized, a `query:execute` role without `settings:read` got a
+  button that only 403s, and `BINTRAIL_CONSOLE_SQL_PANEL=0` removed the card
+  altogether while `views` stayed on — taking it from the operator who declined
+  server-side query execution and whose file executes nothing. Connect carries
+  no capability or permission gate of its own and already calls `settings:read`
+  endpoints. The SQL page keeps a line pointing at it.
+
 ### Fixed
 - **`bintrail views` no longer demands `--index-dsn` for a baselines-only
   file** (#1552). Only the `events` view reads an archive source, and since

@@ -248,10 +248,23 @@ func TestStorageSplit_eachHalfHoldsOnlyItsOwnConcern(t *testing.T) {
 	if !strings.Contains(js, `route === "storage"`) {
 		t.Error("nothing handles the old /storage route, so existing links break")
 	}
-	// And the DuckDB schema download has to be ON the page that queries the
-	// same data, not merely absent from the two halves above.
-	if !strings.Contains(jsFunctionBody(t, js, "renderSQL"), "duckdbCard(") {
-		t.Error("the SQL page does not mount duckdbCard, so it moved off Storage to nowhere")
+	// And the DuckDB schema download has to be mounted SOMEWHERE, not merely
+	// absent from the two halves above. Connect since #1549: /sql gated it on
+	// a capability and a permission that are not the download's own, so
+	// BINTRAIL_CONSOLE_SQL_PANEL=0 left `views` on with no route to it.
+	//
+	// Named explicitly rather than searched file-wide, because the failure
+	// this guards is the card existing while nothing calls it.
+	if !strings.Contains(jsFunctionBody(t, js, "buildConnect"), "duckdbCard(") {
+		t.Error("buildConnect does not mount duckdbCard, so the schema download is unreachable")
+	}
+	// And it must not go back to the SQL page, which #1549 removed entirely.
+	// Asserted as the page's ABSENCE rather than as "renderSQL does not mount
+	// the card": jsFunctionBody fatals on a function it cannot find, so the
+	// body form would fail for the wrong reason today and would only start
+	// checking anything again if the page came back.
+	if strings.Contains(js, "function renderSQL(") {
+		t.Error("renderSQL is back in app.js; the SQL page was removed in #1549, and it is what gated this card behind the sql capability")
 	}
 }
 
