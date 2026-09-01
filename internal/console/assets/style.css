@@ -2112,6 +2112,41 @@ button { font-family: inherit; }
    treatment; relative age rides beside the absolute time */
 .stg-row-latest { background: var(--violet-tint); border-radius: var(--radius-sm); }
 .stg-rel { font-family: var(--f-mono); font-size: 11px; color: var(--ink-3); white-space: nowrap; }
+/* The newest row is the one tint on this page, so everything it carries has
+   to survive the ground it sits on. Measured with the converter in
+   assets_tint_contrast_test.go; the rules below are guarded by
+   assets_latest_row_contrast_test.go, which walks what the row RENDERS. On
+   --violet-tint: --ink-3 is 4.20:1 and --ink-4 is 2.80:1.
+
+   The row's age and its location chip had been under their floor since the
+   tint went on. The chevron never was: it arrives in this same change, so it
+   was born under the floor rather than falling below it. The tint itself is
+   not optional -- it marks the copy a restore actually reads.
+
+   The location chip needed its BORDER moved too, not just its ink: it is
+   drawn with --line-soft, which the token block already records as 1.01:1 on
+   violet, invisible. --violet-line is the token that exists for this and
+   measures 1.20:1. The staleness chip next to it needs nothing -- its own
+   --ochre border is 2.14:1 on the tint, so its shape survives the ground its
+   --ochre-bg fill does not.
+
+   The pill is a different case and is NOT a contrast fix, so do not read it
+   as one. Its default ink-2 on surface-3 measures 6.74:1 and was always
+   legible; what it lost on this ground was its EDGE (surface-3 against the
+   tint is 1.09:1). White barely moves that (1.18:1). It takes the white
+   ground because .tcard-violet .tag-pill already does, and one pill on one
+   tint should not have two looks. */
+.stg-row-latest .stg-rel  { color: var(--ink-2); }
+.stg-row-latest .bk-where { color: var(--ink-2); border-color: var(--violet-line); }
+.stg-row-latest .bk-chev  { color: var(--ink-2); }
+.stg-row-latest .tag-pill { background: var(--surface); color: var(--violet-deep); }
+/* Hover must not erase the mark. --surface-2 is LIGHTER than the tint, so
+   pointing at the newest row used to remove the one thing distinguishing
+   it. Keep the ground, add a ring. */
+.stg-row-latest.bk-expandable:hover {
+  background: var(--violet-tint);
+  box-shadow: inset 0 0 0 1px var(--violet-line);
+}
 .vfy-summary { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
 /* Verify explain modal: a wider modal + doctor-cards for each diverging row,
@@ -2737,3 +2772,69 @@ button { font-family: inherit; }
 .bk-made { font-size: 11.5px; color: var(--ink-3); }
 .bk-made-from { color: var(--ink-4); }
 .bk-made-none { color: var(--ink-4); }
+
+/* Backups list paging (#1572). The pager sits under the rows, and the chevron
+   is what says a row opens at all: the per-row Download lives inside that fold,
+   so a hover background was hiding the feature rather than hinting at it. */
+.bk-pager { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-top: 1px solid var(--line-soft); }
+/* --ink-3, not --ink-4: this is the only thing on the page telling a reader
+   where they are in the list, and --ink-4 on --surface-2 is 3.15:1 (the hint
+   floor, not the body one). --ink-3 is 4.74:1. Raised in the same change that
+   lifted three siblings off the floor for the same reason. */
+.bk-pager-n { font-size: 11.5px; color: var(--ink-3); }
+.bk-chev { margin-left: auto; color: var(--ink-4); font-size: 15px; line-height: 1; flex: none; transition: transform .12s ease; }
+.bk-expandable[aria-expanded="true"] .bk-chev { transform: rotate(90deg); }
+
+/* ── Take a copy with you: the two lanes ───────────────────────────────────
+   White lanes on the panel's --surface-2, so each reads as a card and not as
+   a region of the panel. Worth knowing when the Iceberg panel below is next
+   touched: its .ice-stage cards are --surface-2 on a --surface-2 ground, so
+   they are separated by a hairline and nothing else. */
+/* auto-fit, not a fixed 1fr 1fr: the MySQL lane is absent whenever the
+   selected server is the ephemeral --index-dsn entry or sql_export is off,
+   and a fixed pair left the surviving lane at half width beside an empty
+   column on every desktop viewport.
+
+   300px, not 340: the track budget here is the viewport minus the 248px
+   shell, 96px of view padding and 14px of panel padding, so 340 made a
+   1024px window stack two lanes that 1fr 1fr kept side by side. 300 holds
+   the pair down to about 970px, and the 860px rule below still covers the
+   narrow band. */
+.bk-lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; padding: 14px; }
+@media (max-width: 860px) { .bk-lanes { grid-template-columns: 1fr; } }
+.bk-lane {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius-sm); padding: 18px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.bk-lane-t {
+  margin: 0; font-family: var(--f-display); font-size: 15px;
+  font-weight: 600; letter-spacing: -0.01em; color: var(--ink);
+}
+.bk-lane-lead { margin: 0; font-size: 13px; color: var(--ink-2); }
+.bk-lane-go { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.bk-lane .bk-restore-body { padding: 0; }
+
+/* The drawing: one tile per DOWNLOAD, not per file -- the Parquet tile is a
+   whole folder arriving as one .tar.gz, so counting files would be wrong by
+   hundreds. TWO on the DuckDB lane (when Connect AI can produce the views
+   file) and ONE on the
+   MySQL lane, and that count is the whole message -- it says "this takes two
+   files" before any sentence does. Drawn with el() and these classes, never
+   svgEl (that path is for static icon constants). */
+.bk-shape { display: flex; align-items: flex-start; gap: 10px; padding: 2px 0; }
+.bk-file {
+  position: relative; display: flex; flex-direction: column; gap: 3px;
+  min-width: 104px; padding: 10px 12px 9px;
+  background: var(--surface-3); border: 1px solid var(--line); border-radius: 8px;
+}
+/* the folded corner, so a rectangle reads as a file */
+.bk-file::after {
+  content: ""; position: absolute; top: -1px; right: -1px;
+  border-width: 0 11px 11px 0; border-style: solid;
+  border-color: var(--surface) var(--surface) var(--line) var(--line);
+  border-top-right-radius: 8px;
+}
+.bk-file-n { font-family: var(--f-mono); font-size: 12.5px; font-weight: 500; color: var(--ink); }
+.bk-file-c { font-size: 12px; color: var(--ink-3); }
+.bk-shape-plus { align-self: center; font-size: 15px; color: var(--ink-4); }

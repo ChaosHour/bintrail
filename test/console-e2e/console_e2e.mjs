@@ -2342,15 +2342,135 @@ try {
   // baseline rows 1,2,4 + INSERT id 3 + UPDATE id 1 (-> shipped) + DELETE
   // id 2, built at TT_AT (after all three), so the dump must carry the folded
   // state — not the baseline, not the raw events.
+  // The two download lanes (#1572). The Go guards read the SOURCE: they can
+  // see that backupLane derives its count word and that backupFilesShape
+  // draws one tile per file, but not that a reader ends up looking at two
+  // tiles. This is the only check that renders them.
+  const lanes = await page.evaluate(() => {
+    const out = { views: !!capsCache.views, lanes: [] };
+    document.querySelectorAll(".bk-take .bk-lane").forEach((l) => {
+      const t = l.querySelector(".bk-lane-t");
+      out.lanes.push({
+        title: t ? t.textContent : "",
+        tiles: l.querySelectorAll(".bk-file").length,
+        lead: (l.querySelector(".bk-lane-lead") || {}).textContent || "",
+        views: Array.from(l.querySelectorAll("button")).some((b) => /views\.sql/.test(b.textContent)),
+      });
+    });
+    return out;
+  });
+  const duck = lanes.lanes.find((l) => /DuckDB/.test(l.title));
+  const mysql = lanes.lanes.find((l) => /MySQL/.test(l.title));
+  (duck && mysql)
+    ? ok("take-away: both download lanes render")
+    : bad("take-away: both download lanes render", JSON.stringify(lanes));
+  // The drawing and the sentence come from one source, so the rendered tile
+  // count must match the word the lane prints. A drawing that outlived its
+  // lane is the failure this pins.
+  const counts = { 1: "One download", 2: "Two downloads" };
+  (duck && counts[duck.tiles] && duck.lead.startsWith(counts[duck.tiles]))
+    ? ok("take-away: the DuckDB lane's drawing and its sentence agree")
+    : bad("take-away: the DuckDB lane's drawing and its sentence agree", JSON.stringify(duck));
+  (mysql && mysql.tiles === 1 && mysql.lead.startsWith("One download"))
+    ? ok("take-away: the MySQL lane draws one download and says so")
+    : bad("take-away: the MySQL lane draws one download and says so", JSON.stringify(mysql));
+  // The views half is a promise this page cannot keep alone: the file comes
+  // from the Connect AI panel, which is gated on the same capability.
+  (duck && duck.views === lanes.views && duck.tiles === (lanes.views ? 2 : 1))
+    ? ok("take-away: the views file is offered only when Connect AI can produce it")
+    : bad("take-away: the views file is offered only when Connect AI can produce it", JSON.stringify({ caps: lanes.views, duck: duck }));
+
+  // The GATED arm, fixture-driven through the real builder. The assertions
+  // above run on a stack whose views capability is ON, so the one-tile arm --
+  // its sentence, its missing button -- is drawn by nothing otherwise. Same
+  // shape as sqlxGateOff below: flip the capability, call the builder,
+  // restore. Without this, inverting the gate is caught only by the assertion
+  // above, and the arm itself is never rendered at all.
+  const duckOff = await page.evaluate(() => {
+    const b = { configured: true, snapshots: [{ time: "2026-06-10 12:00:00" }] };
+    const keep = capsCache.views;
+    capsCache.views = false;
+    const off = backupDuckLane(b);
+    capsCache.views = true;
+    const on = backupDuckLane(b);
+    capsCache.views = keep;
+    const read = (lane) => lane && ({
+      tiles: lane.querySelectorAll(".bk-file").length,
+      lead: (lane.querySelector(".bk-lane-lead") || {}).textContent || "",
+      views: Array.from(lane.querySelectorAll("button")).some((x) => /views\.sql/.test(x.textContent)),
+      text: lane.textContent,
+    });
+    return { off: read(off), on: read(on) };
+  });
+  (duckOff.off && duckOff.off.tiles === 1 && !duckOff.off.views && duckOff.off.lead.startsWith("One download"))
+    ? ok("take-away: with no views capability the lane draws one download and offers no views file")
+    : bad("take-away: with no views capability the lane draws one download and offers no views file", JSON.stringify(duckOff.off));
+  // And it must say WHY, rather than dressing a console setting as a property
+  // of the data: the same folder still yields the file from the command line.
+  (duckOff.off && /not offered here/.test(duckOff.off.text) && /decimal columns arrive as text/.test(duckOff.off.text))
+    ? ok("take-away: the withheld views file is explained, not implied away")
+    : bad("take-away: the withheld views file is explained, not implied away", JSON.stringify(duckOff.off && duckOff.off.text));
+  // The on-arm is the vacuousness control: a builder that always drew one
+  // tile would pass the off-arm alone.
+  (duckOff.on && duckOff.on.tiles === 2 && duckOff.on.views)
+    ? ok("take-away: with the capability on, the same builder draws both downloads")
+    : bad("take-away: with the capability on, the same builder draws both downloads", JSON.stringify(duckOff.on));
+
+  // Paging, EXECUTED through the real panel. The Go guards test the window
+  // function and the clamp in isolation and read the call site as text; their
+  // COMPOSITION is what a literal page argument breaks, and only rendering
+  // catches that. The fixture index carries one snapshot, so the list is
+  // handed eight synthetic ones instead.
+  const paged = await page.evaluate(() => {
+    const snaps = [];
+    for (let i = 0; i < 8; i++) snaps.push({ time: "2026-06-1" + i + " 12:00:00", age_hours: i });
+    const keep = backupsPage;
+    const read = (idx) => {
+      backupsPage = { server: currentServer, index: idx };
+      const panel = baselinesPanel({ configured: true, snapshots: snaps }, [], {});
+      return {
+        rows: Array.from(panel.querySelectorAll(".stg-row .stg-name")).map((n) => n.textContent),
+        latest: panel.querySelectorAll(".stg-row-latest").length,
+        pager: (panel.querySelector(".bk-pager-n") || {}).textContent || "",
+      };
+    };
+    const p0 = read(0), p1 = read(1);
+    backupsPage = keep;
+    return { p0: p0, p1: p1 };
+  });
+  (paged.p0.rows.length === 5 && paged.p1.rows.length === 3)
+    ? ok("backups paging: five rows a page, and the last page holds the remainder")
+    : bad("backups paging: five rows a page, and the last page holds the remainder",
+        JSON.stringify({ p0: paged.p0.rows.length, p1: paged.p1.rows.length }));
+  // The composition is what a literal page argument breaks: the window has to
+  // MOVE. Page two showing page one's rows is the shape that passed every
+  // source assertion and both isolated node tests.
+  (paged.p1.rows[0] && paged.p1.rows[0] !== paged.p0.rows[0])
+    ? ok("backups paging: page two continues the list instead of restarting it")
+    : bad("backups paging: page two continues the list instead of restarting it",
+        JSON.stringify({ p0first: paged.p0.rows[0], p1first: paged.p1.rows[0] }));
+  // The treatment marks the backup a restore reads, so it belongs to the
+  // whole list, not to a page.
+  (paged.p0.latest === 1 && paged.p1.latest === 0)
+    ? ok("backups paging: only the real newest backup wears the treatment")
+    : bad("backups paging: only the real newest backup wears the treatment",
+        JSON.stringify({ p0: paged.p0.latest, p1: paged.p1.latest }));
+  (/^1.5 of 8$/.test(paged.p0.pager) && /^6.8 of 8$/.test(paged.p1.pager))
+    ? ok("backups paging: the pager says which rows are on screen")
+    : bad("backups paging: the pager says which rows are on screen",
+        JSON.stringify({ p0: paged.p0.pager, p1: paged.p1.pager }));
   const sqlxGate = await page.evaluate(async () => {
     const out = { cap: !!capsCache.sql_export };
     const v = document.querySelector(".view");
-    const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
-      /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+    const card = Array.from(v.querySelectorAll(".bk-lane")).find((c) =>
+      /To load into MySQL/.test((c.querySelector(".bk-lane-t") || {}).textContent || ""));
     out.card = !!card;
     if (!card) return out;
-    card.open = true;
     const input = card.querySelector("input");
+    // The lane renders neither input nor Build while a build is running (it
+    // hands off to the run region). Say so, rather than dereferencing null
+    // and turning a named failure into a stack trace.
+    if (!input) { out.running = true; return out; }
     out.prefilled = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(input.value);
     // Before any build the download must refuse with words, not stream bytes.
     const headers = TOKEN ? { Authorization: ["Bearer", TOKEN].join(" ") } : {};
@@ -2388,23 +2508,22 @@ try {
     const st = { sql_export: { state: "idle" } };
     const keep = capsCache.sql_export;
     capsCache.sql_export = false;
-    const off = backupSQLExportCard(cur, b, st);
+    const off = backupSQLLane(cur, b, st);
     capsCache.sql_export = keep;
-    return { off: !!off, on: !!backupSQLExportCard(cur, b, st) };
+    return { off: !!off, on: !!backupSQLLane(cur, b, st) };
   });
   (!sqlxGateOff.off && sqlxGateOff.on)
-    ? ok("sqlx: the capability gates the card (off absent, on present)")
-    : bad("sqlx: the capability gates the card (off absent, on present)", JSON.stringify(sqlxGateOff));
+    ? ok("sqlx: the capability gates the lane (off absent, on present)")
+    : bad("sqlx: the capability gates the lane (off absent, on present)", JSON.stringify(sqlxGateOff));
 
   // The real build. TT_AT sits after every fixture event; the fold reads the
   // baseline AND the index. Poll the status endpoint, not the DOM — the page
   // re-renders itself while the run region is up.
   const sqlxRun = await page.evaluate(async (TT_AT) => {
     const v = document.querySelector(".view");
-    const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
-      /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
-    if (!card) return { err: "card vanished" };
-    card.open = true;
+    const card = Array.from(v.querySelectorAll(".bk-lane")).find((c) =>
+      /To load into MySQL/.test((c.querySelector(".bk-lane-t") || {}).textContent || ""));
+    if (!card) return { err: "the .sql lane vanished" };
     const input = card.querySelector("input");
     input.value = TT_AT;
     Array.from(card.querySelectorAll("button")).find((b) => b.textContent === "Build").click();
@@ -2426,8 +2545,8 @@ try {
   await page.waitForFunction(() => {
     const v = document.querySelector(".view");
     if (!v) return false;
-    const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
-      /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+    const card = Array.from(v.querySelectorAll(".bk-lane")).find((c) =>
+      /To load into MySQL/.test((c.querySelector(".bk-lane-t") || {}).textContent || ""));
     return !!card && /Ready: every table as of/.test(card.textContent) &&
       Array.from(card.querySelectorAll("button")).some((b) => /Download \.sql backup/.test(b.textContent));
   }, { timeout: 30000 });
@@ -2509,14 +2628,14 @@ try {
       await page.waitForFunction(() => {
         const v = document.querySelector(".view");
         if (!v) return false;
-        const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
-          /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+        const card = Array.from(v.querySelectorAll(".bk-lane")).find((c) =>
+          /To load into MySQL/.test((c.querySelector(".bk-lane-t") || {}).textContent || ""));
         return !!card && /Last build failed/.test(card.textContent);
       }, { timeout: 15000 });
       const gapMsg = await page.evaluate(() => {
         const v = document.querySelector(".view");
-        const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
-          /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+        const card = Array.from(v.querySelectorAll(".bk-lane")).find((c) =>
+          /To load into MySQL/.test((c.querySelector(".bk-lane-t") || {}).textContent || ""));
         return card.textContent;
       });
       (/capture gap/.test(gapMsg) && !/--allow-gaps/.test(gapMsg))
