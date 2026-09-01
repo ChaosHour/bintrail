@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.76.0] - 2026-09-01
+
+### Added
+- **The Backups page answers what to download, in two lanes.** A reader who
+  opens it wants a copy of their tables, and until now the page listed backups
+  without saying what a copy is made of. There are two lanes now, drawn rather
+  than explained. To open in DuckDB: the Parquet files plus the `views.sql`
+  that tells DuckDB how to read them, two downloads, and the lane says so and
+  shows the two tiles. To load into MySQL: one download, plain SQL in mydumper
+  format, built for whatever moment you pick, with the build starting from the
+  backup before that moment and replaying the changes already recorded. The
+  source database is never touched by either.
+
+- **The backups list pages five at a time**, and a row opens with the chevron
+  instead of scrolling a hundred snapshots to reach the oldest.
+
+### Changed
+- **A row of settings cards fills its row, whatever the count.** The grid was
+  three fixed columns, which is right only for the pages that carry three
+  cards. Retention and Backups carry one, so a third of the row was card and
+  two thirds were nothing. A card left alone on a row now spans it, at every
+  width, rather than leaving a hole beside itself.
+
+- **The "Backups & disk space" card was rewritten, and it no longer promises a
+  saving that cannot happen.** It used to open with two label and value rows
+  reading `reuse: off` and `set by: daemon default`, which name neither what is
+  reused nor who set it, and it printed command line flags at a reader who is
+  clicking buttons. The state is a word at the top now, and the rest is
+  sentences: what the setting does to your disk, what it does not change about
+  your backups, and whether anything is using it yet.
+
+  It also stated the disk saving unconditionally. Reusing a file means linking
+  it on disk, so it only happens when the previous backup is read from the
+  machine dbtrail runs on. A scheduled backup on a server that has a Backup S3
+  reuses nothing and writes every table. The card says which, and the daemon
+  log has been saying so on every published run.
+
+
 ## [0.75.0] - 2026-09-01
 
 ### Fixed
