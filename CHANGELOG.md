@@ -7,7 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.75.0] - 2026-09-01
+
+### Fixed
+- **A DuckDB schema file now refuses a dropped table up front, by name, before
+  it creates any view.** When a table is dropped at the source it leaves the
+  snapshot, and the read used to break at that table's own `CREATE VIEW`. DuckDB
+  does not roll back a multi-statement script, so against a persistent database
+  what remained was a partial schema whose contents depended on emission order,
+  reported as a missing Parquet path — which reads as a corrupt snapshot rather
+  than as a table somebody dropped on purpose. The generated file now checks
+  every table it names against one listing of the snapshot, and raises naming the
+  tables, where it looked, and what to do. A pinned file is not checked: it names
+  a snapshot that held them all when it was written.
+
+- **The Backups page lists every backup location, not just the local folder.** A
+  server with a local directory and an S3 destination kept the bucket as a
+  per-table fallback that time-travel consulted and the listing did not, so once
+  local retention pruned, the page showed nothing while the bucket held dozens.
+  The listing merges both, says where each backup was found, and reports a
+  location it could not read instead of quietly serving a shorter list. A backup
+  held only in the bucket can now be opened and downloaded, and the restore and
+  `.sql` build offer only the backups they can actually read.
+
+### Added
+- **Each table in a backup says how it got there**: read from the source, built
+  from the recorded changes, or reused unchanged from the previous backup. Per
+  table rather than per backup, because a refresh that reuses cold tables makes
+  one backup a mix. It answers a question no surface could answer before — how
+  much of this was independent evidence from your database, and how much was
+  computed — and it is shown in the expanded backup detail.
+
 ### Changed
+- **The Iceberg export panel draws what the export produces instead of
+  describing it**, and says which engines read the folder directly versus through
+  a catalog.
 - **The Download a DuckDB schema card draws what the file will hold, instead of
   describing it.** It carried three checkboxes, each trailed by a multi-line
   caveat, on a page whose job is to be legible to someone who has read nothing.
