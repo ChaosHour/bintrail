@@ -4551,7 +4551,16 @@ function baselineContextStrip(b, cur) {
   const snaps = b.snapshots || [];
   // The source path is code, and it gets the width to render as one line —
   // the dark code-ink treatment the recipe reserves for SQL/DSNs/paths.
-  strip.append(item("SOURCE", el("code", { class: "code-ink ctx-source", text: b.source }), "ctx-grow"));
+  // With two locations the strip names them BOTH. Printing only the primary
+  // is what made an S3-backed server look empty: the path on screen was the
+  // local directory, and the bucket holding the snapshots was never mentioned.
+  const srcs = b.sources || [];
+  if (srcs.length > 1) {
+    strip.append(item("SOURCES", el("div", { class: "ctx-srcs" },
+      ...srcs.map((s) => el("code", { class: "code-ink ctx-source", text: s.source }))), "ctx-grow"));
+  } else {
+    strip.append(item("SOURCE", el("code", { class: "code-ink ctx-source", text: b.source }), "ctx-grow"));
+  }
   strip.append(item("BACKUPS", String(snaps.length) + (b.truncated ? "+" : "")));
   if (snaps.length) {
     // One fact, one place: absolute and relative side by side, instead of the
@@ -4813,6 +4822,61 @@ function icebergExportPanel(cur, baselines) {
   return panel;
 }
 
+// backupSourceList renders every location the listing read, which is more than
+// one whenever a server has a local directory AND an S3 destination (#1542).
+// The bucket is the bundle's per-table fallback, so it always held snapshots the
+// page could resolve through Time-travel and never showed.
+function backupSourceList(b) {
+  const srcs = (b && b.sources) || [];
+  if (srcs.length < 2) return el("code", { class: "stg-code", text: (b && b.source) || "" });
+  return el("div", { class: "bk-srcs" }, ...srcs.map((s) => el("div", { class: "bk-src" },
+    el("span", { class: "bk-src-k", text: backupKindWord(s.kind) }),
+    el("code", { class: "stg-code", text: s.source }),
+    s.error
+      ? el("span", { class: "chip chip-mon", text: "unreadable" })
+      : el("span", { class: "bk-src-n", text: s.count + " file(s)" }))));
+}
+
+function backupKindWord(kind) { return kind === "s3" ? "S3" : "disk"; }
+
+// firstLine trims a backend error to its opening line. An S3 listing failure
+// arrives as a DuckDB error carrying the whole generated SQL statement across
+// several lines; pasted into the page it is a wall, and the wall is what a
+// reader skips. The first line is the cause ("HTTP 404", "AccessDenied"); the
+// server keeps the rest.
+function firstLine(msg) {
+  const s = String(msg || "").split("\n")[0].trim();
+  return s.length > 180 ? s.slice(0, 177) + "\u2026" : s;
+}
+
+// backupWhereChip says which of the two locations a snapshot was found in.
+// Rendered only when there IS more than one, since a chip repeating the single
+// configured source on every row is noise, not information.
+function backupWhereChip(b, sn) {
+  const srcs = (b && b.sources) || [];
+  if (srcs.length < 2) return null;
+  const kinds = (sn && sn.kinds) || [];
+  if (!kinds.length) return null;
+  return el("span", { class: "bk-where", text: kinds.map(backupKindWord).join(" + ") });
+}
+
+// backupIncompleteNotice is a HAZARD, not a status line: the list under it is a
+// subset, and the failure this endpoint had was a short list read as the whole
+// set. Named per location, because "one of your sources failed" sends the
+// operator to check both.
+function backupIncompleteNotice(b) {
+  if (!b || !b.incomplete) return null;
+  const bad = ((b.sources) || []).filter((s) => s.error);
+  const box = el("div", { class: "error-box" },
+    el("div", { text: "Some backups are not listed: " + bad.length +
+      " of " + ((b.sources) || []).length + " locations could not be read." }));
+  bad.forEach((s) => box.append(el("div", { class: "bk-src" },
+    el("span", { class: "bk-src-k", text: backupKindWord(s.kind) }),
+    el("code", { class: "stg-code", text: s.source }),
+    el("span", { class: "bk-src-n", text: firstLine(s.error) }))));
+  return box;
+}
+
 function baselinesPanel(b, servers, opts) {
   // Full-width (#1415): this list is the page. The Create-baseline action
   // moved to the context strip — at page level it is a page action; inside
@@ -4848,14 +4912,20 @@ function baselinesPanel(b, servers, opts) {
       el("code", { class: "stg-code", text: "docker compose --profile baseline run --rm baseline" }),
       el("p", { class: "stg-empty-sub", text: "2. " + baselineConfigHint(cur, opts && opts.serversErr) })));
   } else if (!(b.snapshots || []).length) {
+    // A source that failed reaches HERE too, and "no backups found" would be a
+    // flat lie about a bucket nobody could read.
+    const emptyWarn = backupIncompleteNotice(b);
+    if (emptyWarn) list.append(emptyWarn);
     list.append(el("div", { class: "stg-empty" },
       el("p", { class: "stg-empty-lead", text: "Source configured, no backups found." }),
-      el("code", { class: "stg-code", text: b.source }),
+      backupSourceList(b),
       el("p", { class: "stg-empty-sub", text: "Run bintrail dump and bintrail baseline to create your first backup. The path must point at the folder that contains the backups, not a specific file (<timestamp>/<schema>/<table>.parquet)." })));
   } else {
     // Panel headline: the newest-per-table rollup. Older snapshots being past
     // coverage is routine (superseded) — only the headline and the newest
     // row's verdict are actionable, so only those get a chip.
+    const incomplete = backupIncompleteNotice(b);
+    if (incomplete) list.append(incomplete);
     if (b.staleness && b.staleness !== "ok") {
       list.append(el("div", { class: "vfy-summary" },
         el("span", { class: "chip chip-mon", text: b.staleness === "broken"
@@ -4881,6 +4951,8 @@ function baselinesPanel(b, servers, opts) {
         row.append(el("span", { class: "chip chip-mon", text:
           sn.staleness === "broken" ? "⚠ STALE: restore broken" : sn.staleness.toUpperCase() }));
       }
+      const where = backupWhereChip(b, sn);
+      if (where) row.append(where);
       // Click to expand: tables, sizes and how long the backup took. Loaded
       // once per row, on first open.
       const detail = el("div", { class: "bk-detail" });
@@ -5415,7 +5487,10 @@ function backupRestoreCard(cur, b, restoreSt) {
   // shared store the endpoint refuses (the fold would mix servers).
   if (!cur.baseline_dir) return null;
   if (!b || b.error || !b.configured || b.kind !== "dir") return null;
-  if (!(b.snapshots || []).length) return null;
+  // The LOCAL ones: the card is already gated on the server having its own
+  // baseline_dir, so that is the directory executeRestore will read.
+  const usable = backupSnapshotsFor(b, "dir");
+  if (!usable.length) return null;
   const rst = restoreSt && restoreSt.restore;
   if (rst && rst.state === "running") return null; // the run region owns it
   const details = el("details", { class: "form-advanced bk-restore" },
@@ -5425,12 +5500,14 @@ function backupRestoreCard(cur, b, restoreSt) {
     "Pick a past moment. The console rebuilds every table as it was then, from your backups plus the recorded changes, and saves the result as a new backup in the list below. Your database is not touched." }));
   const input = el("input", { class: "in", type: "text", spellcheck: "false",
     placeholder: "YYYY-MM-DD HH:MM:SS (UTC)" });
-  input.value = (b.snapshots[0] && b.snapshots[0].time) || "";
+  input.value = (usable[0] && usable[0].time) || "";
   const go = el("button", { class: "btn", type: "button", text: "Restore" });
   const msg = el("p", { class: "form-msg err" });
   msg.hidden = true;
   go.onclick = () => startBackupRestore(cur.id, input.value.trim(), go, msg);
   body.append(el("div", { class: "bk-restore-row" }, input, go), msg);
+  const elsewhere = backupElsewhereNote(b, usable);
+  if (elsewhere) body.append(elsewhere);
   if (rst && rst.state === "failed") {
     body.append(el("p", { class: "form-msg err", text:
       "Last restore published nothing: " + backupFoldError(rst.last_error || "unknown error") + " Nothing was overwritten." }));
@@ -5474,10 +5551,48 @@ async function startBackupRestore(id, at, btn, msgEl) {
 // both mean the same thing to the operator: the file is gone, build again.
 // S3-backed backups qualify too (the fold engine reads them directly), which
 // is why this card has no b.kind === "dir" gate.
+// backupSnapshotsFor narrows the listing to the snapshots a JOB can actually
+// fold from (#1542).
+//
+// The Backups list now merges every location, but the restore and .sql-export
+// jobs still read ONE: executeRestore calls SnapshotTablesAt(req.BaselineDir),
+// and the export picks the local directory whenever the server has one. So a
+// card prefilled with the newest row can now name a snapshot that exists only
+// in the bucket, and the job would refuse it while the page above says it is
+// right there. Listing more must not mean offering more than the job can do.
+//
+// The full answer is folding from S3 (#1541); until then the cards offer what
+// works and say what they left out.
+function backupSnapshotsFor(b, kind) {
+  return ((b && b.snapshots) || []).filter((s) => !s.kinds || !s.kinds.length || s.kinds.includes(kind));
+}
+
+// backupElsewhereNote names the snapshots a card had to skip, so a shorter
+// dropdown than the list above it is explained rather than merely odd.
+function backupElsewhereNote(b, usable) {
+  const all = ((b && b.snapshots) || []).length;
+  if (!all || usable.length >= all) return null;
+  const n = all - usable.length;
+  return el("p", { class: "form-hint", text:
+    n + " backup" + (n === 1 ? " is" : "s are") + " kept only in S3. This builds from the local folder, so it cannot start from " +
+    (n === 1 ? "that one" : "those") + " yet." });
+}
+
 function backupSQLExportCard(cur, b, sqlSt) {
   if (!capsCache.sql_export || !cur || !cur.id || cur.kind !== "registry") return null;
   if (!b || b.error || !b.configured) return null;
-  if (!(b.snapshots || []).length) return null;
+  // b.kind, NOT cur.baseline_dir. cur is the RAW registry entry; the export
+  // resolves through withBaselineDefaults (#1010), so an entry that inherits
+  // the daemon-wide backup location has an empty baseline_dir and still builds
+  // from a directory. b.kind comes off the bundle, which applies the same
+  // defaulting and the same dir-over-S3 preference the export does, so it is
+  // exactly "the build will read a directory".
+  //
+  // Borrowing the restore card's gate was the mistake: cur.baseline_dir is
+  // right THERE, because the restore endpoint refuses the shared daemon store
+  // on purpose (the fold would mix servers). This one accepts it, and says so.
+  const usable = backupSnapshotsFor(b, b.kind === "dir" ? "dir" : "s3");
+  if (!usable.length) return null;
   const st = sqlSt && sqlSt.sql_export;
   if (st && st.state === "running") return null; // the run region owns it
   const details = el("details", { class: "form-advanced bk-restore" },
@@ -5487,12 +5602,16 @@ function backupSQLExportCard(cur, b, sqlSt) {
     "Pick a past moment. The console takes the backup from just before it, replays the recorded changes up to it, and packages the result as plain SQL files (mydumper format), ready for myloader. Restoring needs nothing from dbtrail. Your database is not touched." }));
   const input = el("input", { class: "in", type: "text", spellcheck: "false",
     placeholder: "YYYY-MM-DD HH:MM:SS (UTC)" });
-  input.value = (b.snapshots[0] && b.snapshots[0].time) || "";
+  input.value = (usable[0] && usable[0].time) || "";
   const go = el("button", { class: "btn", type: "button", text: "Build" });
   const msg = el("p", { class: "form-msg err" });
   msg.hidden = true;
   go.onclick = () => startSQLExport(cur.id, input.value.trim(), go, msg);
   body.append(el("div", { class: "bk-restore-row" }, input, go), msg);
+  if (b.kind === "dir") {
+    const elsewhere = backupElsewhereNote(b, usable);
+    if (elsewhere) body.append(elsewhere);
+  }
   if (st && st.state === "failed") {
     body.append(el("p", { class: "form-msg err", text:
       "Last build failed: " + backupFoldError(st.last_error || "unknown error") + " Nothing was built." }));
