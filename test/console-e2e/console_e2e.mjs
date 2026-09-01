@@ -3949,6 +3949,144 @@ try {
     ? ok("tropical: config cards rotate through the home's tint palette")
     : bad("tropical: config cards rotate through the home's tint palette", JSON.stringify(tints));
 
+  // ── Scenario 17g2 — a .cards row leaves no empty track ──
+  // The grid was repeat(3, 1fr), which is right only for the pages that carry
+  // three cards. After the #1543 split Retention and Backups carry one and
+  // This daemon two, so a third of the row was card and the rest was nothing.
+  //
+  // Measured on the RENDERED boxes, not on the rule: a stylesheet that reads
+  // auto-fit still leaves a hole when its min track is wider than the space a
+  // lone card can stretch into, and only the geometry can tell those apart.
+  // The property is the one a reader sees: the cards on the first row, plus
+  // the gaps between them, add up to the grid they sit in.
+  //
+  // Retention runs FIRST and daemon LAST, because Scenario 17h below picks up
+  // "still on /daemon".
+  const rowFill = [];
+  for (const route of ["retention", "daemon"]) {
+    await page.evaluate((r) => navigate(r), route);
+    await page.waitForFunction(() => document.querySelectorAll(".cards .card").length >= 1, { timeout: 10000 });
+    rowFill.push(await page.evaluate((r) => {
+      const g = document.querySelector(".cards");
+      const gw = g.getBoundingClientRect().width;
+      const boxes = Array.from(g.children).map((c) => c.getBoundingClientRect());
+      const top = Math.min(...boxes.map((b) => Math.round(b.top)));
+      const row = boxes.filter((b) => Math.round(b.top) === top);
+      const gap = parseFloat(getComputedStyle(g).columnGap) || 0;
+      const used = row.reduce((s, b) => s + b.width, 0) + gap * (row.length - 1);
+      return { route: r, cards: row.length, left: Math.round(gw - used) };
+    }, route));
+  }
+  // 2px of slack for sub-pixel track rounding; the failure this catches is a
+  // whole empty track (361px on a 1084px grid), not a rounding remainder.
+  // Scoped to what auto-fit actually promises. It collapses a track only when
+  // the track is empty across the whole grid, so a page with MORE cards than
+  // tracks still ends on a ragged last row exactly as before. These two routes
+  // are the ones the #1543 split left under-filled, at one card and two.
+  rowFill.every((r) => r.cards >= 1 && r.left <= 2)
+    ? ok("layout: a page with fewer cards than tracks still fills its row")
+    : bad("layout: a page with fewer cards than tracks still fills its row", JSON.stringify(rowFill));
+
+  // The other half, and the one auto-fit does NOT give for free: between the
+  // 880px breakpoint and the width where three tracks fit again, a three-card
+  // page wraps to two columns and its third card is alone on the last row.
+  // Without the span rule that leaves 287 to 387px of nothing beside it, which
+  // is the same hole moved to a laptop width. Measured on the LAST row, at a
+  // width inside the band, on the page that carries three cards.
+  //
+  // The suite's viewport is restored before moving on: every scenario after
+  // this one assumes 1300.
+  await page.setViewportSize({ width: 1000, height: 1000 });
+  await page.evaluate(() => navigate("connect"));
+  await page.waitForFunction(() => location.pathname === "/connect"
+    && document.querySelectorAll(".cards .card").length >= 3, { timeout: 10000 });
+  const bandRow = await page.evaluate(() => {
+    const g = document.querySelector(".cards");
+    const gw = g.getBoundingClientRect().width;
+    const boxes = Array.from(g.children).map((c) => c.getBoundingClientRect());
+    const tops = [...new Set(boxes.map((b) => Math.round(b.top)))].sort((a, z) => a - z);
+    const last = boxes.filter((b) => Math.round(b.top) === tops[tops.length - 1]);
+    const gap = parseFloat(getComputedStyle(g).columnGap) || 0;
+    const used = last.reduce((s, b) => s + b.width, 0) + gap * (last.length - 1);
+    return { cards: boxes.length, rows: tops.length, onLast: last.length, left: Math.round(gw - used) };
+  });
+  await page.setViewportSize({ width: 1300, height: 1000 });
+  // Back to /daemon, and WAIT for it: Scenario 17h below picks up "still on
+  // /daemon" and looks for a card by title there. Leaving the page on /connect
+  // failed it with {"found":false}, which reads as a telemetry bug and is not
+  // one.
+  await page.evaluate(() => navigate("daemon"));
+  await page.waitForFunction(() => location.pathname === "/daemon"
+    && document.querySelectorAll(".cards .card").length >= 2, { timeout: 10000 });
+  // rows > 1 asserts the band is actually the wrapped case, so a future width
+  // change that stops wrapping here cannot pass this vacuously.
+  (bandRow.rows > 1 && bandRow.left <= 2)
+    ? ok("layout: a card left alone on the last row spans it")
+    : bad("layout: a card left alone on the last row spans it", JSON.stringify(bandRow));
+
+  // ── Scenario 17g3 — the disk-space card, every state it can be in ──
+  // Calls the REAL backupRefreshCard with each of the 16 DTOs the daemon can
+  // serve and reads the rendered element. A Go guard over the source can only
+  // see that both `br.enabled` and `br.scheduled` appear somewhere in the
+  // function, so inverting either condition survives it while the card tells
+  // the operator the opposite of the truth. Rendering is the only view that
+  // separates those.
+  //
+  // It also pins the sentence about WHERE the saving applies, which the Go
+  // guard deliberately leaves alone: that one asserts the claim is tied to the
+  // rule in reconstruct, not what the claim says. Keyed to the PRODUCER, since
+  // only the per-server schedule passes BaselineS3 to the fold; the interval
+  // loop and every restore read the local directory and do reuse files.
+  const cardStates = await page.evaluate(() => {
+    const rows = [];
+    for (const on of [false, true]) {
+      for (const enabled of [false, true]) {
+        for (const scheduled of [false, true]) {
+          for (const source of ["default", "override"]) {
+            const el = backupRefreshCard({ carry_forward_unchanged: on, enabled, scheduled, source });
+            const t = el.innerText || el.textContent || "";
+            rows.push({
+              on, enabled, scheduled, source,
+              pill: (el.querySelector(".bkr-state") || {}).textContent || "",
+              dormant: t.includes("Nothing uses this yet"),
+              middle: t.includes("Nothing refreshes all servers on one timer"),
+              chose: t.includes("You chose this here"),
+              saving: t.includes("only when the last backup is read from this machine"),
+              // A WORD test, not the literal "(live". The old shape put the
+              // word in parentheses, so a check for that string passes on a pill
+              // reading "On, running now" beside "Nothing uses this yet", which
+              // is the contradiction this exists to catch. The card says "the
+              // next time dbtrail runs", so \brunning\b does not match it.
+              live: /\b(live|running)\b/i.test(t),
+              buttons: Array.from(el.querySelectorAll("button")).map((b) => b.textContent),
+            });
+          }
+        }
+      }
+    }
+    return rows;
+  });
+  const cardBad = cardStates.filter((r) =>
+    // the value is on screen, and it is the value
+    r.pill !== (r.on ? "On" : "Off")
+    // dormant is said when nothing consumes the setting, and only then
+    || r.dormant !== !r.enabled
+    // the middle state is the --baseline-trigger daemon: live for restores,
+    // nothing on a timer. Collapsing it into either neighbour is the misreport
+    // the card exists to avoid.
+    || r.middle !== (r.enabled && !r.scheduled)
+    // provenance answers who chose, never whether it runs
+    || r.chose !== (r.source === "override")
+    || r.live
+    // the saving never appears without the condition it actually has
+    || !r.saving
+    // the hand-it-back button appears only where there is something to hand back
+    || (r.buttons.length === 2) !== (r.source === "override"));
+  cardStates.length === 16 && cardBad.length === 0
+    ? ok("backups: the disk-space card reports every state it can be in")
+    : bad("backups: the disk-space card reports every state it can be in",
+        JSON.stringify({ n: cardStates.length, wrong: cardBad.slice(0, 4) }));
+
   // ── Scenario 17h — the telemetry card shows the exact sample event (#1447) ──
   // Still on /daemon. The "Show a sample event" fold must be closed by
   // default, open on click, and carry the daemon's `sample_event` string

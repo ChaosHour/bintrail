@@ -971,7 +971,41 @@ button { font-family: inherit; }
 /* ============================================================
    status cards
    ============================================================ */
-.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+/* auto-fit, not a fixed 3, because the pages that use this grid no longer all
+   carry three cards: the #1543 split left Retention and Backups with exactly
+   one, so a third of the row was card and two thirds were nothing, and This
+   daemon carries two when its staging card does not render. auto-fit (never auto-fill) is what closes that: empty tracks
+   collapse, so a lone card takes the whole row instead of a third of it.
+
+   The 260px floor is measured, not chosen. The content column caps at 1084px,
+   where three cards are 349px each, and the existing 880px breakpoint below
+   already forces a single column. Between those, three fixed columns squeezed
+   each card to 207px at a 1000px viewport and 167px at 881px. 260 keeps three
+   across at every width where they were readable (1084 and 936 grids are
+   unchanged, three cards at 349 and 300) and wraps only below that, where the
+   fixed grid was producing cards too narrow to read.
+
+   Card tints rotate on :nth-child (see the four rules further down), which is
+   DOM order, so wrapping cannot change which card gets which colour. */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; }
+/* auto-fit fills a row only while there are FEWER cards than tracks. A page
+   with more of them still ends on a partial row, so between the 880px
+   breakpoint and the width where three tracks fit again, a three-card page
+   wrapped to two columns and left its third card alone beside 287 to 387px of
+   nothing. That is the same hole this rule was written to close, moved to a
+   laptop width instead of removed.
+
+   The band is arithmetic, not a guess: the shell is 248px and .view adds 48px
+   of padding a side, so grid = viewport - 344; three 260px tracks plus two
+   18px gaps need 816, hence three columns from 1160px up. Below 881px the
+   media query further down forces a single column.
+
+   :last-child:nth-child(odd) is "last, and at an odd position". At two columns
+   an odd position always starts a row, so the card is alone on it: true for
+   the third of three and the fifth of five, false for the second of two. */
+@media (min-width: 881px) and (max-width: 1159px) {
+  .cards > .card:last-child:nth-child(odd) { grid-column: 1 / -1; }
+}
 .card {
   background: var(--panel-bg);
   border: 1px solid var(--panel-border);
@@ -2647,6 +2681,30 @@ button { font-family: inherit; }
 /* Step cards hug their content: card 3 carries the drawn dialog and is much
    taller, and stretching 1 and 2 to match reads as two-thirds empty page. */
 .cards .cn-card { align-self: start; }
+/* the disk-space card carries its state in the title row rather than a kv row
+   (see backupRefreshCard): one value does not make a table, and the kv shape
+   is what forced the two labels its own reader could not read.
+
+   The pill goes white rather than --surface-3, which measures 1.09 against
+   these tints and is under the 1.15 separation floor. White is not much
+   better: measured on the rendered card, which is always the pink tint
+   because this grid holds one card and the tints rotate on :nth-child, white
+   lands at exactly 1.15. So it also takes the hairline the inset code chip
+   takes a few rules up, for the same reason: an edge that does not depend on
+   the fill winning. Text on the pill measures 16.01 and body text on the card
+   6.37, both clear of the 4.5 body floor.
+
+   Those two were first written as 6.75 and 5.80, from a probe that read
+   getComputedStyle().color and parsed it as sRGB. Chrome returns these as the
+   authored oklch(), so the three oklch components were being read as three
+   sRGB channels. Resolve a colour through a canvas fillStyle before comparing
+   it; the 1.15 survived only because both sides of THAT one come back as
+   rgb(). */
+.bkr-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.bkr-state {
+  background: var(--surface); color: var(--ink);
+  border: 1px solid oklch(0.5 0.05 320 / 0.16);
+}
 .cn-num {
   display: inline-flex; align-items: center; justify-content: center;
   width: 28px; height: 28px; border-radius: 50%; flex: none;
