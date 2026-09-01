@@ -17,6 +17,7 @@ package views
 import (
 	"fmt"
 	"net"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -65,11 +66,15 @@ type BaselineTable struct {
 	Table  string
 	Path   string // local path or s3:// URL of the table's .parquet file
 	// Rel is Path relative to its snapshot directory ("schema/table.parquet"),
-	// set by the producer only under FollowNewest. The following there is a SQL
-	// shape rather than a path, and it needs the tail on its own to rebuild the
-	// file name against whichever snapshot the query picks. Deriving it back
-	// out of Path in the generator would be a second opinion about the layout;
-	// the producer already split it once to decide it could follow at all.
+	// set by the producer under BOTH following modes. FollowNewest needs it to
+	// build its view bodies at all: the following there is a SQL shape rather
+	// than a path, so it rebuilds the file name against whichever snapshot the
+	// query picks. FollowPointer's bodies do not need it, but the preflight
+	// (#1558) does, and it asks the same question of both files, so deriving
+	// the tail one way here and another way there is how the two renders would
+	// come to disagree about the layout. Deriving it back out of Path in the
+	// generator would be a second opinion for the same reason: the producer
+	// already split it once to decide it could follow at all.
 	Rel string
 
 	// Decimals are the table's DECIMAL and NUMERIC columns, which the baseline
@@ -538,6 +543,14 @@ func writeHeader(b *strings.Builder, in Input) {
 		orUnknown(in.Version), in.GeneratedAt.UTC().Format(time.RFC3339))
 	b.WriteString("--\n")
 	b.WriteString("-- THIS FILE IS A SNAPSHOT OF THE LAYOUT, NOT A LIVE BINDING. ")
+	// checksSnapshot, not Follow.follows(), for the sentence below that names
+	// the dropped-table check. The two are the same today for every render a
+	// producer makes, and they come apart for a filtered one: writeStateViews
+	// returns before the preflight when OnlyViews selected no state view, so a
+	// file could promise a check it does not contain. Deriving the promise from
+	// the same plan the writer uses is what keeps them coextensive rather than
+	// merely equal today.
+	checks := in.checksSnapshot()
 	if in.Follow.follows() {
 		// The state views follow too, so the sentence above is now only about
 		// SHAPE. Say which shape, concretely: a reader who knows a new table
@@ -566,9 +579,17 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("-- changes type, and whenever archive sources are added or removed.\n")
 		b.WriteString("--\n")
 		b.WriteString("-- Which of those you will notice follows one rule: this file names only the\n")
-		b.WriteString("-- PATHS and the DECIMAL columns, so only those two can fail. A table that\n")
-		b.WriteString("-- leaves the newest snapshot stops resolving and reading this file fails,\n")
-		b.WriteString("-- naming the path; a DECIMAL column renamed or dropped fails the script.\n")
+		b.WriteString("-- PATHS and the DECIMAL columns, so only those two can fail. ")
+		if checks {
+			b.WriteString("A table that\n")
+			b.WriteString("-- leaves the newest snapshot is caught by the check below, which names the\n")
+			b.WriteString("-- table and stops before any view is created; a DECIMAL column renamed or\n")
+			b.WriteString("-- dropped fails the script at its own view.\n")
+		} else {
+			b.WriteString("A table that\n")
+			b.WriteString("-- leaves the newest snapshot stops resolving, and the read fails at its own\n")
+			b.WriteString("-- view; so does a DECIMAL column renamed or dropped.\n")
+		}
 		b.WriteString("-- Everything else is QUIET, because `SELECT *` passes it through untouched:\n")
 		b.WriteString("-- a table added to the source has no view here, a DECIMAL whose scale grew is\n")
 		b.WriteString("-- read at the old scale with the extra digits rounded away, a column that\n")
@@ -1441,13 +1462,7 @@ func stateViewPlan(in Input) []statePlan {
 // writeStateViews emits one view per table in the newest baseline snapshot, and
 // returns whether it emitted any.
 func writeStateViews(b *strings.Builder, in Input) bool {
-	plan := stateViewPlan(in)
-	wanted := make([]statePlan, 0, len(plan))
-	for _, p := range plan {
-		if in.OnlyViews.wants(p.name) {
-			wanted = append(wanted, p)
-		}
-	}
+	wanted := selectedStatePlans(in)
 	// A filtered render that selected no state view emits NOTHING, comments
 	// included, for the reason GenerateViews states: its caller executes this.
 	if in.OnlyViews != nil && len(wanted) == 0 {
@@ -1493,6 +1508,7 @@ func writeStateViews(b *strings.Builder, in Input) bool {
 	if in.Follow == FollowNewest {
 		writeNewestSnapshotVar(b, in)
 	}
+	writeSnapshotPreflight(b, in, wanted)
 
 	for _, p := range wanted {
 		t, name := p.table, p.name
@@ -1531,6 +1547,14 @@ func writeStateViews(b *strings.Builder, in Input) bool {
 // to disagree about.
 const newestVar = "bintrail_newest_snapshot"
 
+// missingVar and checkVar carry the preflight below. Two variables rather than
+// one expression so the message can NAME the tables it found, and so a clean
+// file prints nothing at all.
+const (
+	missingVar = "bintrail_missing_tables"
+	checkVar   = "bintrail_tables_checked"
+)
+
 // writeNewestSnapshotVar emits the lookup that picks the snapshot, for a root
 // with no `current` pointer to rewrite (#1550).
 //
@@ -1552,6 +1576,200 @@ func writeNewestSnapshotVar(b *strings.Builder, in Input) {
 			baseline.SuccessMarker+" marker). Take or refresh a baseline, then read this file again."))
 	fmt.Fprintf(b, "    ELSE max(regexp_replace(file, %s, '')) END\n", sqlString(baseline.SuccessMarker+"$"))
 	fmt.Fprintf(b, "  FROM glob(%s));\n\n", sqlString(root+"/*/"+baseline.SuccessMarker))
+}
+
+// selectedStatePlans is the state views this render will actually emit: the
+// full plan, narrowed by OnlyViews.
+//
+// One function because two callers ask the same question — the writer, to emit
+// them, and checksSnapshot, to decide whether the header may promise the
+// dropped-table check. Narrowing the plan in one and re-deriving it in the
+// other is how a file would come to advertise a guarantee it does not carry,
+// which is the failure this whole PR is about.
+func selectedStatePlans(in Input) []statePlan {
+	plan := stateViewPlan(in)
+	out := make([]statePlan, 0, len(plan))
+	for _, p := range plan {
+		if in.OnlyViews.wants(p.name) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// checksSnapshot reports whether this render will emit the dropped-table check.
+//
+// It answers by running the writer's own conditions, not by restating them: the
+// header's promise and the check's presence have to agree, and two lists of
+// conditions maintained apart is how they would stop agreeing.
+func (in Input) checksSnapshot() bool {
+	if !in.Follow.follows() {
+		return false
+	}
+	wanted := selectedStatePlans(in)
+	if len(wanted) == 0 {
+		return false
+	}
+	if _, _, ok := snapshotDirExpr(in); !ok {
+		return false
+	}
+	for _, p := range wanted {
+		if p.table.Rel == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// writeSnapshotPreflight emits one check, ahead of every state view, that the
+// tables this file names are still in the snapshot it will read (#1558).
+//
+// It exists because the alternative is the worst failure this file has. DuckDB
+// binds a view when it is CREATED, so a table DROPped at the source takes the
+// whole script down at its own statement: the views emitted before it exist, the
+// ones after it never do, and against a persistent database what remains is a
+// silently partial schema whose size depends on emission order. The error names
+// a Parquet path, which reads as a corrupt snapshot rather than as a table
+// somebody dropped on purpose.
+//
+// DuckDB has no tolerant read to lean on: union_by_name, filename and a
+// zero-match glob all raise the same way, so "define the other views anyway" is
+// not on the table. The choice is between failing confusingly and partially, and
+// failing legibly and first. This is the second.
+//
+// Only for a file that FOLLOWS. A pinned file names a snapshot that already held
+// every one of these tables when it was written, so the check would be asking
+// whether someone deleted files by hand.
+func writeSnapshotPreflight(b *strings.Builder, in Input, wanted []statePlan) {
+	dir, globDir, ok := snapshotDirExpr(in)
+	if !ok || len(wanted) == 0 {
+		return
+	}
+	rels := make([]string, 0, len(wanted))
+	for _, p := range wanted {
+		if p.table.Rel == "" {
+			// A producer that did not fill Rel cannot be described, and a
+			// preflight over SOME of the tables would pass while the file still
+			// broke on one it never checked.
+			return
+		}
+		rels = append(rels, p.table.Rel)
+	}
+
+	b.WriteString("-- Every table below has to still be in that snapshot. A table dropped at the\n")
+	b.WriteString("-- source leaves it, and DuckDB binds a view when it is created, so without\n")
+	b.WriteString("-- this the script would stop at that one view and never define the rest.\n")
+	b.WriteString("SET VARIABLE " + missingVar + " = (\n")
+	b.WriteString("  SELECT string_agg(t, ', ' ORDER BY t) FROM (VALUES\n")
+	for i, rel := range rels {
+		sep := ","
+		if i == len(rels)-1 {
+			sep = ""
+		}
+		fmt.Fprintf(b, "    (%s)%s\n", sqlString(rel), sep)
+	}
+	b.WriteString("  ) AS x(t)\n")
+	// `**` and not `*/`, even though every Rel in this layout is exactly
+	// schema/table.parquet. The two would agree today and the recursion costs
+	// nothing at this depth, but snapshotRel returns EVERYTHING after the
+	// snapshot directory, so a layout that ever nested one level deeper would
+	// leave the glob listing less than the list it is compared against. That
+	// does not lose the check, it inverts it: every table looks missing and a
+	// perfectly healthy file is refused before it creates anything, which is
+	// the worst outcome this code has. `**` is a superset at every depth
+	// (verified: it matches one, two and three levels), so it cannot.
+	fmt.Fprintf(b, "  WHERE %s || t NOT IN (SELECT file FROM glob(%s || '**/*.parquet')));\n", dir, globDir)
+	// Raised through a SET rather than a bare SELECT so a clean file prints
+	// nothing. A SELECT here puts a one-row NULL table in front of every reader
+	// who has nothing wrong.
+	//
+	// The condition is on missingVar and NOT inside error()'s argument, because
+	// error() is a scalar function and PROPAGATES NULL: error('x ' || NULL)
+	// returns NULL instead of raising, so a guard assembled by concatenation
+	// disarms itself the moment any piece of it is NULL. That also decides what
+	// happens under FollowNewest when nothing is marked and the directory is
+	// NULL: the whole check evaluates to NULL and raises nothing. It fails OPEN
+	// there on purpose, because the emitter above has already raised its own
+	// refusal naming the root, and a second message about missing tables would
+	// only describe the same absent snapshot in worse words.
+	fmt.Fprintf(b, "SET VARIABLE %s = (SELECT CASE WHEN getvariable('%s') IS NOT NULL\n", checkVar, missingVar)
+	fmt.Fprintf(b, "  THEN error(%s || getvariable('%s') ||\n",
+		sqlString("bintrail views: these tables are not in the newest snapshot any more: "), missingVar)
+	// Naming where it looked is what DuckDB's own "No files found" gave the
+	// reader before this check existed, and it is the half that says whether the
+	// table moved or the whole snapshot is the wrong one. Under FollowNewest the
+	// file cannot know the directory until the query runs, so it has to come
+	// from the variable rather than from a literal here.
+	fmt.Fprintf(b, "    %s || %s ||\n", sqlString(". Looked in "), dir)
+	fmt.Fprintf(b, "    %s) END);\n\n",
+		sqlString(". If they were dropped or renamed, download this file again."))
+}
+
+// snapshotDirExpr returns TWO SQL expressions for the snapshot directory the
+// state views read, both with a trailing separator, or ok=false for a file that
+// does not follow one.
+//
+// They differ, and the difference is load-bearing. The first is compared
+// against glob's OUTPUT, so it must be the LITERAL path. The second is
+// concatenated into glob's PATTERN, where `[`, `*` and `?` are syntax.
+//
+// One of those is a real failure and the rest are hygiene, which is worth
+// stating so nobody credits this with a guard it does not have. A `[` in the
+// root makes the listing return NOTHING, so every table grades missing and a
+// healthy file is refused before it creates anything — the worst outcome this
+// code has. A `*` or `?` makes it match SIBLING directories, which cannot
+// produce a wrong verdict: the comparison side is the literal, and an
+// over-matched sibling is spelled with its own directory name, so it never
+// equals the literal and the real file is still matched. They are escaped
+// anyway because a pattern that means something other than its own path is a
+// trap waiting for the next reader, not because a bug is behind them.
+//
+// DuckDB does not honour a backslash escape here; a single-character class does,
+// which is what globLiteral builds. FollowNewest needs no escaping: its value is
+// itself a glob RESULT, so a root that glob cannot express never reaches it —
+// writeNewestSnapshotVar's own glob raises first, naming the root.
+func snapshotDirExpr(in Input) (dir, globDir string, ok bool) {
+	switch in.Follow {
+	case FollowNewest:
+		v := "getvariable('" + newestVar + "')"
+		return v, v, true
+	case FollowPointer:
+		// filepath.Join, not a hand-built string off the raw BaselineSource.
+		// Join CLEANS, which is what the paths in the view bodies were built
+		// with, and trimming one trailing slash off the flag as typed does not:
+		// a root ending "//" produced ".../001//current/" here while the bodies
+		// read ".../001/current/...", so every table compared unequal and a
+		// perfectly healthy file was refused. Same class as the Rel divergence
+		// this file's preflight exists behind — one derivation, not two.
+		lit := filepath.ToSlash(filepath.Join(in.BaselineSource, baseline.CurrentLinkName)) + "/"
+		return sqlString(lit), sqlString(globLiteral(lit)), true
+	}
+	return "", "", false
+}
+
+// globLiteral makes s match itself under DuckDB's glob, by wrapping every
+// pattern metacharacter in a single-character class.
+//
+// Verified against DuckDB rather than assumed: a backslash does NOT escape
+// (`meta\[1\]` matches nothing), a class DOES (`meta[[]1]` matches), `[` alone
+// under-matches to zero, and `*` and `?` over-match to siblings. `{` is wrapped
+// too: alone it is inert, but a second one turns the pair into brace expansion.
+//
+// Built in ONE pass. Escaping `[` first and then the others would re-process the
+// brackets this function just introduced.
+func globLiteral(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '[', '*', '?', '{':
+			b.WriteByte('[')
+			b.WriteRune(r)
+			b.WriteByte(']')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // writeNewestStateBody emits one state view's body under FollowNewest: a read of

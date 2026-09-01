@@ -91,9 +91,11 @@ var stagingSeq atomic.Uint64
 // What it deliberately does NOT check is that the new snapshot carries every
 // table the current one does. The pointer names the newest COMPLETE snapshot,
 // whatever tables that snapshot holds, and a followed views file can therefore
-// lose a view when the table set shrinks: the view keeps naming
-// <root>/current/<schema>/<table>.parquet, which stops resolving, and DuckDB
-// says so by path.
+// lose a view when the table set shrinks: the file keeps naming
+// <root>/current/<schema>/<table>.parquet, which stops resolving. The generated
+// file checks for exactly that up front and refuses by TABLE NAME before it
+// creates anything (#1558), rather than letting the read break at whichever
+// view happens to be the one that moved.
 //
 // That is the chosen failure, not an oversight. A superset rule would freeze
 // the pointer FOREVER the first time a table is legitimately dropped, since no
@@ -323,7 +325,15 @@ func ResolveCurrentPointer(root string) (string, bool) {
 // local directory at all: an s3:// baseline destination reaches this function
 // verbatim from the console, and filepath.Rel succeeds on one, so the URL check
 // below is what refuses it rather than any caller filtering first.
-func RewriteToPointer(root string, paths []string) ([]string, bool) {
+// It also returns each path's tail below its snapshot directory
+// ("<schema>/<table>.parquet", forward-slashed), because splitSnapshotPath
+// already computes it to decide the rewrite at all. Handing it back is what
+// keeps a caller from deriving the same tail a SECOND way: this function
+// resolves the root with filepath.Rel, which CLEANS both sides, and a caller
+// cutting a raw byte prefix instead disagrees the moment the root is spelled
+// "./baselines", "/data/bl//" or "/data/./bl" (#1558). The two answers being
+// derived once is the point; returning them separately is the mechanism.
+func RewriteToPointer(root string, paths []string) ([]string, []string, bool) {
 	// An empty root is the --baseline-s3 shape on the CLI side. Refused rather
 	// than passed through: ResolveCurrentPointer would probe a bare "current"
 	// against the PROCESS working directory, which is the same class of mistake
@@ -336,22 +346,24 @@ func RewriteToPointer(root string, paths []string) ([]string, bool) {
 	// removes the probe; leaving it to Lstat makes the outcome depend on what
 	// happens to sit next to the daemon's CWD.
 	if root == "" || strings.Contains(root, "://") || len(paths) == 0 {
-		return nil, false
+		return nil, nil, false
 	}
 	pointer, ok := ResolveCurrentPointer(root)
 	if !ok {
-		return nil, false
+		return nil, nil, false
 	}
 	current := filepath.Join(root, CurrentLinkName)
 	out := make([]string, len(paths))
+	rels := make([]string, len(paths))
 	for i, path := range paths {
 		snapshot, rest := splitSnapshotPath(root, path)
 		if snapshot != pointer {
-			return nil, false
+			return nil, nil, false
 		}
 		out[i] = filepath.Join(current, rest)
+		rels[i] = filepath.ToSlash(rest)
 	}
-	return out, true
+	return out, rels, true
 }
 
 // splitSnapshotPath splits a baseline table path into its snapshot directory

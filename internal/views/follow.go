@@ -22,13 +22,42 @@ func ApplyFollow(in *Input, root string, pin bool) {
 	if pin || len(in.Baselines) == 0 {
 		return
 	}
+	// A backslash in the root is not followable, and it is measured rather than
+	// assumed: DuckDB's glob treats `\` as a path SEPARATOR, not an escape, so
+	// a pattern under `/data/back\up/baselines` is globbed as
+	// `/data/back/up/baselines` and matches nothing. read_parquet reads the same
+	// literal path perfectly well, which is why the view bodies would work while
+	// the dropped-table check refused every table of a healthy snapshot — the
+	// worst outcome this file has.
+	//
+	// There is no escape to reach for: as-is, doubled, and a single-character
+	// class were all tried against the pinned engine and all match nothing. So
+	// the honest answer is not to follow. The file is pinned, its header says
+	// so, and no check is promised that is not there.
+	//
+	// On Linux, where this ships, a backslash is an ordinary legal filename
+	// character. On Windows it is the separator, so following would be broken
+	// for every root; refusing is right in both.
+	if strings.Contains(root, `\`) {
+		return
+	}
 	paths := make([]string, len(in.Baselines))
 	for i, t := range in.Baselines {
 		paths[i] = t.Path
 	}
-	if rewritten, ok := baseline.RewriteToPointer(root, paths); ok {
+	if rewritten, rels, ok := baseline.RewriteToPointer(root, paths); ok {
+		// Rel comes back from the rewrite rather than being cut off the paths a
+		// second time. This branch used to set Follow UNCONDITIONALLY while
+		// setting Rel only when a local re-derivation happened to agree, and the
+		// two disagreed for every root that is not already filepath.Clean-shaped
+		// ("./baselines", "/data/bl//", "/data/./bl"): RewriteToPointer resolves
+		// with filepath.Rel, which CLEANS both sides, and the local helper cut a
+		// raw byte prefix. The result was a file that followed, promised the
+		// dropped-table check in its own header, and carried no check at all
+		// (#1558).
 		for i := range in.Baselines {
 			in.Baselines[i].Path = rewritten[i]
+			in.Baselines[i].Rel = rels[i]
 		}
 		in.Follow = FollowPointer
 		return
@@ -41,21 +70,34 @@ func ApplyFollow(in *Input, root string, pin bool) {
 	if !isS3(root) {
 		return
 	}
-	rels := make([]string, len(in.Baselines))
-	for i, t := range in.Baselines {
-		rel, ok := snapshotRel(root, t.Path)
-		if !ok {
-			// All or nothing. A file where some state views follow and others
-			// are pinned reads exactly like one where they all do, and the two
-			// halves would drift apart at the first refresh.
-			return
-		}
-		rels[i] = rel
+	rels := snapshotRels(root, paths)
+	if rels == nil {
+		// All or nothing. A file where some state views follow and others
+		// are pinned reads exactly like one where they all do, and the two
+		// halves would drift apart at the first refresh.
+		return
 	}
 	for i := range in.Baselines {
 		in.Baselines[i].Rel = rels[i]
 	}
 	in.Follow = FollowNewest
+}
+
+// snapshotRels cuts every path down to its position inside a snapshot
+// directory, or returns nil if any one of them will not cut.
+//
+// All or nothing on purpose: the callers use these to describe the whole file,
+// and a half-filled slice would describe half of it while looking complete.
+func snapshotRels(root string, paths []string) []string {
+	out := make([]string, len(paths))
+	for i, path := range paths {
+		rel, ok := snapshotRel(root, path)
+		if !ok {
+			return nil
+		}
+		out[i] = rel
+	}
+	return out
 }
 
 // snapshotRel cuts a table's path down to its position inside a snapshot
