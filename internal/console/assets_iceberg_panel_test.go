@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -357,4 +358,299 @@ func TestCIRequiresNodeForTheRenderedCommand(t *testing.T) {
 		t.Errorf("no step running the unit suite in %s sets %s, so the rendered-command test can skip in CI "+
 			"and leave icebergExportCommand with no executing coverage", path, requireNodeEnv)
 	}
+}
+
+// TestIcebergLegendMatchesTheCommandItLabels pins the drawing to its source.
+//
+// The legend under the command is FILTERED by what the command holds
+// (`cmd.includes(k)`), which is right — the password blank is absent for an
+// index that needs none — and which fails OPEN in exactly one way: change the
+// placeholder in icebergExportCommand and every label quietly stops rendering.
+// Nothing on screen looks broken, the panel just goes back to printing an
+// unexplained line, and no assertion in this file would notice.
+//
+// So the guard is not "the keys are consistent with themselves" but "a command
+// that should show BOTH of them does". This is the claudeAskMock discipline:
+// a drawing can be wrong in a way prose cannot, so it is tied to the thing it
+// depicts.
+func TestIcebergLegendMatchesTheCommandItLabels(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		if os.Getenv(requireNodeEnv) != "" {
+			t.Fatalf("%s is set and node is not on PATH: the legend would go unchecked", requireNodeEnv)
+		}
+		t.Skip("node is not installed; the legend is not covered on this machine")
+	}
+	raw, err := os.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(raw)
+
+	keys := icebergPlaceholderKeys(t, js)
+	if len(keys) < 2 {
+		t.Fatalf("ICEBERG_PLACEHOLDERS holds %d key(s); the legend exists to label the "+
+			"password and the warehouse path, so this guard covers nothing", len(keys))
+	}
+
+	script := functionBody(t, js, "function shellWord(") + "\n" +
+		functionBody(t, js, "function icebergExportCommand(") + `
+console.log(icebergExportCommand(
+  {host: "db.internal", port: "3307", user: "reader", dbname: "idx", has_password: true},
+  {source: "/data/baselines", kind: "dir"}));
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legend.js")
+	if err := os.WriteFile(path, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(node, path).Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	cmd := strings.TrimSpace(string(out))
+
+	for _, k := range keys {
+		if !strings.Contains(cmd, k) {
+			t.Errorf("the legend labels %q, which the command does not contain:\n  %s\n"+
+				"the label is filtered out by cmd.includes(), so it silently stops rendering", k, cmd)
+		}
+	}
+
+	// And the legend is actually reached. Every check above passes on a panel
+	// that never calls it.
+	panel := functionBody(t, js, "function icebergExportPanel(")
+	if !strings.Contains(panel, "icebergKeys(cmd)") {
+		t.Error("the panel never builds the legend, so the command's blanks go unlabelled")
+	}
+	if !strings.Contains(panel, "icebergFlow()") || !strings.Contains(panel, "icebergRuns()") {
+		t.Error("the panel does not draw the flow and the run shapes; without them it is " +
+			"a bare command with no statement of what it produces")
+	}
+}
+
+// icebergPlaceholderKeys reads the first element of each ICEBERG_PLACEHOLDERS
+// pair straight out of app.js, so the test cannot drift from the constant by
+// carrying its own copy.
+func icebergPlaceholderKeys(t *testing.T, js string) []string {
+	t.Helper()
+	const marker = "const ICEBERG_PLACEHOLDERS = ["
+	i := strings.Index(js, marker)
+	if i < 0 {
+		t.Fatal("ICEBERG_PLACEHOLDERS is gone from app.js; the legend has no source to check")
+	}
+	block := js[i+len(marker):]
+	end := strings.Index(block, "];")
+	if end < 0 {
+		t.Fatal("ICEBERG_PLACEHOLDERS is not closed; cannot read its keys")
+	}
+	var keys []string
+	var candidates int
+	for _, line := range strings.Split(block[:end], "\n") {
+		line = strings.TrimSpace(line)
+		// Every entry of the literal opens with a bracket. Counted separately
+		// from the ones this scanner can READ, because a floor ("at least two
+		// keys survived") passes on a THIRD entry written in a shape the
+		// scanner skips — a constant reference, two entries on one line, one
+		// wrapped across two — and that third label would then be exactly the
+		// unguarded fail-open this test exists to close, one entry later.
+		if !strings.HasPrefix(line, "[") {
+			continue
+		}
+		candidates++
+		// More than one entry on a line is the shape a per-line scanner reads
+		// as ONE. Counted here rather than parsed, because the fix is to write
+		// them one per line, not to teach this more grammar.
+		if n := strings.Count(line, `["`); n > 1 {
+			candidates += n - 1
+		}
+		if !strings.HasPrefix(line, `["`) {
+			continue
+		}
+		rest := line[2:]
+		j := strings.Index(rest, `"`)
+		if j < 0 {
+			t.Fatalf("cannot read the key out of %q", line)
+		}
+		keys = append(keys, rest[:j])
+	}
+	if len(keys) != candidates {
+		t.Fatalf("ICEBERG_PLACEHOLDERS holds %d entries but this test could only read %d of them; "+
+			"the ones it skipped go unchecked, which is the silent failure it exists to prevent. "+
+			"Write every entry as [\"key\", \"label\"] on its own line, or teach this scanner the new shape.",
+			candidates, len(keys))
+	}
+	return keys
+}
+
+// TestAppendedPanelCSSPaintsNoBrandWarmth covers a range the brand guard cannot.
+//
+// The brand-COLOUR guards in assets_brandpaint_test.go read only the
+// marker-delimited #1385 block (brandSection), so a rule appended at the END of
+// style.css is structurally invisible to them. Not every test in that file is
+// so scoped — TestTransparentInkStaysBehindABackgroundClipSupportsTest reads the
+// whole file — but the ones enforcing this rule are. The
+// rule those tests enforce is stated in style.css itself: the warm palette is
+// worn across the chrome and "never encode[s] data ... pink never lands on a
+// surface that carries a row".
+//
+// The Iceberg run bars are exactly the shape that rule is about: two widths
+// standing for two magnitudes. They are painted in one neutral ink instead, and
+// this keeps them that way.
+func TestAppendedPanelCSSPaintsNoBrandWarmth(t *testing.T) {
+	raw, err := os.ReadFile("assets/style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(raw)
+	const marker = "/* Iceberg export panel (#1467)."
+	i := strings.Index(css, marker)
+	if i < 0 {
+		t.Fatal("the Iceberg panel CSS block is gone from style.css; this guard covers nothing")
+	}
+	block := css[i:]
+	if j := strings.Index(block[len(marker):], "\n/* "); j >= 0 {
+		block = block[:len(marker)+j]
+	}
+	if !strings.Contains(block, ".ice-bar-full") {
+		t.Fatal("the run bars are not in the block this guard reads")
+	}
+	// Declarations only: the block's own comments carry issue numbers, and a bare
+	// "#" scan would match those and fail on prose. Tracked as a STATE rather
+	// than per-line prefixes, because a /* */ comment's continuation lines start
+	// with ordinary words and a prefix filter keeps them — which is the failure
+	// this filter exists to avoid, one line down.
+	var decls strings.Builder
+	inComment := false
+	for _, line := range strings.Split(block, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if inComment {
+			if strings.Contains(line, "*/") {
+				inComment = false
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "//") || trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "/*") {
+			if !strings.Contains(line, "*/") {
+				inComment = true
+			}
+			continue
+		}
+		decls.WriteString(line)
+		decls.WriteString("\n")
+	}
+	body := decls.String()
+	// Two checks, because brand warmth reaches a rule two ways and a denylist of
+	// colour LITERALS only closes one of them. style.css:137 defines
+	// --brand-warm as the very pink-to-peach gradient that was removed from the
+	// run bars, so `background: var(--brand-warm)` restores the exact visual
+	// while spelling no colour at all.
+	for _, lit := range []string{"oklch(", "rgb(", "hsl(", "#0", "#1", "#2", "#3", "#4",
+		"#5", "#6", "#7", "#8", "#9", "#a", "#b", "#c", "#d", "#e", "#f"} {
+		if strings.Contains(strings.ToLower(body), lit) {
+			t.Errorf("the Iceberg panel CSS spells a colour literally (%q). Its run bars encode a "+
+				"magnitude with their WIDTHS, and style.css's own rule is that the warm palette "+
+				"never encodes data; use a var(--ink-*) / var(--line*) / var(--surface*) token.", lit)
+		}
+	}
+	// An ALLOWLIST for the tokens, which is what the message above already
+	// tells the author. A denylist of brand names would need updating every
+	// time the palette grows a colour.
+	for _, m := range regexp.MustCompile(`var\(\s*(--[a-z0-9-]+)`).FindAllStringSubmatch(body, -1) {
+		name := m[1]
+		if strings.HasPrefix(name, "--ink") || strings.HasPrefix(name, "--line") ||
+			strings.HasPrefix(name, "--surface") {
+			continue
+		}
+		t.Errorf("the Iceberg panel CSS uses %s. Its run bars encode a magnitude with their "+
+			"WIDTHS, and style.css's own rule is that the warm palette never encodes data; "+
+			"only --ink-* / --line* / --surface* belong here.", name)
+	}
+}
+
+// TestIcebergFlowStatesWhatTheExportActuallyProduces pins the two claims the
+// drawing pass dropped and 3c5a6f2 put back, plus the engine split.
+//
+// Nothing pinned them before: the legend guard checks only that icebergFlow is
+// CALLED, never what it renders, so the same edit that lost them once could
+// lose them again with the suite green. The compose note next door is guarded
+// down to body-vs-fold placement; these are the panel's other two load-bearing
+// claims and they had nothing.
+func TestIcebergFlowStatesWhatTheExportActuallyProduces(t *testing.T) {
+	raw, err := os.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(raw)
+	flow := functionBody(t, js, "function icebergFlow(")
+	runs := functionBody(t, js, "function icebergRuns(")
+
+	if !strings.Contains(flow, "newest backup") || !strings.Contains(runs, "newest backup") {
+		t.Error("the panel no longer says WHICH backup the first run loads; a reader looking at " +
+			"a list of them on this very page cannot work that out from \"the whole snapshot\"")
+	}
+	if !strings.Contains(flow, "nowhere else") {
+		t.Error("the panel no longer answers where the tables go. For an EXPORT feature that is " +
+			"the one thing a cautious operator asks while standing here")
+	}
+
+	// The engine split against the paragraph it paraphrases. A drawing can be
+	// wrong in a way prose cannot, and "read them directly" is true of two of
+	// the five.
+	docs, err := os.ReadFile("../../docs/iceberg-export.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := string(docs)
+	direct, catalog := "read such a directory directly", "read Iceberg through a catalog"
+	di, ci := strings.Index(d, direct), strings.Index(d, catalog)
+	if di < 0 || ci < 0 || di >= ci {
+		t.Fatalf("docs/iceberg-export.md no longer carries the two sentences this guard reads "+
+			"(direct at %d, catalog at %d); the engine split has no source to check against", di, ci)
+	}
+	// Windowed, not searched. These names appear all over the document, so a
+	// plain Index finds an unrelated earlier mention and grades every engine
+	// against the wrong sentence.
+	dEnd := di + len(direct)
+	dStart := strings.LastIndex(d[:di], ".") + 1
+	directSentence, catalogSentence := d[dStart:dEnd], d[dEnd:ci+len(catalog)]
+	for _, name := range icebergEngineNames(t, js, "ICEBERG_ENGINES_DIRECT") {
+		if !strings.Contains(directSentence, name) {
+			t.Errorf("the panel says %s reads the folder straight off, but the docs sentence that "+
+				"says so does not name it:\n  %s", name, strings.TrimSpace(directSentence))
+		}
+	}
+	for _, name := range icebergEngineNames(t, js, "ICEBERG_ENGINES_CATALOG") {
+		if !strings.Contains(catalogSentence, name) {
+			t.Errorf("the panel says %s reads through a catalog, but the docs sentence that says "+
+				"so does not name it:\n  %s", name, strings.TrimSpace(catalogSentence))
+		}
+	}
+}
+
+func icebergEngineNames(t *testing.T, js, constName string) []string {
+	t.Helper()
+	marker := "const " + constName + " = ["
+	i := strings.Index(js, marker)
+	if i < 0 {
+		t.Fatalf("%s is gone from app.js; the engine split has nothing to check", constName)
+	}
+	rest := js[i+len(marker):]
+	end := strings.Index(rest, "]")
+	if end < 0 {
+		t.Fatalf("%s is not closed", constName)
+	}
+	var out []string
+	for _, part := range strings.Split(rest[:end], ",") {
+		if v := strings.Trim(strings.TrimSpace(part), `"`); v != "" {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		t.Fatalf("%s is empty; this guard covers nothing", constName)
+	}
+	return out
 }
