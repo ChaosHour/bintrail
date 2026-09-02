@@ -592,13 +592,12 @@ func jsArmSummary(t *testing.T, body, anchor string) string {
 //     never probed, so "Using access keys" is false whenever the ID is
 //     exported without it.
 //
-// Exactly TWO arms are covered here, and saying so is the point: the ECS and
-// EKS arms still read "Using an IAM role" from environment-variable presence
-// alone, which is weaker evidence than the file stat behind the shared-config
-// arm. That is dbtrail#1534, deliberately out of scope for #1528, and the
-// comment in credentialsCard has to keep pointing at it. A guard or a comment
-// that describes "every arm" as hedged would be the same over-claim the card
-// itself is being fixed for.
+// The role arms are covered here too since #1534 closed them, and each one
+// says what its own evidence supports rather than one shared hedge: ECS is
+// still env-var presence (probing the endpoint is a network call, a separate
+// decision), so its sentence claims only that the variable is there, while the
+// EKS arms report the token-file probe and AWS_ROLE_ARN separately — an
+// unreadable token and a missing role ARN are different repairs.
 //
 // Each assertion is scoped to the STRING that arm assigns. See jsArmSummary
 // for why neither a byte window nor the whole line is narrow enough.
@@ -648,7 +647,28 @@ func TestCredentialsCard_armsReportWhatWasProbed(t *testing.T) {
 		t.Error(`the Raw signals row does not name the one variable that was read (AWS_ACCESS_KEY_ID)`)
 	}
 
-	// And the two retired sentences must not appear ANYWHERE in the function.
+	// The ECS and EKS arms, hedged since #1534. The ECS one stays a
+	// presence claim (probing the endpoint is a network call, a separate
+	// decision); the EKS one is probed server-side, and each of its three
+	// shapes names what was actually observed.
+	ecs := jsArmSummary(t, body, "else if (aws.container_creds)")
+	if !strings.Contains(ecs, "not checked here") {
+		t.Errorf("the ECS arm no longer says the endpoint was not checked:\n%s", ecs)
+	}
+	broken := jsArmSummary(t, body, `summary = "An EKS service-account role is configured`)
+	if !strings.Contains(broken, "cannot be read") || !strings.Contains(broken, "cannot sign") {
+		t.Errorf("the unreadable-token arm does not say the token cannot be read or that nothing signs:\n%s", broken)
+	}
+	noArn := jsArmSummary(t, body, `summary = "An EKS service-account token is readable`)
+	if !strings.Contains(noArn, "AWS_ROLE_ARN") || !strings.Contains(noArn, "cannot sign") {
+		t.Errorf("the missing-role-arn arm does not name AWS_ROLE_ARN or say nothing signs:\n%s", noArn)
+	}
+	healthy := jsArmSummary(t, body, `summary = "Found an EKS service-account role`)
+	if !strings.Contains(healthy, "not checked here") {
+		t.Errorf("the healthy EKS arm claims more than the probes observed (readable token + named role):\n%s", healthy)
+	}
+
+	// And the retired sentences must not appear ANYWHERE in the function.
 	//
 	// The arm-scoped bans above are SUBSUMED by this one — jsArmSummary returns
 	// a sub-slice of the same body, so anything they can see this sees too.
@@ -679,10 +699,10 @@ func TestCredentialsCard_armsReportWhatWasProbed(t *testing.T) {
 	// reworded claim, one assembled from concatenated fragments, or one
 	// returned by a helper defined outside this function. No string guard
 	// closes those; what it closes is the phrase itself coming back verbatim.
-	// Neither string collides with the deliberate "Using an IAM role" in the
-	// ECS and EKS arms — those are dbtrail#1534, not retired.
+	// "Using an IAM role" joined the retired list with #1534: both role arms
+	// now report what was probed instead of asserting use.
 	span := jsFunctionSpan(t, readAsset(t, "app.js"), "credentialsCard")
-	for _, retired := range []string{"Using credentials from", "Using access keys"} {
+	for _, retired := range []string{"Using credentials from", "Using access keys", "Using an IAM role"} {
 		if strings.Contains(span, retired) {
 			t.Errorf("credentialsCard says %q somewhere in its body. That claim was retired in #1528: the "+
 				"daemon probes presence, never use, and this is the card an operator opens precisely "+
@@ -691,12 +711,13 @@ func TestCredentialsCard_armsReportWhatWasProbed(t *testing.T) {
 	}
 }
 
-// TestCredentialsCard_commentDoesNotOverclaim (#1528 pass 3). The "presence,
-// not use" note was hoisted above the whole if/else chain and generalized to
-// "every arm below". Two arms below say "Using an IAM role" from env-var
-// presence alone. A comment that describes unhedged arms as hedged is the same
-// defect as the copy this PR is fixing, one layer down, and it is the thing a
-// later reader trusts instead of re-deriving.
+// TestCredentialsCard_commentDoesNotOverclaim (#1528 pass 3, flipped by
+// #1534). The comment above the if/else chain is what a later reader trusts
+// instead of re-deriving, so it has to track the arms. It once had to say the
+// role arms were NOT hedged; now that they are, the stale claim is the danger
+// — it would send a reader to re-fix fixed code, and its own message named the
+// worst way to quiet it (drop the hedging). This guard bans that text and
+// requires the #1534 citation the arms' shapes need.
 //
 // Read from the RAW asset on purpose: jsFunctionBody blanks comment lines, so
 // the body view cannot see a comment at all.
@@ -712,13 +733,18 @@ func TestCredentialsCard_commentDoesNotOverclaim(t *testing.T) {
 	}
 	region := js[start : start+end]
 
-	if strings.Contains(region, "in every arm below") {
-		t.Error("the note claims every arm reports presence rather than use; the ECS and EKS arms still " +
-			"say \"Using an IAM role\" from an env var being non-empty")
+	// The deficiency note flipped with #1534: every arm now reports what was
+	// probed, so the STALE claim to ban is the old one — a comment saying the
+	// role arms are still unhedged would send a reader to re-fix fixed code
+	// (and its message named the worst way to quiet it).
+	for _, stale := range []string{"NOT hedged", "Tracked in #1534; fixing", "still read \"Using an IAM role\""} {
+		if strings.Contains(region, stale) {
+			t.Errorf("the region still carries the pre-#1534 deficiency note (%q); the arms are probed now", stale)
+		}
 	}
 	if !strings.Contains(region, "#1534") {
-		t.Error("the note does not point at the issue tracking the two arms that are still unhedged, so " +
-			"the next reader has to rediscover which arms this PR did and did not fix")
+		t.Error("the region no longer cites #1534, so the next reader has to rediscover why the EKS arm " +
+			"has three shapes and the ECS one stays a presence claim")
 	}
 }
 

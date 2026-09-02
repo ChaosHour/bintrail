@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -56,6 +57,120 @@ func TestStorageAPI_reportsPresenceNeverValues(t *testing.T) {
 	}
 	if got.AWS.ContainerCreds || got.AWS.WebIdentity {
 		t.Fatalf("aws = %+v, want no container/web-identity signals", got.AWS)
+	}
+}
+
+// TestStorageAPI_webIdentityIsProbedNotAsserted pins the #1534 shapes: the
+// variable alone used to render "Using an IAM role" while a typo'd path, an
+// unmounted projected-token volume, or a missing AWS_ROLE_ARN meant nothing
+// signs — on the page an operator opens precisely because S3 is not working.
+func TestStorageAPI_webIdentityIsProbedNotAsserted(t *testing.T) {
+	tmp := t.TempDir()
+	token := filepath.Join(tmp, "token")
+	if err := os.WriteFile(token, []byte("jwt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, env := range []string{"AWS_ACCESS_KEY_ID", "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION",
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI"} {
+		t.Setenv(env, "")
+	}
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(tmp, "missing"))
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(tmp, "missing2"))
+
+	srv := newStorageServer(t)
+	read := func() awsCredsDTO {
+		t.Helper()
+		rec, body := doServersReq(t, srv, "GET", "/api/storage", "")
+		if rec.Code != 200 {
+			t.Fatalf("code = %d, body = %s", rec.Code, body)
+		}
+		var got storageInfoResponse
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatal(err)
+		}
+		return got.AWS
+	}
+
+	// The healthy shape: token readable, role named.
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", token)
+	t.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/app")
+	if aws := read(); !aws.WebIdentity || !aws.WebIdentityTokenReadable || !aws.WebIdentityRoleArn {
+		t.Fatalf("healthy IRSA = %+v, want all three signals", aws)
+	}
+
+	// The typo'd/unmounted path: variable set, file absent. This is the shape
+	// that used to read as "Using an IAM role".
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", filepath.Join(tmp, "nope"))
+	if aws := read(); !aws.WebIdentity || aws.WebIdentityTokenReadable {
+		t.Fatalf("missing token = %+v, want web_identity set and token NOT readable", aws)
+	}
+
+	// A token without a role: the provider needs both.
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", token)
+	t.Setenv("AWS_ROLE_ARN", "")
+	if aws := read(); !aws.WebIdentityTokenReadable || aws.WebIdentityRoleArn {
+		t.Fatalf("no role arn = %+v, want readable token and role_arn false", aws)
+	}
+
+	// The projected-volume mount pointed at instead of the token inside it.
+	// os.Open succeeds on a directory, so a probe built on Open alone reports
+	// this as readable while the SDK's own read fails with EISDIR — the same
+	// unearned claim #1534 exists to retire.
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", tmp)
+	if aws := read(); !aws.WebIdentity || aws.WebIdentityTokenReadable {
+		t.Fatalf("directory = %+v, want web_identity set and token NOT readable", aws)
+	}
+
+	// A token the daemon may not read. It stats fine (stat comes from the
+	// directory's execute bit), so this is the case the OPEN half of the probe
+	// exists for: without it the function reduces to a stat and every other
+	// case here still passes.
+	locked := filepath.Join(tmp, "locked-token")
+	if err := os.WriteFile(locked, []byte("jwt"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if os.Geteuid() == 0 {
+		t.Log("running as root: skipping the unreadable-mode case (root opens a mode-000 file)")
+	} else {
+		t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", locked)
+		if aws := read(); !aws.WebIdentity || aws.WebIdentityTokenReadable {
+			t.Fatalf("mode-000 token = %+v, want web_identity set and token NOT readable", aws)
+		}
+	}
+
+	// A Kubernetes projected token is a symlink farm (token -> ..data/token),
+	// so the probe must follow symlinks: Lstat here would report a healthy
+	// IRSA mount as unreadable.
+	link := filepath.Join(tmp, "linked-token")
+	if err := os.Symlink(token, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", link)
+	if aws := read(); !aws.WebIdentityTokenReadable {
+		t.Fatalf("symlinked token = %+v, want readable (projected tokens are symlinks)", aws)
+	}
+}
+
+// TestStorageAPI_webIdentityFifoDoesNotBlock: os.Open on a FIFO with no writer
+// blocks forever, which would strand this handler's goroutine (and its
+// response) on every GET /api/storage. The probe stats first, so a FIFO is
+// answered immediately. Asserted with a deadline because the regression is a
+// HANG, not a wrong answer — a bare call would wedge the test binary instead
+// of failing it.
+func TestStorageAPI_webIdentityFifoDoesNotBlock(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo unsupported here: %v", err)
+	}
+	done := make(chan bool, 1)
+	go func() { done <- webIdentityTokenReadable(fifo) }()
+	select {
+	case got := <-done:
+		if got {
+			t.Fatal("a FIFO is not a readable token file")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("webIdentityTokenReadable blocked on a FIFO with no writer")
 	}
 }
 
