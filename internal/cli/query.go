@@ -430,7 +430,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "\n%d row(s)\n", n)
 		}
 		if n >= qLimit {
-			fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows. Use a narrower time range or --limit to adjust.\n", qLimit)
+			truncationWarn(qLimit, qLimitPerPK, qOrder)
 		}
 		return nil
 	}
@@ -512,7 +512,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "\n%d row(s)\n", n)
 	}
 	if n >= qLimit {
-		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows. Use a narrower time range or --limit to adjust.\n", qLimit)
+		truncationWarn(qLimit, qLimitPerPK, qOrder)
 	}
 	// An empty digest-filtered result means one of two opposite things. Probe
 	// only here — after the answer came back empty — so the cost lands on the
@@ -534,6 +534,37 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		}
 	}
 	return nil
+}
+
+// truncationWarn prints the stderr warning for a result cut by --limit,
+// naming which end of the matched window survived (#1439): under DESC the
+// newest events, under ASC (or the empty default) the oldest — "truncated"
+// alone left the reader unable to tell which. Under --limit-per-pk the claim
+// is false in BOTH directions (the per-PK cap's inner ordering is pinned
+// DESC, so the result is a slice of a per-PK-newest subset and events fell
+// off both ends), so that shape says so instead.
+func truncationWarn(limit, limitPerPK int, order string) {
+	if limitPerPK > 0 {
+		// Same direction split as the MCP notice: under DESC the newest end
+		// is provably intact (the cap's inner ordering is itself DESC), so
+		// "both ends" would be false there.
+		if query.OrderDirection(order) == "DESC" {
+			fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows, keeping the NEWEST matching events, "+
+				"and --limit-per-pk kept only the latest %d events per row, so older events were dropped from "+
+				"inside the window as well. Use a narrower time range or --limit to adjust.\n", limit, limitPerPK)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows, and --limit-per-pk kept only the latest %d "+
+			"events per row, so events were dropped at both ends of the window. Use a narrower time range or --limit to adjust.\n",
+			limit, limitPerPK)
+		return
+	}
+	kept := "OLDEST"
+	if query.OrderDirection(order) == "DESC" {
+		kept = "NEWEST"
+	}
+	fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows, keeping the %s matching events. "+
+		"Use a narrower time range or --limit to adjust.\n", limit, kept)
 }
 
 // queryArchiveSources is the single choke point for issue #203: it fetches
