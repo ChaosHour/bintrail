@@ -171,7 +171,7 @@ func TestBaselineRefreshNote_partitionsTheTables(t *testing.T) {
 func TestBackupRefreshWireNamesMatchTheFrontend(t *testing.T) {
 	js := readAsset(t, "app.js")
 
-	raw, err := json.Marshal(BaselineStatus{State: "succeeded", Tables: 3, Carried: 2})
+	raw, err := json.Marshal(BaselineStatus{State: "succeeded", Tables: 3, Carried: 2, CarriedCopied: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,13 @@ func TestBackupRefreshWireNamesMatchTheFrontend(t *testing.T) {
 		t.Fatalf("BaselineStatus no longer serialises a \"carried\" key (got %s); the console reads rf.carried "+
 			"and would silently stop showing reused tables", raw)
 	}
-	for _, ref := range []string{"rf.carried", "rst.carried"} {
+	// carried_copied is the honesty half of the pair (#1578): without it every
+	// reuse renders as a disk saving, including the copies that saved none.
+	if _, ok := wire["carried_copied"]; !ok {
+		t.Fatalf("BaselineStatus no longer serialises \"carried_copied\" (got %s); copied reuses would "+
+			"silently render as disk savings again", raw)
+	}
+	for _, ref := range []string{"rf.carried", "rst.carried", "rf.carried_copied", "rst.carried_copied", "run.carried_copied"} {
 		if !strings.Contains(js, ref) {
 			t.Errorf("app.js does not read %s, so the reused count never reaches the page", ref)
 		}
@@ -345,6 +351,28 @@ func TestBackupRefreshCard_titleSaysWhatItDoes(t *testing.T) {
 	if !strings.Contains(js, `"Scheduled backups: none"`) {
 		t.Fatal("the schedule summary is no longer called Scheduled backups; the collision was resolved from " +
 			"the wrong side, and this guard would have passed on a renamed timetable")
+	}
+}
+
+// TestReusedCopiedNote_saysWhatACopyCost pins the only user-visible half of
+// #1578: every layer under the render (carryForward's bool, the fold wiring,
+// countReuse, applyFoldStatus, the wire names) is guarded, but the string the
+// reporter actually reads was not — emptying reusedCopiedNote restored the
+// exact bug (a copied reuse rendering as a disk saving) with the whole Go
+// suite green, because the wire-name guard only checks the fields are READ.
+func TestReusedCopiedNote_saysWhatACopyCost(t *testing.T) {
+	body := jsFunctionBody(t, readAsset(t, "app.js"), "reusedCopiedNote")
+	// The zero arm: no copies, no qualifier — the unqualified "reused" note
+	// is then the correct claim.
+	if !strings.Contains(body, `if (!copied) return "";`) {
+		t.Error("reusedCopiedNote no longer returns empty for zero copies; every reuse would carry a false qualifier")
+	}
+	// The non-empty arm carries the counter and the two load-bearing claims:
+	// no disk was saved, and the cause is in the daemon log.
+	for _, want := range []string{`+ copied +`, "which saved no disk", "the daemon log says why"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("reusedCopiedNote lost %q; a copied reuse would render as a disk saving again (#1578)", want)
+		}
 	}
 }
 
