@@ -4127,7 +4127,32 @@ function backupRefreshCard(br) {
     say("Turn this on and a table with no changes keeps its file from the last backup instead. The backup is still complete.");
   }
   say("It saves disk only when the last backup is read from this machine. A scheduled backup on a server that has a Backup S3 reuses nothing, so it writes every table.");
-  say("This one setting covers every server.");
+  // "covers every server" was false for an S3-only server, which the refresh
+  // timer skips permanently (#1579); scoped to the servers the loop can
+  // actually reach, with the skip counted right below it.
+  say("This one setting covers every server that keeps backups on this machine.");
+  // The everything-running silence #1579 names: enabled and scheduled both
+  // true reads as the healthy state, while the timer can be running over
+  // ZERO refreshable servers (fresh install, or every server S3-only or
+  // without a Backup dir). br.targets is computed live by the daemon and
+  // omitted where no loop runs, so the alarm can only fire on a watch
+  // daemon whose loop truly covers nothing.
+  if (br.scheduled && br.targets === 0) {
+    card.append(el("p", { class: "form-msg err", text:
+      "The refresh timer is on, but no server can be refreshed: a refresh needs an index connection " +
+      "and a local Backup dir. Nothing will refresh until a server has both; set one in the servers list below." }));
+  }
+  // What the skipped servers CANNOT do, not what they will do: an update from
+  // the recorded changes writes Parquet to a local directory, which is the very
+  // field these servers lack, so the bucket is never read back into a cheaper
+  // backup. The positive form ("their backups are full backups") would be a
+  // PREDICTION, and this card holds no gate data: with the create-backup
+  // opt-in off, a schedule on such a server is refused and takes no backup at
+  // all. The per-server rows below make that prediction, and only after
+  // checking the refusal.
+  if (br.skipped_s3_only > 0) {
+    say(br.skipped_s3_only + " server(s) keep backups only in S3, so the timer skips them. Those servers never get an update from the recorded changes; the only backup they can get is a full one.");
+  }
   // Three situations, not two. A daemon started with the backup trigger and no
   // refresh schedule still applies this to restores, so calling it dormant
   // there would let an operator reuse files right after being told nothing

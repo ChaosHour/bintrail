@@ -4073,7 +4073,7 @@ try {
     : bad("layout: a card left alone on the last row spans it", JSON.stringify(bandRow));
 
   // ── Scenario 17g3 — the disk-space card, every state it can be in ──
-  // Calls the REAL backupRefreshCard with each of the 16 DTOs the daemon can
+  // Calls the REAL backupRefreshCard with each of the 144 DTOs the daemon can
   // serve and reads the rendered element. A Go guard over the source can only
   // see that both `br.enabled` and `br.scheduled` appear somewhere in the
   // function, so inverting either condition survives it while the card tells
@@ -4091,10 +4091,37 @@ try {
       for (const enabled of [false, true]) {
         for (const scheduled of [false, true]) {
           for (const source of ["default", "override"]) {
-            const el = backupRefreshCard({ carry_forward_unchanged: on, enabled, scheduled, source });
+          // The two #1579 dimensions. `targets` is absent off a watch daemon
+          // (no loop to count) and a real 0 on one whose loop covers nothing;
+          // the alarm must separate those, so undefined and 0 are distinct
+          // values here, not one falsy case.
+          for (const targets of [undefined, 0, 1]) {
+          // 0, 1 and 2: a predicate that agrees with "> 0" on {0, 2} but hides
+          // the note for a SINGLE skipped server survives a two-value axis, and
+          // one S3-only server is both the common deployment and the value a
+          // later pluralization edit is most likely to special-case.
+          for (const skipped of [0, 1, 2]) {
+            const el = backupRefreshCard({ carry_forward_unchanged: on, enabled, scheduled, source,
+              targets, skipped_s3_only: skipped });
             const t = el.innerText || el.textContent || "";
             rows.push({
-              on, enabled, scheduled, source,
+              on, enabled, scheduled, source, targets, skipped,
+              alarm: t.includes("no server can be refreshed"),
+              // The count is read back, not just the sentence: a card that
+              // says "server(s)" without the number tells an operator nothing
+              // about how much is uncovered.
+              skipNote: t.includes(skipped + " server(s) keep backups only in S3"),
+              // The skip note may MENTION the cheaper update, but only to DENY
+              // it: these servers cannot get one, because the fold writes its
+              // Parquet to the local directory they do not have. An unnegated
+              // mention is the promise the first version of this note made
+              // ("their scheduled backups read the bucket instead"). Read from
+              // the skip PARAGRAPH, not the card: the saving sentence above
+              // legitimately says "reuses nothing" about the same servers.
+              skipPromisesReuse: ((line) => /read the bucket/i.test(line)
+                || (/(reus|recorded changes)/i.test(line) && !/\b(never|cannot|no)\b/i.test(line)))(
+                Array.from(el.querySelectorAll("p")).map((p) => p.textContent)
+                  .find((x) => x.includes("keep backups only in S3")) || ""),
               pill: (el.querySelector(".bkr-state") || {}).textContent || "",
               dormant: t.includes("Nothing uses this yet"),
               middle: t.includes("Nothing refreshes all servers on one timer"),
@@ -4108,6 +4135,8 @@ try {
               live: /\b(live|running)\b/i.test(t),
               buttons: Array.from(el.querySelectorAll("button")).map((b) => b.textContent),
             });
+          }
+          }
           }
         }
       }
@@ -4128,9 +4157,18 @@ try {
     || r.live
     // the saving never appears without the condition it actually has
     || !r.saving
+    // #1579: the alarm fires exactly when a timer is on over zero refreshable
+    // servers. An ABSENT count (no loop in this daemon) is not zero, and that
+    // is the whole point of the strict compare in the card.
+    || r.alarm !== (r.scheduled && r.targets === 0)
+    // the skip note appears with its count, and only when servers were skipped
+    || r.skipNote !== (r.skipped > 0)
+    // and it never promises those servers an update from the bucket, which
+    // needs the local directory they lack
+    || r.skipPromisesReuse
     // the hand-it-back button appears only where there is something to hand back
     || (r.buttons.length === 2) !== (r.source === "override"));
-  cardStates.length === 16 && cardBad.length === 0
+  cardStates.length === 144 && cardBad.length === 0
     ? ok("backups: the disk-space card reports every state it can be in")
     : bad("backups: the disk-space card reports every state it can be in",
         JSON.stringify({ n: cardStates.length, wrong: cardBad.slice(0, 4) }));
