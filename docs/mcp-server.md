@@ -191,7 +191,7 @@ automatically.
 | `recover_cascade` | `bintrail recover-cascade --dry-run` | Generate reversal SQL for foreign-key `ON DELETE`/`ON UPDATE` cascade side effects InnoDB ran below the binlog — the child rows plain `recover` cannot see. Fails with the reasons when the synthesis is provably partial, unless `allow_incomplete` is set |
 | `reconstruct` | `bintrail reconstruct` | A single row's full state at a point in time (needs a baseline) |
 | `status` | `bintrail status` | Indexed files, partitions, and summary |
-| `list_schema_changes` | reads `schema_changes` (see [DDL tracking](./ddl-tracking.md)) | DDL changes recorded while indexing/streaming, with the full statement, binlog coordinates, and the covering `snapshot_id` (`null` = no auto-snapshot) |
+| `list_schema_changes` | reads `schema_changes` (see [DDL tracking](./ddl-tracking.md)) | DDL changes recorded while indexing/streaming, with the full statement, binlog coordinates, and the covering `snapshot_id` (`null` = no auto-snapshot; a TRUNCATE row's null is by design and carries a `snapshot_note` saying so) |
 
 All six are read-only — annotated `ReadOnlyHint: true` and `IdempotentHint: true`,
 so the client knows they're safe to call repeatedly and never modify state.
@@ -210,8 +210,11 @@ HTTP, console-token auth, per-server routing by URL path) — if you already run
 `list_schema_changes` accepts `schema`, `table`, `ddl_type`
 (`CREATE`/`ALTER`/`DROP`/`RENAME`/`TRUNCATE`, prefix-matched so `ALTER` matches
 `ALTER TABLE`), `since`, `until`, `limit` (default 100), and `uncovered_only`
-(only changes whose `snapshot_id` is `null` — the rows behind the `status`
-tool's "DDL(s) detected without auto-snapshot" warning); results come back
+(exactly the rows behind the `status` tool's "DDL(s) detected without
+auto-snapshot" warning — `snapshot_id` is `null` AND the DDL is not a
+`TRUNCATE TABLE`, whose null is by design since it changes no structure; a
+TRUNCATE row in the plain listing carries a `snapshot_note` saying so, and
+`ddl_type: TRUNCATE` lists them all); results come back
 newest-first, and changes inside the same second are ordered by binlog
 coordinate (`binlog_file`, then `binlog_pos`), so a migration's burst of DDLs
 reads in the order it ran and a `limit` that cuts inside the burst keeps the

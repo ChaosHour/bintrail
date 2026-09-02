@@ -326,6 +326,22 @@ func LoadArchiveStats(ctx context.Context, db *sql.DB) (*ArchiveStats, error) {
 	return &a, nil
 }
 
+// UncoveredDDLWhere is the ONE definition of "a DDL with no covering
+// snapshot", shared by this package's UncoveredDDLs count and the
+// list_schema_changes tool's uncovered_only filter (#1436) — the two were
+// hand-maintained WHERE clauses and diverged once: the tool used a bare
+// `snapshot_id IS NULL` and listed 9 rows where the status warning counted 1.
+//
+// TRUNCATE TABLE is excluded: it does not change table structure, so every
+// capture path records it with snapshot_id = NULL on purpose ("DDL detected
+// (no snapshot needed)") — a NULL there is not a coverage gap, and counting
+// it would permanently inflate the warning.
+//
+// Parenthesized so both consumers compose it safely: status appends it to
+// WHERE, the tool to an existing clause with AND — an OR added here later
+// would otherwise bind correctly in one site and silently wrong in the other.
+const UncoveredDDLWhere = `(snapshot_id IS NULL AND ddl_type <> 'TRUNCATE TABLE')`
+
 // LoadCoverage loads restore coverage info from binlog_events, schema_changes,
 // and archive_state. Archive coverage is derived from partition names stored in
 // archive_state (e.g. "p_2026021914" → 2026-02-19 14:00 UTC) without reading
@@ -346,12 +362,8 @@ func LoadCoverage(ctx context.Context, db *sql.DB) (*CoverageInfo, error) {
 		return nil, fmt.Errorf("query schema_changes count: %w", err)
 	}
 
-	// TRUNCATE TABLE is excluded: it does not change table structure, so every
-	// capture path records it with snapshot_id = NULL on purpose ("DDL detected
-	// (no snapshot needed)") — a NULL there is not a coverage gap.
 	err = db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM schema_changes
-		 WHERE snapshot_id IS NULL AND ddl_type <> 'TRUNCATE TABLE'`).Scan(&c.UncoveredDDLs)
+		`SELECT COUNT(*) FROM schema_changes WHERE `+UncoveredDDLWhere).Scan(&c.UncoveredDDLs)
 	if err != nil {
 		return nil, fmt.Errorf("query uncovered DDLs: %w", err)
 	}
