@@ -1155,6 +1155,13 @@ function covCard(c, stamp) {
       // An error must never render like "nothing broken" — the broken-table
       // warning would silently vanish behind a failed listing.
       card.append(el("p", { class: "cov-line warn", text: "Full-table coverage could not be checked. See the daemon log." }));
+      if (c.unevaluable_tables && c.unevaluable_tables.length) {
+        // Naming them is the point. The usual cause is an index whose archives
+        // cannot be attributed to one source, where a backup below the live
+        // floor may still be covered: too uncertain to call broken, too
+        // specific to leave as "could not be checked".
+        card.append(el("p", { class: "cov-line warn", text: "Their newest backup is older than the window this index can prove, and the archives cannot be tied to one source: " + c.unevaluable_tables.join(", ") + ". Take a fresh backup to settle it." }));
+      }
     }
     if (c.full_table_from) {
       card.append(el("p", { class: "cov-line" },
@@ -1163,6 +1170,15 @@ function covCard(c, stamp) {
     }
     if (c.broken_tables && c.broken_tables.length) {
       card.append(el("p", { class: "cov-line bad", text: "Not fully restorable (newest backup predates coverage): " + c.broken_tables.join(", ") + ". Take a fresh backup." }));
+    }
+    if (c.restore_needs_local) {
+      card.append(el("p", { class: "cov-line warn", text: "Backups for this server go to S3 only, so \"Restore to a moment\" has nothing local to fold from. Time-travel still reads them. Set this server's backup dir to restore here." }));
+    }
+    if (c.offsite_tables && c.offsite_tables.length) {
+      // Warn, not bad: the backup exists and Time-travel reads it from the
+      // bucket. What cannot use it is Restore, which folds from the local
+      // backup folder only.
+      card.append(el("p", { class: "cov-line warn", text: "Backed up only in S3, so \"Restore to a moment\" cannot fold them: " + c.offsite_tables.join(", ") + ". Time-travel still reads them. Take a local backup to restore them here." }));
     }
   }
   return card;

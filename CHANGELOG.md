@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Restore Coverage is graded across every backup location** (#1571). The
+  panel that answers how far back a server can be restored derived that from
+  `bundle.baselineSrc` alone, so on a server with a local directory and an S3
+  destination a table whose only surviving anchor lives in the bucket was not
+  graded, not named broken, and not counted — a clean verdict over an inventory
+  missing a table. It now merges both locations through the same
+  `listBaselinesMerged` the Backups listing uses (#1542), and **a location that
+  fails to list** makes the verdict `unknown` rather than grading the half that
+  did: a partial listing can only understate coverage, and an understated
+  window names healthy tables broken. (A location that lists but skips an
+  unreadable snapshot directory returns no error, so it is not covered by that
+  rule.) Merging can also flip a verdict from `ok` to `unknown`, when the
+  second location contributes a table whose anchor is unattributable.
+  A table whose only usable backup is in S3 is reported in a new
+  `offsite_tables` bucket instead of widening the restorable window: the
+  listing reads every location, but the Restore button folds from the local
+  backup directory alone (#1541), so counting that anchor would print a start
+  the button then refuses. It is not `broken_tables` either — that drives an
+  alarm and advises a fresh backup, and the backup exists. Time travel still
+  reads it, through the S3 fallback `bundle.findBaseline` already has (#766) —
+  which is also why a table whose STALE LOCAL copy shadows a fresh offsite one
+  stays in `broken_tables`: that fallback fires only on `ErrNoBaseline`, so a
+  local hit means no console surface ever reaches the bucket. On a server that
+  backs up only to S3 there is no local anchor at all, so the card states that
+  once (`restore_needs_local`) instead of naming every table. Tables that
+  could not be graded at all are named in `unevaluable_tables` rather than
+  collapsing into a bare "could not be checked": on an index whose archives
+  cannot be attributed to one source, the ambiguity demotion (#1219) turns
+  every shadowed table's verdict into `unknown`, which is the right call for
+  the verdict and would have erased the inventory it applies to.
+- **The downloaded `views.sql` says when a newer backup lives somewhere it does
+  not read** (#1571). The file names ONE root and every state view resolves a
+  path under it, so merging the two locations would produce views that half of
+  its readers cannot open — the paths would not resolve. What silence cost was
+  quieter: with the newest snapshot aged out of local retention but still in
+  the bucket, the file pinned the older local one and read as current. The
+  header now names the newer snapshot, where it is, and the control that reads
+  it instead ("Works on another machine"). The route is named only when the
+  control moves the reader *toward* the newer snapshot: with the box already
+  ticked the newer snapshot is the local one, and unticking would hand a file
+  of local paths to someone who asked for one that travels, so the fact is
+  stated and the route withheld. A second location that will not answer costs
+  the download nothing and is disclosed in the header, since silence there is
+  indistinguishable from "it holds nothing newer" and the two lead to opposite
+  actions. Every operator-supplied path printed into the header is now escaped
+  for newlines: a registry backup path containing one ended the comment and
+  left the rest of the value on a line DuckDB would execute.
+
 ### Changed
 - **The `events` view binds one Parquet footer per SCHEMA, not per archived
   file** (#1535). `archive_state` gains `column_set`, the archived file's own

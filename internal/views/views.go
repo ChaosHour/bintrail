@@ -247,6 +247,29 @@ type Input struct {
 	// the header. BaselineSnapshot is that snapshot's timestamp.
 	BaselineSource   string
 	BaselineSnapshot time.Time
+	// NewerElsewhere names a snapshot that is more recent than the one this
+	// file pins, found in the server's OTHER backup location (#1571).
+	//
+	// It is a warning and deliberately NOT a correction. This file names ONE
+	// root, and every state view resolves a path under it: a reader who has
+	// the local directory cannot open an s3:// path and the reverse is just
+	// as true, so merging the two locations would produce views that half of
+	// the readers cannot resolve. What silence cost instead was worse in a
+	// quieter way — a file pinned to a week-old snapshot because the newest
+	// one had already aged out of local retention, reading as current.
+	NewerElsewhere       time.Time
+	NewerElsewhereSource string
+	// NewerElsewhereHowTo is the route THIS producer's reader can take to get
+	// that snapshot instead, rendered verbatim as one comment line. Same rule
+	// as LiveLegHowTo: this package states no route it cannot see, so an empty
+	// value leaves the note stating the fact alone. A note that names a
+	// problem and no way to act on it is where the reader stops.
+	NewerElsewhereHowTo string
+	// NewerElsewhereUnchecked names the other location when the look at it did
+	// NOT answer, so the header can say the question is open instead of
+	// rendering a file indistinguishable from one whose other location was
+	// read and held nothing newer. Set only when NewerElsewhere is zero.
+	NewerElsewhereUnchecked string
 	// Follow records how, if at all, the state views reach a snapshot published
 	// after this file was generated (#1484, #1550). ApplyFollow is what sets
 	// it; see FollowMode for what each mode costs the reader.
@@ -777,14 +800,14 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("--   (none registered in archive_state: no rotated partitions have been archived yet)\n")
 	}
 	for _, s := range in.ArchiveSources {
-		fmt.Fprintf(b, "--   %s\n", s)
+		fmt.Fprintf(b, "--   %s\n", commentSafe(s))
 	}
 	b.WriteString("-- Baseline snapshot:\n")
 	switch {
 	case len(in.Baselines) == 0 && in.BaselineSource == "":
 		b.WriteString("--   (no baseline source given: pass --baseline-dir or --baseline-s3)\n")
 	case len(in.Baselines) == 0:
-		fmt.Fprintf(b, "--   (none discoverable under %s)\n", in.BaselineSource)
+		fmt.Fprintf(b, "--   (none discoverable under %s)\n", commentSafe(in.BaselineSource))
 	case in.SnapshotScoped && in.BaselineSource == ".":
 		// The tarball's copy (#1583): paths spelled "./schema/table.parquet".
 		// Guarded by INTENT, not by the path value alone: `bintrail views
@@ -804,8 +827,28 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("--   holding the schema directories). From anywhere else the reads fail with\n")
 		b.WriteString("--   DuckDB's own \"No files found\" naming the exact relative path.\n")
 	default:
+		// commentSafe on the SOURCE as well as the sentence: a registry entry's
+		// baseline path is operator-supplied and unvalidated for newlines, and
+		// one here would end the comment and leave the rest of the path on a
+		// line DuckDB executes. The HowTo beside it is a compile-time
+		// constant; this one is not, which is the half that needed it.
 		fmt.Fprintf(b, "--   %s at %s (%d table(s))\n",
-			in.BaselineSource, in.BaselineSnapshot.UTC().Format(time.RFC3339), len(in.Baselines))
+			commentSafe(in.BaselineSource), in.BaselineSnapshot.UTC().Format(time.RFC3339), len(in.Baselines))
+		switch {
+		case !in.NewerElsewhere.IsZero():
+			fmt.Fprintf(b, "--   NOTE: a newer snapshot (%s) exists under %s, which this file does\n"+
+				"--   not read. A file names one location, and its paths only resolve there.\n",
+				in.NewerElsewhere.UTC().Format(time.RFC3339), commentSafe(in.NewerElsewhereSource))
+			if in.NewerElsewhereHowTo != "" {
+				fmt.Fprintf(b, "--   %s\n", commentSafe(in.NewerElsewhereHowTo))
+			}
+		case in.NewerElsewhereUnchecked != "":
+			// Say the check did not answer. Silence here is indistinguishable
+			// from "the other location holds nothing newer", and the two lead
+			// to opposite actions. Same shape as the archive half above.
+			fmt.Fprintf(b, "--   (whether %s holds a newer snapshot could not be read; the\n"+
+				"--   console log has the error)\n", commentSafe(in.NewerElsewhereUnchecked))
+		}
 		switch in.Follow {
 		case FollowPointer:
 			// Name the timestamp AND the pointer: the timestamp is what the
@@ -813,7 +856,7 @@ func writeHeader(b *strings.Builder, in Input) {
 			// actually open. Reporting only one of the two would make a
 			// followed file indistinguishable from a pinned one.
 			fmt.Fprintf(b, "--   read through %s/%s, which is that snapshot right now\n",
-				strings.TrimSuffix(in.BaselineSource, "/"), baseline.CurrentLinkName)
+				commentSafe(strings.TrimSuffix(in.BaselineSource, "/")), baseline.CurrentLinkName)
 		case FollowNewest:
 			// Same job as the pointer line, and the same reason: the timestamp
 			// above is where the column types came from, not what the views
