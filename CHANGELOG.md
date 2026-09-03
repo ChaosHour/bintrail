@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.77.0] - 2026-09-03
+
 ### Fixed
 - **Restore Coverage is graded across every backup location** (#1571). The
   panel that answers how far back a server can be restored derived that from
