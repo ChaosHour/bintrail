@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`doctor` warns about tables with no primary key** (#1608). Those tables are
+  not captured at all: the first snapshot REFUSES outright and the stream does
+  not start, and a later snapshot after a schema change EXCLUDES them and skips
+  their row events. Until now nothing said so before the refusal. The check
+  names the tables, up to ten, keeps the count exact past that, and its
+  remediation states what actually happens rather than describing degraded
+  recovery over data that does not exist.
+  It is advisory on every path, including its own errors: nothing downstream
+  consumes the answer, since the snapshot re-derives it and refuses on its own,
+  so a transient `information_schema` error must not stop capture on a source
+  that is healthy. Nothing visible in scope reports `skip`, never `pass`.
+  The finding comes from `metadata.TablesWithoutPrimaryKey`, which is the
+  snapshot's OWN classifier, rather than a second query asking a similar
+  question. Both directions of drift were measured on live servers before this
+  landed: a `TABLE_CONSTRAINTS` question warns about a `UNIQUE NOT NULL` table
+  that MySQL marks `COLUMN_KEY = 'PRI'` and the product keys perfectly well,
+  and a `TABLE_TYPE = 'BASE TABLE'` filter misses MariaDB's `SYSTEM VERSIONED`
+  tables, which is the shape where the data loss is total (#1272).
+
 ## [0.77.0] - 2026-09-03
 
 ### Fixed
