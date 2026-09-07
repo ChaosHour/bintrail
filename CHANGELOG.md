@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.78.0] - 2026-09-07
+
 ### Fixed
 - **Point-in-time restore folds from the server's S3 backups** (#1541). The
   console's Restore listed the backup to fold from in the server's local
