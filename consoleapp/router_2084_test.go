@@ -207,7 +207,7 @@ func newRouterFiles(t *testing.T) routerFiles {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return routerFiles{owner: owner, servers: servers, portFile: filepath.Join(dir, console.FlashbackFileName)}
+	return routerFiles{owner: owner, servers: servers, portFile: console.RouterSwitchPath(servers)}
 }
 
 func (f routerFiles) settings(token string) routerSettings {
@@ -224,7 +224,7 @@ func (f routerFiles) savePortFile(t *testing.T, enabled bool, password string) {
 	if enabled {
 		body = "version: 1\nenabled: true\n"
 	}
-	body += "listen: 127.0.0.1:3309\npassword: " + password + "\n"
+	body += "password: " + password + "\n"
 	tmp := f.portFile + ".tmp"
 	if err := os.WriteFile(tmp, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -370,6 +370,29 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 	}
 }
 
+// mysqlLoginSettled logs in once the port answers as MySQL does. A password
+// withdrawn closes the router's port for a moment, to put out everyone on
+// it, and opens it again: a login in that gap is refused by the system, not
+// by the router, and says nothing about the password.
+func mysqlLoginSettled(t *testing.T, addr, password string) uint16 {
+	t.Helper()
+	var code uint16
+	waitUntil(t, "the port to answer a login at "+addr, func() bool { code = mysqlLoginQuiet(addr, password); return code != 1 })
+	return code
+}
+
+// connectSettled connects once the port takes password, across that gap.
+func connectSettled(t *testing.T, addr, password string) *client.Conn {
+	t.Helper()
+	var conn *client.Conn
+	waitUntil(t, "a connection to "+addr, func() bool {
+		c, err := client.Connect(addr, "default", password, "")
+		conn = c
+		return err == nil
+	})
+	return conn
+}
+
 // With no token and no password yet the router waits, without listening,
 // and opens its port when the daemon's web interface creates the password.
 // When that password is withdrawn, the connections made with it are closed
@@ -413,13 +436,10 @@ func TestRouterPort_waitsForACredentialAndFollowsIt(t *testing.T) {
 	f.savePortFile(t, true, "made-again")
 	waitUntil(t, "the connection made with the replaced password to be closed", func() bool { return conn.Ping() != nil })
 	waitUntil(t, "the port to be open for the new password", func() bool { return bound() != "" && mysqlLoginQuiet(addr, "made-again") == 0 })
-	if code := mysqlLogin(t, addr, "made-in-the-web"); code != gomysql.ER_ACCESS_DENIED_ERROR {
+	if code := mysqlLoginSettled(t, addr, "made-in-the-web"); code != gomysql.ER_ACCESS_DENIED_ERROR {
 		t.Fatalf("login with the replaced password: %d, want 1045", code)
 	}
-	conn2, err := client.Connect(addr, "default", "made-again", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn2 := connectSettled(t, addr, "made-again")
 	defer conn2.Close()
 	conn = conn2
 	// The port turned off in the web interface: that password opens
@@ -547,8 +567,8 @@ func TestRouterStartupLines_sayWhatWillHappen(t *testing.T) {
 			[]string{"every network interface", "does not exist", "is not applied", "read routing is read-only"}},
 		{"a pool of one is one statement", func(u *routerStartup) { u.Pool.Workers = 1 },
 			[]string{"1 statement on the copy at once"}, []string{"1 statements"}},
-		{"no token: the web interface's password", func(u *routerStartup) { u.PortFile = "/var/lib/bintrail/console-mysql-port.yaml" },
-			[]string{"no access token was given", "/var/lib/bintrail/console-mysql-port.yaml", "only while it is on"},
+		{"no token: the web interface's password", func(u *routerStartup) { u.PortFile = "/var/lib/bintrail/console-router.yaml" },
+			[]string{"no access token was given", "/var/lib/bintrail/console-router.yaml", "only while it is on"},
 			[]string{"the password is the access token"}},
 		{"a servers file that is not there", func(u *routerStartup) { u.ServersExists, u.Servers = false, 0 },
 			[]string{"does not exist yet", "no server can be reached", "--servers-file"},
