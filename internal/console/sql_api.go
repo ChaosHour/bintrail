@@ -212,10 +212,11 @@ func (s *Server) sqlAvailable(r *http.Request, b *bundle) bool {
 		!policyFrom(r.Context()).Allows(ext.PermSQLExecute) {
 		return false
 	}
-	if strings.HasPrefix(b.baselineSrc, "s3://") {
+	src := b.sqlCopySource()
+	if strings.HasPrefix(src, "s3://") {
 		return false
 	}
-	if b.baselineSrc != "" && reconstruct.HasLocalSnapshot(b.baselineSrc) {
+	if src != "" && reconstruct.HasLocalSnapshot(src) {
 		return true
 	}
 	// The portable lookup: no tree walk, no warning per call. A source it
@@ -369,7 +370,7 @@ func (s *Server) handleSQLInfo(w http.ResponseWriter, r *http.Request) {
 	if !s.sqlGate(w, r, b) {
 		return
 	}
-	in, err := s.buildViewsInput(r.Context(), b, viewsRequest{PinSnapshot: true, OmitEvents: true})
+	in, err := s.buildViewsInput(r.Context(), b, viewsRequest{PinSnapshot: true, OmitEvents: true, LocalCopy: true})
 	switch {
 	case errors.Is(err, errNoViewSources):
 		writeJSONError(w, http.StatusConflict, errNoViewSources.Error()+"; there is no copy to run SQL on yet")
@@ -379,7 +380,7 @@ func (s *Server) handleSQLInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if in.NeedsS3() {
-		writeJSONError(w, http.StatusConflict, sqlCopyNotLocalMessage)
+		writeJSONError(w, http.StatusConflict, s.sqlNotLocalMessage(b))
 		return
 	}
 	// The events view is offered only over a local change log: a statement
@@ -397,7 +398,7 @@ func (s *Server) handleSQLInfo(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusConflict, why)
 			return
 		}
-		writeJSONError(w, http.StatusConflict, sqlCopyNotLocalMessage)
+		writeJSONError(w, http.StatusConflict, s.sqlNotLocalMessage(b))
 		return
 	}
 	notes := in.NamingNotes()
@@ -915,12 +916,13 @@ func sqlMayAnswerOlder(statement string, sess sqlsandbox.Session) bool {
 // than h.limit. Every snapshot it can list is a complete one (a run that
 // failed is never listed), so the tables of one copy are one moment.
 func (s *Server) sqlOlderCopy(ctx context.Context, b *bundle, h *sqlHeavyRun) (time.Time, bool) {
-	if b.baselineSrc == "" || len(h.tables) == 0 {
+	src := b.sqlCopySource()
+	if src == "" || len(h.tables) == 0 {
 		return time.Time{}, false
 	}
 	lctx, cancel := context.WithTimeout(ctx, baselineListTimeout)
 	defer cancel()
-	files, _, err := reconstruct.ListBaselinesReport(lctx, b.baselineSrc)
+	files, _, err := reconstruct.ListBaselinesReport(lctx, src)
 	if err != nil {
 		slog.Warn("console: sql: could not list earlier copies to answer from", "error", err)
 		return time.Time{}, false
@@ -989,9 +991,10 @@ func sqlOlderCopyNote(h *sqlHeavyRun, at time.Time) string {
 func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schema string, maxRows int, sess sqlsandbox.Session, unchanged sqlUnchanged, at time.Time, heavy **sqlHeavyRun) (sqlOutcome, error) {
 	// What is known without any I/O is refused before the slot: a copy that
 	// lives only on S3 is never served here, and listing it would hold one
-	// of the daemon's two slots while it waits on the network.
-	if strings.HasPrefix(b.baselineSrc, "s3://") {
-		return sqlOutcome{}, &sqlRefusal{http.StatusConflict, sqlCopyNotLocalMessage}
+	// of the daemon's two slots while it waits on the network. A local
+	// mirror of it that holds a snapshot is a local copy (#2302).
+	if strings.HasPrefix(b.sqlCopySource(), "s3://") {
+		return sqlOutcome{}, &sqlRefusal{http.StatusConflict, s.sqlNotLocalMessage(b)}
 	}
 	// The slot first (#2026): a statement that will be refused as busy must
 	// not pay for the view build below, which reads the index and walks the
@@ -1031,7 +1034,7 @@ func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schem
 	if in.NeedsS3() || (!in.RendersAnyView() && eventsInS3) {
 		// The tables themselves are in S3, or the change log in S3 is all
 		// there is: nothing here is local.
-		return sqlOutcome{}, &sqlRefusal{http.StatusConflict, sqlCopyNotLocalMessage}
+		return sqlOutcome{}, &sqlRefusal{http.StatusConflict, s.sqlNotLocalMessage(b)}
 	}
 	if !in.RendersAnyView() {
 		return sqlOutcome{}, &sqlRefusal{http.StatusConflict,
@@ -1629,7 +1632,7 @@ func (s *Server) sqlViewsFor(ctx context.Context, b *bundle, statement string, a
 	// fixed cost per statement, paid by every statement. A copy that gives
 	// no state view this way (no snapshot, or every table in a schema
 	// DuckDB keeps for itself) falls through to the archive, as before.
-	tablesOnly := viewsRequest{PinSnapshot: true, OmitEvents: true, StateOnly: true, ForStatement: true, SnapshotAt: at}
+	tablesOnly := viewsRequest{PinSnapshot: true, OmitEvents: true, StateOnly: true, ForStatement: true, LocalCopy: true, SnapshotAt: at}
 	if !sqlMentionsEvents(statement) {
 		in, err = s.buildViewsInput(ctx, b, tablesOnly)
 		if err == nil && in.RendersAnyView() {
@@ -1644,7 +1647,7 @@ func (s *Server) sqlViewsFor(ctx context.Context, b *bundle, statement string, a
 	// S3 change log is detected from the sources alone and answered with
 	// the tables, exactly as before; only a local change log is then built
 	// with the events view on.
-	in, err = s.buildViewsInput(ctx, b, viewsRequest{PinSnapshot: true, OmitEvents: true, ForStatement: true, SnapshotAt: at})
+	in, err = s.buildViewsInput(ctx, b, viewsRequest{PinSnapshot: true, OmitEvents: true, ForStatement: true, LocalCopy: true, SnapshotAt: at})
 	if err != nil {
 		return views.Input{}, false, err
 	}
@@ -1654,7 +1657,7 @@ func (s *Server) sqlViewsFor(ctx context.Context, b *bundle, statement string, a
 	if !sqlArchivesLocal(in.ArchiveSources) {
 		return in, true, nil
 	}
-	in, err = s.buildViewsInput(ctx, b, viewsRequest{PinSnapshot: true, ForStatement: true, SnapshotAt: at})
+	in, err = s.buildViewsInput(ctx, b, viewsRequest{PinSnapshot: true, ForStatement: true, LocalCopy: true, SnapshotAt: at})
 	if err != nil {
 		return views.Input{}, false, err
 	}
@@ -1694,6 +1697,26 @@ const sqlEventsLookupFailedNote = "events, the change log, is not listed: where 
 // sqlWorkerFailedMessage replaces a WorkerError on every wire: its text can
 // carry host paths, so the log gets it and the client gets this.
 const sqlWorkerFailedMessage = "the SQL worker failed before it could answer; DBTrail's log has the details"
+
+// sqlCopyMirrorNotReadyMessage is the refusal for a server whose snapshots
+// are only in S3 and whose local mirror holds none yet (#2302): the copy is
+// on its way, which "only on S3" does not say. Written for a browser and for
+// a MySQL client alike, and short: a client cuts a message at 512 bytes.
+const sqlCopyMirrorNotReadyMessage = "this server's snapshots are in S3 and the local copy SQL reads is not ready yet: " +
+	"DBTrail is bringing the newest snapshot from the bucket. Try again in a few minutes; " +
+	"if it stays like this, the DBTrail log says why under \"copy mirror\""
+
+// sqlNotLocalMessage is the refusal for a server SQL cannot read locally:
+// one that has a mirror on its way, or one that has none. "On its way" is
+// said only by a process that fills mirrors (Config.FillsCopyMirrors): the
+// read-only console and the router have the folder and nobody bringing
+// anything to it, and must not promise a download.
+func (s *Server) sqlNotLocalMessage(b *bundle) string {
+	if s.fillsCopyMirrors && b != nil && b.sqlMirrorDir != "" {
+		return sqlCopyMirrorNotReadyMessage
+	}
+	return sqlCopyNotLocalMessage
+}
 
 // sqlCopyNotLocalMessage is the 409 for a copy the worker cannot reach.
 const sqlCopyNotLocalMessage = "the copy for this server is only on S3; SQL in the browser needs a local copy"

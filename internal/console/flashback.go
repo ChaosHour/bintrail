@@ -163,7 +163,7 @@ const sqlEventsInS3PortMessage = "the change history for this server is on S3, s
 // when there is none or it cannot be read: the router's freshness input.
 // One state-only view build (snapshot discovery on disk; no index read).
 func (q *SQLOnCopy) CopyUpdatedAt(ctx context.Context) time.Time {
-	in, err := q.s.buildViewsInput(ctx, q.b, viewsRequest{PinSnapshot: true, OmitEvents: true, StateOnly: true, ForStatement: true})
+	in, err := q.s.buildViewsInput(ctx, q.b, viewsRequest{PinSnapshot: true, OmitEvents: true, StateOnly: true, ForStatement: true, LocalCopy: true})
 	if err != nil {
 		// The router forwards on a zero time; the operator still has to
 		// learn why the copy never answers.
@@ -229,7 +229,7 @@ func (s *Server) ResolveFlashback(ctx context.Context, selector string) (Flashba
 	if err != nil {
 		return FlashbackTarget{}, err
 	}
-	dir, s3 := splitBaselineSource(b.baselineSrc)
+	dir, s3 := timeTravelBaseline(b)
 	sqlOnCopy, sqlWhyNot := s.sqlOnCopyFor(b, id)
 	// The generation first, the entry second: see routedConns.gen.
 	forwardGen := s.routed.generation(id)
@@ -294,6 +294,15 @@ func (s *Server) flashbackDefaultSchema(id string) string {
 		return ""
 	}
 	return cfg.DBName
+}
+
+// timeTravelBaseline is where time travel through the port reads a server's
+// snapshots: its own location, never the local mirror SQL on the copy reads
+// (#2302). Time travel runs in this process, which can reach the bucket, and
+// asks for any moment the bucket covers; the mirror keeps the newest
+// snapshots only.
+func timeTravelBaseline(b *bundle) (dir, s3 string) {
+	return splitBaselineSource(b.baselineSrc)
 }
 
 // splitBaselineSource maps a resolved baseline source (the console bundle's

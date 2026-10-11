@@ -89,6 +89,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to match.
 
 ### Added
+- **SQL on a server whose snapshots are only on S3** (#2302). The SQL card
+  and the MySQL port refused such a server ("the copy for this server is only
+  on S3"): a statement runs in a process with no network. `bintrail-console
+  watch` now keeps a local mirror of the two newest snapshots of every such
+  server under the state directory (`copy-mirror/`) and SQL reads it: it
+  looks when the daemon starts, after each of its own uploads and every five
+  minutes; it downloads only the tables that changed since the snapshot it
+  has and links the rest; every table file and change file is checked
+  against the checksum the snapshot records for it; and nothing is downloaded
+  unless it fits with 1 GiB left free.
+  Until the first snapshot is there the refusal says the local copy is not
+  ready yet, and the daemon log says why under `copy mirror`. Recovery, time
+  travel, the Snapshots page and the downloaded `views.sql` keep reading the
+  bucket. A server that also keeps a local snapshot folder is unchanged. The
+  separate `router` service reads the mirrors the daemon keeps when it shares
+  the daemon's state volume, as it does in the bundled stack; a router on a
+  machine of its own keeps none yet.
 - **`bintrail-console router`: the MySQL-protocol port and its read routing as
   a service of its own** (#2084, experimental). Until now the port lived
   inside `bintrail-console watch`, the process that captures: restarting it
