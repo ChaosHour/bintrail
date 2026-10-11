@@ -1904,6 +1904,10 @@ func upConsoleConfigFor(db *sql.DB, indexDSN string, opts consoleOpts, reg *cons
 			Interval:  upRotateInterval,
 			AddFuture: upRotateAddFuture,
 			Enabled:   upRotationCfg.Enabled,
+			// The same bit the loop decides on (#2315): an explicit window
+			// is what every index rotates on, so the capacity projection
+			// and the rotation panel must report it, not the index record.
+			Explicit: upRotationCfg.Explicit,
 		},
 		// The Snapshots page's read-only rows (#1582):
 		// what this daemon was told, verbatim, each under the exact flag or
@@ -2037,6 +2041,12 @@ func rotationSettingsProvider(reg *console.Registry) func() rotation.Settings {
 			s, err := rotation.ParseSettings(rc.Retain, rc.Interval, rc.AddFuture, true)
 			if err == nil && s.Enabled {
 				return s
+			}
+			if err == nil {
+				// ParseSettings answers Enabled=false only for a retain of
+				// "off"/"0"/"": the console refuses to save one, so this is a
+				// hand edit. Name it rather than logging error=<nil>.
+				err = fmt.Errorf("retain %q turns rotation off, which only --rotate-retain can do", rc.Retain)
 			}
 			slog.Warn("built-in rotation: ignoring the invalid policy saved in the web interface; using daemon defaults", "error", err)
 		}

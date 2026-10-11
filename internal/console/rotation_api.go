@@ -22,8 +22,11 @@ type rotationDTO struct {
 	// on while no override is saved: each index records the retention it was
 	// created under (#1709), so the daemon's default above describes new
 	// indexes, not necessarily this one. IndexBasis says where it came from —
-	// "recorded", "legacy" or "unreadable". Both empty when an override is in
-	// force (it applies to every index) or when this console cannot ask.
+	// "recorded", "legacy" or "unreadable"; or "configured" when the operator
+	// set --rotate-retain / BINTRAIL_ROTATE_RETAIN themselves, in which case
+	// IndexRetain is that window: the loop drops every index on it and reads
+	// no record (#2315). Both empty when an override is in force (it applies
+	// to every index) or when this console cannot ask.
 	IndexRetain string `json:"index_retain,omitempty"`
 	IndexBasis  string `json:"index_basis,omitempty"`
 	// Enabled reports whether the rotation loop is actually RUNNING — false when
@@ -51,7 +54,15 @@ func (s *Server) handleRotationGet(w http.ResponseWriter, r *http.Request) {
 	// the window it was created under, so the panel has to be able to say what
 	// the selected server is actually on. Resolved here rather than in the
 	// panel: the loop's answer and the screen's must come from one function.
-	if dto.Source == "default" {
+	switch {
+	case dto.Source != "default":
+	case s.rotationDefaults.Explicit:
+		// The operator chose the window: the loop never reads the record
+		// (rotation.Settings.Explicit), so asking the index here would name a
+		// window the loop does not use — the #2315 shape: 48h recorded, 6h
+		// configured, the panel saying 48h.
+		dto.IndexRetain, dto.IndexBasis = dto.Retain, string(rotation.RetainConfigured)
+	default:
 		if b, err := s.resolve(r); err == nil && b != nil && b.db != nil {
 			if eff := rotation.ResolveEffective(r.Context(), b.db, b.dbName); eff.Retain > 0 {
 				dto.IndexRetain, dto.IndexBasis = eff.Raw, string(eff.Source)
@@ -67,9 +78,20 @@ func (s *Server) handleRotationGet(w http.ResponseWriter, r *http.Request) {
 // branches — never forced true on override presence: a daemon booted with
 // rotation off runs no loop, so a saved override is dormant until a restart and
 // the panel must keep warning, not claim it is live.
+//
+// A saved override is reported only if the loop would run it: the same
+// rotation.ParseSettings the watch command's rotationSettingsProvider applies
+// each cycle, on all three fields. A file edited by hand or written by a newer
+// build can hold an interval of "1x" or a retain of "off" beside a valid
+// retain; the loop then warns and runs the daemon defaults, so the capacity
+// projection and the panel must say the defaults too — projecting over the
+// saved retain alone was the #2315 shape from the other side (#2315 review).
 func (s *Server) effectiveRotation() rotationDTO {
 	d := s.rotationDefaults
 	if rc, ok := s.cm.reg.Rotation(); ok {
+		if st, err := rotation.ParseSettings(rc.Retain, rc.Interval, rc.AddFuture, true); err != nil || !st.Enabled {
+			return rotationDTO{Retain: d.Retain, Interval: d.Interval, AddFuture: d.AddFuture, Source: "default", Enabled: d.Enabled}
+		}
 		return rotationDTO{
 			Retain:    rc.Retain,
 			Interval:  rc.Interval,
