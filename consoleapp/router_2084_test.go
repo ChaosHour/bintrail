@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -142,6 +143,25 @@ func TestRouterSettings_refusals(t *testing.T) {
 // The port's serving configuration: routing is always on, with no maximum
 // copy age, and a busy copy refuses; a connection bound from it carries all
 // three to its handler.
+// The switch saved in the web interface decides the routing of a router that
+// follows the port's saved setting, and is not asked by one started with a
+// token, which does not read that file.
+func TestRouterPortConfig_theSavedSwitchDecides(t *testing.T) {
+	on := false
+	asked := func() bool { return on }
+	noToken := routerPortConfig(routerSettings{ServersFile: "/x/console-servers.yaml"}, asked)
+	if noToken.RouteSwitch == nil || noToken.RouteSwitch() {
+		t.Fatal("no token: the saved switch is not what decides, or reads on while it is off")
+	}
+	on = true
+	if !noToken.RouteSwitch() {
+		t.Fatal("no token: the switch is not read each time")
+	}
+	if withToken := routerPortConfig(routerSettings{ServersFile: "/x/console-servers.yaml", Token: "tok"}, asked); withToken.RouteSwitch != nil {
+		t.Fatal("with a token the saved switch is asked, though its file is not read")
+	}
+}
+
 func TestRouterFlashbackConfig_reachesTheHandler(t *testing.T) {
 	st := routerSettings{Policy: readrouter.Policy{CostThreshold: 7, ScanRows: 11}, ReadOnly: true}
 	cfg := routerFlashbackConfig(st)
@@ -218,6 +238,18 @@ func (f routerFiles) settings(token string) routerSettings {
 
 // savePortFile writes the port's saved setting as the daemon's web interface
 // does.
+// saveRouting saves the port's setting as on, with password and read routing.
+func (f routerFiles) saveRouting(t *testing.T, password string, routing bool) {
+	t.Helper()
+	body := fmt.Sprintf("version: 1\nenabled: true\npassword: %s\nrouting: %v\n", password, routing)
+	if err := os.WriteFile(f.portFile+".tmp", []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(f.portFile+".tmp", f.portFile); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (f routerFiles) savePortFile(t *testing.T, enabled bool, password string) {
 	t.Helper()
 	body := "version: 1\nenabled: false\n"
@@ -442,6 +474,15 @@ func TestRouterPort_waitsForACredentialAndFollowsIt(t *testing.T) {
 	conn2 := connectSettled(t, addr, "made-again")
 	defer conn2.Close()
 	conn = conn2
+	// Read routing turned on, then off, with the same password: who answers
+	// is decided when a connection is made, so the one made under the other
+	// setting does not stay, and the port is open again for the password.
+	for _, routing := range []bool{true, false} {
+		f.saveRouting(t, "made-again", routing)
+		waitUntil(t, "the connection made before read routing changed to be closed", func() bool { return conn.Ping() != nil })
+		conn = connectSettled(t, addr, "made-again")
+		defer conn.Close()
+	}
 	// The port turned off in the web interface: that password opens
 	// nothing any more, and the connection made with it does not stay.
 	f.savePortFile(t, false, "made-again")
@@ -568,7 +609,7 @@ func TestRouterStartupLines_sayWhatWillHappen(t *testing.T) {
 		{"a pool of one is one statement", func(u *routerStartup) { u.Pool.Workers = 1 },
 			[]string{"1 statement on the copy at once"}, []string{"1 statements"}},
 		{"no token: the web interface's password", func(u *routerStartup) { u.PortFile = "/var/lib/bintrail/console-mysql-port.yaml" },
-			[]string{"no access token was given", "/var/lib/bintrail/console-mysql-port.yaml", "only while it is on"},
+			[]string{"no access token was given", "/var/lib/bintrail/console-mysql-port.yaml", "only while it is on", "routed only when that file says so"},
 			[]string{"the password is the access token"}},
 		{"a servers file that is not there", func(u *routerStartup) { u.ServersExists, u.Servers = false, 0 },
 			[]string{"does not exist yet", "no server can be reached", "--servers-file"},

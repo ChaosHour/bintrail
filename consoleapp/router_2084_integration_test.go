@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -117,6 +118,63 @@ func TestIntegrationRouter(t *testing.T) {
 	if got := side("SELECT status FROM orders WHERE id = 3"); got != "edited" {
 		t.Errorf("after the UPDATE the lookup answered %q", got)
 	}
+
+	// A connection that asks for the copy alone ("<server>@copy") gets it,
+	// the point lookup too, while the others stay routed. By name and by id.
+	for _, who := range []string{ent.Name, ent.ID} {
+		only := openFlashback(t, addr, who+"@copy", "tok", srcName)
+		if got := scanStrings(t, only, "SELECT status FROM orders WHERE id = 1"); len(got) != 1 || got[0] != "copy" {
+			t.Errorf("a point lookup as %s@copy: %v, want the copy's row", who, got)
+		}
+		if got := scanStrings(t, only, "SHOW ROUTER STATUS"); len(got) == 0 || got[0] != "routing" {
+			t.Errorf("SHOW ROUTER STATUS as %s@copy: %v, want an answer that starts by saying routing is off here", who, got)
+		}
+		if _, err := only.Exec("UPDATE orders SET status = 'through-copy' WHERE id = 1"); err == nil {
+			t.Errorf("a write as %s@copy was accepted", who)
+		}
+		only.Close()
+	}
+	if got := side("SELECT status FROM orders WHERE id = 1"); got != "live" {
+		t.Errorf("after the copy-only connections, a routed lookup answered %q, want live: the source was written or routing was lost", got)
+	}
+	// The suffix is not a way around a name that does not exist.
+	nobody := openFlashback(t, addr, "nobody@copy", "tok", srcName)
+	if _, err := nobody.Query("SELECT 1"); err == nil || mysqlCode(err) != 1049 {
+		t.Errorf("an unknown server with the suffix: %v, want error 1049", err)
+	}
+	nobody.Close()
+
+	// The switch saved in the web interface (flashbackConfig.RouteSwitch),
+	// on a second port over the same servers: off, the copy answers every
+	// statement and nothing is forwarded; on, the lookup is MySQL's again.
+	// It is asked as each connection is made.
+	var routing atomic.Bool
+	swCfg := routerFlashbackConfig(st)
+	swCfg.RouteSwitch = routing.Load
+	swAddr := freeAddr(t)
+	swPort := &routerPort{srv: srv, addr: swAddr, cfg: swCfg, poll: 50 * time.Millisecond, out: &bytes.Buffer{}}
+	swDone := make(chan error, 1)
+	go func() { swDone <- swPort.serve(ctx) }()
+	t.Cleanup(func() { cancel(); <-swDone })
+	waitUntil(t, "the second port to open", func() bool { return swPort.listening() != "" })
+	off := openFlashback(t, swAddr, ent.Name, "tok", srcName)
+	if got := scanStrings(t, off, "SELECT status FROM orders WHERE id = 2"); len(got) != 1 || got[0] != "copy" {
+		t.Errorf("routing off, a point lookup: %v, want the copy's row", got)
+	}
+	var name, value string
+	if err := off.QueryRow("SHOW ROUTER STATUS").Scan(&name, &value); err != nil || name != "routing" || !strings.Contains(value, "read routing is turned off") {
+		t.Errorf("SHOW ROUTER STATUS with routing off: %q = %q (%v), want it to say routing is off", name, value, err)
+	}
+	if _, err := off.Exec("UPDATE orders SET status = 'while-off' WHERE id = 2"); err == nil {
+		t.Error("routing off, a write was accepted")
+	}
+	routing.Store(true)
+	on := openFlashback(t, swAddr, ent.Name, "tok", srcName)
+	if got := scanStrings(t, on, "SELECT status FROM orders WHERE id = 2"); len(got) != 1 || got[0] != "live" {
+		t.Errorf("routing on, a point lookup on a new connection: %v, want MySQL's row, untouched by the refused write", got)
+	}
+	on.Close()
+	off.Close()
 
 	// Several clients on the one server, each with expensive reads, all at
 	// once: every one is answered by the copy. Inside watch a server's

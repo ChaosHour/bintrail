@@ -358,6 +358,17 @@ func routerStatusHandler(st routerSettings, numbers func() console.RouterNumbers
 	})
 }
 
+// routerPortConfig is routerFlashbackConfig with the switch saved in the web
+// interface deciding whether statements are routed (#2341). A router
+// started with a token does not read that file, and routes.
+func routerPortConfig(st routerSettings, routingOn func() bool) flashbackConfig {
+	cfg := routerFlashbackConfig(st)
+	if routerPortFile(st) != "" {
+		cfg.RouteSwitch = routingOn
+	}
+	return cfg
+}
+
 // routerPortFile is the saved setting whose password the router accepts, ""
 // when it accepts none from it. With a token, the token decides and the file
 // is not read: that is the capture process's own rule when it is started
@@ -525,7 +536,7 @@ func routerStartupLines(u routerStartup) string {
 	if u.PortFile == "" {
 		b.WriteString("Router: the password is the access token (--token). A port password created in the web interface is not accepted here.\n")
 	} else {
-		fmt.Fprintf(&b, "Router: no access token was given, so the password is the one the web interface creates when the MySQL port is turned on there (read from %s), and the port is open only while it is on.\n", u.PortFile)
+		fmt.Fprintf(&b, "Router: no access token was given, so the password is the one the web interface creates when the MySQL port is turned on there (read from %s), and the port is open only while it is on. Statements are routed only when that file says so (routing: true); otherwise the copy answers every statement.\n", u.PortFile)
 	}
 	switch {
 	case !u.ServersExists:
@@ -609,7 +620,7 @@ func runRouter(cmd *cobra.Command, _ []string) error {
 		go exportCopySnapshots(ctx, srv.CopySnapshots, routerCopySnapshotEvery, last)
 	}
 
-	cfg := routerFlashbackConfig(st)
+	cfg := routerPortConfig(st, srv.FlashbackRoutingOn)
 	_, statErr := os.Stat(st.ServersFile)
 	fmt.Fprint(os.Stderr, routerStartupLines(routerStartup{
 		Listen: st.Listen, Pool: pool, MemoryLimit: memoryLimit, Cfg: cfg,
