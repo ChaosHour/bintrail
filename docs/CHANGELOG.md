@@ -40,9 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.103.1] - 2026-10-10
 
-The first published build of the changes listed under 0.103.0, with the
-same code. 0.103.0 was tagged and never published: no binaries, packages
-or images exist for it.
+The first published build of the changes listed under 0.103.0, which was
+tagged and has no binaries, packages or images of its own. It also carries
+two internal changes toward a MySQL port that runs as a service of its own
+(#2084), both off unless set: nothing in the console or the port behaves
+differently because of them.
 
 ### Fixed
 - **A test of the release gate counted the rows a partition listing reads**
