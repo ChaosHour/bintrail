@@ -19,6 +19,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   past this number wait their turn.
 
 ### Changed
+- **The web interface has a MySQL clients page, and the MySQL port left MCP
+  Server.** The MySQL port, read routing with the router's numbers, the
+  memory a statement may use and the Iceberg export sat under the three MCP
+  steps, where nobody looking for the `mysql` line looked. They are now on
+  **Settings → MySQL clients**, drawn rather than written: the `mysql` line
+  as a terminal line, what it is made of as four facts, the memory as
+  figures. The page is two sections so that one is not taken for the other:
+  reading your copy from a MySQL client, and read routing ("Run MySQL and
+  DuckDB on one port"), which is optional and has its own switch and a
+  drawing of where a statement goes. MCP Server keeps the token, the
+  address, the installer, the other AI clients and the DuckDB schema
+  download. In the sidebar, Settings now sits above Investigate. The old
+  `/sql` address lands on the new page, and every message and flag
+  description that sent you to MCP Server for the port now names MySQL
+  clients.
 - **A statement on the MySQL port waits for its turn on the copy for as
   long as its client stays connected.** It used to wait 30 seconds and then
   get an error (1040 with read routing on, 1203 without), so a test with
