@@ -6,6 +6,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.104.2] - 2026-10-13
+### Added
+- **The schedule form sets how often the whole database is read again.**
+  Under the interval, **Read the whole database again every**: Off, 24 h,
+  7 days or 30 days. It was only reachable through the schedule API
+  (`full_every`). The runs in between still update the copy from the recorded
+  changes without reading your database (#2380).
+- **A mismatch on a table a foreign key cascades into names the likely
+  cause.** MariaDB and MySQL before 9.6 apply `ON DELETE` / `ON UPDATE`
+  `CASCADE`, `SET NULL` and `SET DEFAULT` to the child rows without writing
+  them to the binary log, so a snapshot built from the recorded changes keeps
+  rows the database already removed. The check reported the mismatch and not
+  why. It now says so on the table's line, in `verify --explain` and at the
+  top of the Explain dialog. The verdict does not change, and a full read of
+  the database brings the snapshot back in line (#2383).
+- **The daily usage beacon says how old the install is and, once after an
+  upgrade, which version came before**, both as coarse buckets that identify
+  nobody. See `docs/TELEMETRY.md` (#2378).
+
+### Changed
+- **Read routing is now called Engine Routing** in the web interface, the
+  log, `SHOW ROUTER STATUS`, command help and the docs, and is no longer
+  labelled experimental (#2371).
+- **Snapshots: the jobs and the list of snapshots are one card**, each job on
+  the line of the snapshot it left, and a snapshot's row opens a designed
+  detail (#2381).
+- **The wait for a mismatch's row-level detail is drawn**: the table's name,
+  the two sides being compared, the time waited, and a button that says what
+  it does, Stop waiting (#2382).
+
+### Fixed
+- **The check between two saved snapshots found nothing to check on a server
+  that deletes its local snapshots by age.** It listed the local folder only,
+  so once the last full read of the database was older than the local window
+  every table came back "inconclusive: no longer kept", although the snapshot
+  was in the S3 destination. The read, and the snapshot before it, are now
+  read from S3 when the folder no longer holds them; each file is brought to
+  a temporary file for the time it is read and removed. The message for a
+  read kept in neither place says what the check needs and where it looked.
+  With `bintrail verify`, give both `--baseline-dir` and `--baseline-s3`
+  (#2379).
+- **Docker Compose: usage telemetry turned off in the web interface came back
+  on after an upgrade**, because the choice was stored inside the container.
+  Take the current `docker-compose.yml` (#2376).
+
+### Documentation
+- How far behind an Iceberg export is, with measured numbers, and DuckDB
+  slowing down on a table exported often (#2373).
 ### Changed
 - **Usage telemetry: a daemon's daily beacon now says roughly how old the
   install is, and once, which version it ran before.** Two new fields,
