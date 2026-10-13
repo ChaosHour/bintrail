@@ -227,6 +227,46 @@ live decision, so its beacons stop the moment you opt out. When a
 higher-precedence control above is in charge, the web interface shows that and defers
 to it rather than pretending to override it.
 
+### Where the choice is kept, and containers
+
+The file and the spool live in `~/.config/bintrail/`. Set
+`BINTRAIL_TELEMETRY_DIR` to an absolute path to keep them somewhere else. It
+only names a folder: it is not a consent control and cannot turn telemetry on.
+A value that is not an absolute path is refused, and telemetry stays off until
+it is fixed.
+
+That setting exists because of containers. A container's home directory is part
+of the container, so recreating the container (which is what an upgrade does)
+deletes the file, and a choice made with `telemetry off` or the web interface
+toggle is gone: telemetry is back to the default, on. The bundled
+`docker-compose.yml` sets `BINTRAIL_TELEMETRY_DIR` to a folder on its state
+volume from file version 5, so the choice survives. **With an older compose
+file, or your own container setup, a choice recorded in the file does not
+survive an upgrade.** Use `BINTRAIL_TELEMETRY=off` or `DO_NOT_TRACK=1` in the
+container's environment, which do, or set `BINTRAIL_TELEMETRY_DIR` to a path on
+a volume.
+
+**If you had turned telemetry off before taking file version 5, turn it off
+once more after that upgrade.** The earlier choice was inside the container
+that the upgrade replaces, so there is nothing to carry over; from then on it
+is kept.
+
+Each container has its own home directory, so in the bundled file the three
+long-lived services (`bintrail`, `router`, and `shim` from the `flashback`
+profile) are all given the same folder. `router` and `shim` mount the volume
+read-only: they follow the choice and report nothing themselves. With a file
+older than version 5 they read their own empty home directory, so the toggle
+in the web interface does not reach them. The one-shot services (`baseline`,
+`iceberg-export`) do not read that folder either; `BINTRAIL_TELEMETRY=off` or
+`DO_NOT_TRACK=1` in their environment is the way to turn it off there.
+
+`bintrail telemetry status` names the folder in use, and says so when
+`BINTRAIL_TELEMETRY_DIR` was refused. A daemon logs one `WARN` line for a
+refused value.
+
+The `.deb` and `.rpm` packages are not affected: their service user's home is
+`/var/lib/bintrail`, which is kept.
+
 `bintrail telemetry off` also deletes anything already spooled locally, so
 opting out does not leave earlier events sitting on your disk waiting for a
 delivery that will never come.
