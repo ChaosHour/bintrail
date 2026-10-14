@@ -175,7 +175,16 @@ func (s *baselineSupervisor) TriggerCompact(req refreshRequest, due []compactCan
 	s.postRefresh.Add(1)
 	go func() {
 		defer s.postRefresh.Done()
-		s.runCompact(req, due)
+		release, _, err := s.takeSnapshotLane(req.ServerName, "compaction")
+		if err != nil {
+			s.stoppedBeforeStart(s.compacts, req.ServerID)
+			return
+		}
+		func() {
+			defer release() // a panic in the merge must not keep the lane
+			s.runCompact(req, due)
+		}()
+		// The lane is given back before the resolve, which takes it itself.
 		// The refresh that started this job found it running when it came
 		// to write the resolved pairs, and stood aside (maybeResolve). The
 		// job leaves the newest snapshot's chains as they were, so the pairs

@@ -52,6 +52,8 @@ var checkMydumperPrivileges = func(ctx context.Context, sourceDSN string, ssl co
 // mounts the docker socket. One job at a time per server, tracked in-memory —
 // the durable record is the snapshot itself (listed by /api/baselines).
 type baselineSupervisor struct {
+	// gate is the heavy-work gate (#2385); nil is the process's heavyWork.
+	gate       *heavyGate
 	ctx        context.Context // daemon lifecycle; cancels an in-flight dump on shutdown
 	stagingDir string          // base dir for temp dump + staged Parquet (S3-destined runs)
 
@@ -118,6 +120,9 @@ type baselineSupervisor struct {
 	// written (#2231, maybeResolve), by absolute path. Not a job slot: it
 	// only keeps two runs from writing the same pairs. Guarded by mu.
 	resolving map[string]bool
+	// resolveWriting marks a folder whose resolve pass holds the snapshot
+	// lane and is writing pairs (#2385); resolving also covers one waiting.
+	resolveWriting map[string]bool
 	// resolveRetry is when a table whose pair could not be written may be
 	// tried again, keyed by resolveRetryKey. Guarded by mu.
 	resolveRetry map[string]time.Time
