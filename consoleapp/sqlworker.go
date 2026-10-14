@@ -17,7 +17,14 @@ import (
 // repeated for every query. cmd/bintrail-console calls it. A main() that
 // does not is still served by the hidden command below, one cobra dispatch
 // later.
+//
+// It also answers for the verify drill-down's child (#2385, explainchild.go),
+// so a main() that calls it first needs no second line, and whatever it
+// sets up after that call does not run again in the child.
 func RunSQLWorkerIfInvoked() {
+	if isVerifyWorkerInvocation(os.Args) {
+		os.Exit(runVerifyWorker())
+	}
 	if !sqlsandbox.IsWorkerInvocation(os.Args) {
 		return
 	}
