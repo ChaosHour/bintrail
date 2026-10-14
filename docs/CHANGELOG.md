@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.104.3] - 2026-10-14
+### Fixed
+- **The bundled index no longer grows until it is killed for memory**
+  (#2385). After every refresh, a statement read the newest row of every
+  hourly partition. It named `binlog_events` once per partition, up to
+  250 times. MySQL opens a copy of the table for each name, every copy
+  carries every partition, and the copies stay in the table cache. On an
+  index with about 200 partitions the index `mysqld` grew by about 30 MB a
+  minute and was killed at 6.3 GB on an 8 GB host after 19 hours, which
+  stopped capture for a few minutes. The statement now reads 16 partitions
+  at a time. Measured with 200 partitions: from 3,200 cached copies and
+  1.9 GB down to 256 copies and 150 MB (#2394).
+- **A check, an Explain, a snapshot update and a compaction can run
+  together on an 8 GB host without the daemon being killed** (#2385).
+  - Heavy work now takes turns (#2389). Snapshot work (the fold of an
+    update or a restore, a compaction, an SQL export) runs one job at a
+    time and never waits behind a check. A check runs one table at a time,
+    as does an Explain, and gives way to snapshot work. A waiting check
+    says so on the page. A full read is not queued: it starts when the
+    schedule says.
+  - Each DuckDB session's memory comes from the host instead of a fixed
+    4 GB (#2390). 40% of the host goes to heavy work. On an 8 GB host that
+    is about 1 GB per snapshot session and 500 MB per check session. A
+    session never gets less than 512 MB or more than 4 GB.
+  - Explain no longer holds the table in memory (#2386). It compares the
+    two sides in DuckDB, under a memory cap, spilling to disk.
+  - Measured on an 8 GB host with a 3-million-row table, a check, an
+    Explain, refreshes every minute and a compaction at once:
+    `bintrail-console` peaked at 852 MB and the index at 709 MB. Nothing
+    was killed.
+- **DuckDB sessions no longer share a spill directory** (#2387). Two
+  sessions spilling at once used the same file names, and the queries
+  failed with "Could not read enough bytes" or hung. Each session now
+  spills into a private directory of its own. The directory is removed when
+  the session closes, and a process killed mid-spill has its directory
+  removed by the next process that starts (#2388).
+
 ## [0.104.2] - 2026-10-13
 ### Added
 - **The schedule form sets how often the whole database is read again.**
