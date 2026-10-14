@@ -3,9 +3,14 @@ package duckdbutil
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
@@ -88,9 +93,9 @@ func TestSetTempDirectory(t *testing.T) {
 	SetTempDirectory(context.Background(), db)
 
 	got := currentSetting(t, db, "temp_directory")
-	want := os.TempDir()
-	if got != want && !strings.HasPrefix(got, want) {
-		t.Fatalf("temp_directory after SetTempDirectory = %q, want it based on os.TempDir() (%q)", got, want)
+	want := filepath.Join(os.TempDir(), spillDirPrefix)
+	if !strings.HasPrefix(got, want) {
+		t.Fatalf("temp_directory after SetTempDirectory = %q, want a directory of its own under os.TempDir() (%q*)", got, want)
 	}
 	if got == "" || got == ".tmp" {
 		t.Fatalf("temp_directory after SetTempDirectory = %q, want it NOT DuckDB's CWD-relative default", got)
@@ -123,4 +128,168 @@ func assertUsable(t *testing.T, db *sql.DB) {
 	if err := db.QueryRow("SELECT 1").Scan(&one); err != nil || one != 1 {
 		t.Fatalf("session unusable after Apply: %v (got %d)", err, one)
 	}
+}
+
+// TestSetTempDirectory_ownDirPerSession pins #2387: DuckDB names spill files
+// by block size only, so two sessions sharing a directory overwrite each
+// other's. Two sessions spilling at once must both get the right answer, and
+// each session's directory must be gone once it closes.
+func TestSetTempDirectory_ownDirPerSession(t *testing.T) {
+	// Sessions colliding in one directory can also hang inside DuckDB, where
+	// the deadline does not reach: a regression may show as the go test
+	// timeout rather than as these assertions.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	const n = 3_000_000
+	dirs := make([]string, 2)
+	errs := make([]error, 2)
+	counts := make([]int64, 2)
+	var wg sync.WaitGroup
+	for i := range 2 {
+		db, err := sql.Open("duckdb", filepath.Join(t.TempDir(), "s.duckdb"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.SetMaxOpenConns(1)
+		Tuning{Threads: 2, MemoryLimit: "64MB"}.Apply(ctx, db)
+		SetTempDirectory(ctx, db)
+		dirs[i] = currentSetting(t, db, "temp_directory")
+		for _, stmt := range []string{
+			fmt.Sprintf("CREATE TABLE a AS SELECT i AS k1, hash(i) AS k2 FROM range(%d) t(i)", n),
+			fmt.Sprintf("CREATE TABLE b AS SELECT i AS k1, hash(i) AS k2 FROM range(%d) t(i)", n),
+		} {
+			if _, err := db.ExecContext(ctx, stmt); err != nil {
+				t.Fatal(err)
+			}
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer db.Close()
+			for range 3 {
+				if errs[i] = db.QueryRowContext(ctx, "SELECT count(*) FROM a JOIN b ON a.k1 = b.k1 AND a.k2 = b.k2").Scan(&counts[i]); errs[i] != nil || counts[i] != n {
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if dirs[0] == dirs[1] {
+		t.Errorf("two sessions share the spill directory %s", dirs[0])
+	}
+	for i := range 2 {
+		if errs[i] != nil || counts[i] != n {
+			t.Errorf("session %d: count=%d err=%v, want %d", i, counts[i], errs[i], n)
+		}
+		if _, err := os.Stat(dirs[i]); !os.IsNotExist(err) {
+			t.Errorf("session %d spill directory %s still there after close: %v", i, dirs[i], err)
+		}
+	}
+}
+
+// TestSetTempDirectory_privateProcessDir: the sessions' directories sit in
+// one per-process directory only its owner can enter, so no other user can
+// read spilled rows or create a session's directory first.
+func TestSetTempDirectory_privateProcessDir(t *testing.T) {
+	db := openDuckDB(t)
+	SetTempDirectory(context.Background(), db)
+	got := currentSetting(t, db, "temp_directory")
+	parent := filepath.Dir(got)
+	if parent != spillRoot || spillRoot == "" {
+		t.Fatalf("session dir %s not under the process dir %q", got, spillRoot)
+	}
+	fi, err := os.Stat(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o700 {
+		t.Errorf("process spill dir mode = %v, want 0700", fi.Mode().Perm())
+	}
+	if h, pid, ok := parseSpillDirName(filepath.Base(parent)); !ok || h != spillHost() || pid != os.Getpid() {
+		t.Errorf("process spill dir %s: host %q pid %d ok %v", parent, h, pid, ok)
+	}
+}
+
+// TestRemoveDeadSpillDirs: on this host, a spill directory whose process is
+// gone, or an earlier one with this process's pid, is removed; a live
+// process's, another host's, and anything not named like one stay.
+func TestRemoveDeadSpillDirs(t *testing.T) {
+	dir := t.TempDir()
+	me := os.Getpid()
+	dead := deadPid(t)
+	name := func(host string, pid int) string {
+		return fmt.Sprintf("%s%s-%d-%s", spillDirPrefix, host, pid, "123456")
+	}
+	mk := func(n string) string {
+		p := filepath.Join(dir, n)
+		if err := os.MkdirAll(filepath.Join(p, "1"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	gone := []string{
+		mk(name("box-a", dead)),
+		mk(name("box-a", me)), // an earlier process that had this pid
+	}
+	stay := []string{
+		mk(name("box-a", os.Getppid())),
+		mk(name("box-b", dead)), // another container's; its pids mean nothing here
+		mk(spillDirPrefix + "box-a-x-1"),
+		mk("something-else"),
+	}
+	file := filepath.Join(dir, name("box-a", dead)+"0")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stay = append(stay, file)
+
+	removeDeadSpillDirs(dir, "box-a")
+	for _, p := range gone {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s should be removed: %v", filepath.Base(p), err)
+		}
+	}
+	for _, p := range stay {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s should stay: %v", filepath.Base(p), err)
+		}
+	}
+}
+
+func TestParseSpillDirName(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		host string
+		pid  int
+		ok   bool
+	}{
+		{spillDirPrefix + "box-42-123", "box", 42, true},
+		{spillDirPrefix + "ip-10-0-0-1-42-987", "ip-10-0-0-1", 42, true},
+		{spillDirPrefix + "box-42-", "", 0, false},
+		{spillDirPrefix + "box-42", "", 0, false},
+		{spillDirPrefix + "-42-123", "", 0, false},
+		{spillDirPrefix + "box-0-123", "", 0, false},
+		{spillDirPrefix + "box-x-123", "", 0, false},
+		{spillDirPrefix + "42-123", "", 0, false},
+		{"other-box-42-123", "", 0, false},
+	} {
+		host, pid, ok := parseSpillDirName(tc.name)
+		if host != tc.host || pid != tc.pid || ok != tc.ok {
+			t.Errorf("parseSpillDirName(%q) = %q, %d, %v; want %q, %d, %v", tc.name, host, pid, ok, tc.host, tc.pid, tc.ok)
+		}
+	}
+}
+
+// deadPid returns the pid of a process that has exited.
+func deadPid(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Skipf("cannot run a short-lived process: %v", err)
+	}
+	pid := cmd.Process.Pid
+	if processAlive(pid) {
+		t.Skipf("pid %d was reused", pid)
+	}
+	return pid
 }
