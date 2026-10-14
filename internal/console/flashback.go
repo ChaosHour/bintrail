@@ -91,6 +91,8 @@ type SQLOnCopy struct {
 	user string
 	// id is the server's registry id (the boot id for the daemon's own).
 	id string
+	// last is what answered the connection's last statement (#2369).
+	last lastAnswerState
 }
 
 // Run runs one statement; schema is where unqualified names resolve (the
@@ -109,6 +111,7 @@ func (q *SQLOnCopy) Run(ctx context.Context, statement, schema string, sess sqls
 		// must not wait in line for the copy first. The statement's own
 		// tables are asked about once the worker has parsed it.
 		if why := captureBehind(q.s.captureWatermarkFor(ctx, q.id, q.b), time.Now(), sess.UnchangedWithin); why != "" {
+			q.noteCopyRefused()
 			return sqlsandbox.Result{}, &sqlsandbox.MayHaveChangedError{Reason: why}
 		}
 		unchanged = func(ctx context.Context, tables []views.BaselineTable) string {
@@ -117,6 +120,7 @@ func (q *SQLOnCopy) Run(ctx context.Context, statement, schema string, sess sqls
 	}
 	out, err := q.s.runSQLVouched(ctx, q.b, q.user, statement, schema, q.s.sqlPortRowCap(), sess, unchanged)
 	if err != nil {
+		q.noteCopyRefused()
 		var werr *sqlsandbox.WorkerError
 		var refusal *sqlRefusal
 		var star *sqlStarRefusal
@@ -144,6 +148,7 @@ func (q *SQLOnCopy) Run(ctx context.Context, statement, schema string, sess sqls
 		}
 		return sqlsandbox.Result{}, err
 	}
+	q.noteCopyAnswer(out.ReadFrom, out.ReadFromOK, time.Now())
 	out.Result.Note = out.OlderCopyNote
 	return out.Result, nil
 }
