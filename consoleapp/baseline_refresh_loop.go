@@ -1530,7 +1530,8 @@ func applyFoldStatus(st *console.BaselineStatus, tables, refused int, reuse reus
 //
 // The zero value is NOT uniformly the safe choice on that struct, which is the
 // trap this note used to leave open. It is safe for the DuckDB budgets and the
-// archive fetcher, where zero resolves to the container-safe default. It is the
+// archive fetcher, where zero resolves to the snapshot lane's budget on the
+// fold's context (laneCtx, #2385), or the container-safe default. It is the
 // OPPOSITE for Parallelism (zero means runtime.NumCPU()) and for
 // WarnEventThreshold (zero means the volume warning never fires). Those two are
 // therefore set explicitly in refreshFoldConfig; see the constants above it.
@@ -1800,7 +1801,7 @@ func (s *baselineSupervisor) foldSnapshot(req refreshRequest, at time.Time, tabl
 	}
 	reports, failures, runErr := func() ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
 		defer release() // deferred: a panic in the fold must not keep the lane
-		return foldTables(s.ctx, refreshFoldConfig(req, at, tableList))
+		return foldTables(laneCtx(s.ctx, laneSnapshot), refreshFoldConfig(req, at, tableList))
 	}()
 	if req.s3Copies != nil {
 		req.s3Copies.files = reconstruct.S3Copies(reports)

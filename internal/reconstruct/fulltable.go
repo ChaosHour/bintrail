@@ -345,6 +345,8 @@ type FullTableConfig struct {
 	// RAM regardless of any --ultrafast/--duckdb-* flag the caller set. The
 	// CLI sets this to the same resolved Tuning it hands ArchiveFetcher, so an
 	// explicit operator flag is honored here too, not just on archive reads.
+	// Under the daemon the zero value takes the job's budget from ctx first
+	// (duckdbutil.WithSessionTuning, #2385), sized from the host.
 	DuckDBTuning duckdbutil.Tuning
 }
 
@@ -356,8 +358,15 @@ type FullTableConfig struct {
 // host-greedy budget passes duckdbutil.Ultrafast() (which sets S3Direct, so it
 // is never the zero value) or any other explicit non-zero Tuning.
 func effectiveDuckDBTuning(t duckdbutil.Tuning) duckdbutil.Tuning {
+	return effectiveDuckDBTuningFor(context.Background(), t)
+}
+
+// effectiveDuckDBTuningFor is effectiveDuckDBTuning with the zero value
+// falling back to the budget the caller's job put on ctx
+// (duckdbutil.WithSessionTuning, #2385) before DefaultTuning.
+func effectiveDuckDBTuningFor(ctx context.Context, t duckdbutil.Tuning) duckdbutil.Tuning {
 	if t == (duckdbutil.Tuning{}) {
-		return duckdbutil.DefaultTuning()
+		return duckdbutil.DefaultTuningFor(ctx)
 	}
 	return t
 }
@@ -369,7 +378,7 @@ func effectiveDuckDBTuning(t duckdbutil.Tuning) duckdbutil.Tuning {
 // DuckDB session this package opens for the merge/baseline path goes through
 // this single call so the pairing can't be forgotten at a future call site.
 func applyDuckDBTuning(ctx context.Context, db *sql.DB, t duckdbutil.Tuning) {
-	effectiveDuckDBTuning(t).Apply(ctx, db)
+	effectiveDuckDBTuningFor(ctx, t).Apply(ctx, db)
 	duckdbutil.SetTempDirectory(ctx, db)
 }
 
