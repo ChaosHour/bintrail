@@ -814,6 +814,11 @@ type sqlOutcome struct {
 	// the views that ran; ReadFromOK is false when that cannot be told.
 	ReadFrom   map[string][]string
 	ReadFromOK bool
+	// TailThrough is the oldest instant the tails the statement read are
+	// indexed through (#2369), zero when it read none; AllTailed says every
+	// table it read had one, so the published copy's cut does not bound it.
+	TailThrough time.Time
+	AllTailed   bool
 }
 
 // runSQL is POST /api/sql without the HTTP: the gates that need the copy
@@ -1062,6 +1067,23 @@ func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schem
 			fmt.Sprintf("the copy directory %s contains the console's own configuration (%s), so SQL cannot run over it; "+
 				"point this server's snapshot directory at a directory that holds only snapshots", dir, filepath.Base(file))}
 	}
+	// The port's statements read the tables' tails (#2369), over the
+	// newest copy only: an earlier one's cut is not the one they follow.
+	var tails *tailKeeper
+	// A copy with no index connection has nothing to read them from.
+	if id, ok := tailsFor(ctx); ok && at.IsZero() && b.db != nil && !tailsOff() {
+		tails = s.tailKeeperFor(id, b)
+	}
+	if tails != nil {
+		if dir, err := tails.ensureDir(); err != nil {
+			tails.note(fmt.Errorf("the tails' directory: %w", err))
+			tails = nil
+		} else {
+			copyDirs = append(copyDirs, dir)
+		}
+	}
+	var tailThrough time.Time
+	var allTailed bool
 	var copyUpdatedAt *time.Time
 	if !in.BaselineSnapshot.IsZero() {
 		at := in.BaselineSnapshot.UTC()
@@ -1105,6 +1127,12 @@ func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schem
 			named := sqlNamedTables(in, refs)
 			if readTables = named; narrowed.OnlyViews == nil {
 				readTables = in.Baselines
+			}
+			// Not over a statement whose tables the parse could not tell: it
+			// would build a tail for every table of the copy.
+			if tails != nil && narrowed.OnlyViews != nil {
+				narrowed.Baselines, tailThrough, allTailed = s.statementTails(ctx, tails, narrowed.Baselines, readTables)
+				allTailed = tailsSayTheInstant(statement, allTailed)
 			}
 			if h := sqlChainTooHeavy(named, limit, sqlFileSize); h.Table != "" {
 				viewsRefusal = &sqlRefusal{http.StatusUnprocessableEntity, sqlChainTooHeavyMessage(h, limit, memory)}
@@ -1188,7 +1216,7 @@ func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schem
 	}
 	readFrom, readFromOK := copyReadFrom(in, readTables)
 	return sqlOutcome{Result: res, CopyUpdatedAt: copyUpdatedAt, ViewBuild: viewBuild, SlotWait: slotWait,
-		ReadFrom: readFrom, ReadFromOK: readFromOK}, nil
+		ReadFrom: readFrom, ReadFromOK: readFromOK, TailThrough: tailThrough, AllTailed: allTailed}, nil
 }
 
 // sqlWantedViews decides which of the copy's views a statement needs, from

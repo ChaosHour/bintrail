@@ -33,6 +33,12 @@ type fakeIndex struct {
 	fills, pages int
 	sinceTables  []string
 	writeErr     error
+	// sinceFails fails Since after handing out that many pages; sinceFrom
+	// is the cursor the last Since started after. fillWait blocks Fill for
+	// a table until its context ends (a read that runs out of time).
+	sinceFails int
+	sinceFrom  uint64
+	fillWait   map[string]bool
 }
 
 const fakePage = 2
@@ -73,8 +79,13 @@ func (f *fakeIndex) hand(evs []query.ResultRow, page func([]query.ResultRow) err
 	return nil
 }
 
-func (f *fakeIndex) Fill(_ context.Context, t views.BaselineTable, upTo uint64, page func([]query.ResultRow) error) (string, error) {
+func (f *fakeIndex) Fill(ctx context.Context, t views.BaselineTable, upTo uint64, page func([]query.ResultRow) error) (string, error) {
 	key := tailKey(t.Schema, t.Table)
+	if f.fillWait[key] {
+		delete(f.fillWait, key) // once: a retry must not hang the test
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
 	if err := f.fillErr[key]; err != nil {
 		delete(f.fillErr, key)
 		return "", err
@@ -97,7 +108,7 @@ func (f *fakeIndex) Since(_ context.Context, tables []views.BaselineTable, from,
 		return f.sinceErr
 	}
 	want := map[string]bool{}
-	f.sinceTables = nil
+	f.sinceTables, f.sinceFrom = nil, from
 	for _, t := range tables {
 		want[tailKey(t.Schema, t.Table)] = true
 		f.sinceTables = append(f.sinceTables, t.Table)
@@ -107,6 +118,13 @@ func (f *fakeIndex) Since(_ context.Context, tables []views.BaselineTable, from,
 		if want[tailKey(ev.SchemaName, ev.TableName)] && ev.EventID > from && ev.EventID <= upTo {
 			evs = append(evs, ev)
 		}
+	}
+	if f.sinceFails > 0 {
+		n := min(len(evs), f.sinceFails*fakePage)
+		if err := f.hand(evs[:n], page); err != nil {
+			return err
+		}
+		return context.DeadlineExceeded
 	}
 	return f.hand(evs, page)
 }
@@ -193,6 +211,7 @@ func TestTailKeeper(t *testing.T) {
 	newKeeper := func(f *fakeIndex) *tailKeeper {
 		k := newTailKeeper(f, t.TempDir(), 3, time.Minute, time.Hour)
 		k.now = func() time.Time { return clock }
+		k.minBuild = 0
 		return k
 	}
 	refresh := func(t *testing.T, k *tailKeeper, tables ...views.BaselineTable) map[string]tailView {
@@ -321,6 +340,121 @@ func TestTailKeeper(t *testing.T) {
 		}
 		if got := refresh(t, k, newerCut(orders)); got[ko].Path == before[ko].Path {
 			t.Error("the rebuild was not retried")
+		}
+	})
+
+	t.Run("a read that runs out of time keeps the pages it folded; the next goes on after them", func(t *testing.T) {
+		f := &fakeIndex{}
+		f.add("orders", "1")
+		k := newKeeper(f)
+		refresh(t, k, orders)
+		for _, key := range []string{"2", "2", "2", "2", "2"} {
+			f.add("orders", key)
+		}
+		f.sinceFails = 1 // one page of two events, then out of time
+		if _, err := k.refresh(ctx, []views.BaselineTable{orders}); err == nil {
+			t.Fatal("a read that ran out of time gave tails")
+		}
+		f.sinceFails = 0
+		got := refresh(t, k, orders)
+		if f.sinceFrom != 3 {
+			t.Errorf("the next read started after event %d, want 3: the folded page was read again", f.sinceFrom)
+		}
+		if fileKeys(t, got[ko].Path) != 2 || !got[ko].Through.Equal(f.at(6)) {
+			t.Errorf("%+v", got[ko])
+		}
+	})
+
+	t.Run("a first read that runs out of time: no tail until the next cut, and the others are not judged on it", func(t *testing.T) {
+		f := &fakeIndex{fillWait: map[string]bool{ko: true}}
+		f.add("orders", "1")
+		f.add("customers", "9")
+		k := newKeeper(f)
+		short, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+		defer cancel()
+		got, err := k.refresh(short, []views.BaselineTable{orders, customers})
+		if err != nil || len(got) != 0 {
+			t.Fatalf("%+v %v", got, err)
+		}
+		if e := k.tables[kc]; e != nil {
+			t.Errorf("a table the statement had no time left for was judged: %+v", e)
+		}
+		got = refresh(t, k, orders, customers)
+		if _, ok := got[ko]; ok {
+			t.Errorf("a table that ran out of time is read again at every statement: %+v", got[ko])
+		}
+		if _, ok := got[kc]; !ok {
+			t.Error("the other table has no tail at the next statement")
+		}
+		f.cuts = map[string]uint64{}
+		if _, ok := refresh(t, k, newerCut(orders))[ko]; !ok {
+			t.Error("not built again over its next cut")
+		}
+	})
+
+	t.Run("a rebuild that runs out of time keeps the advancing tail it had, over the newer cut", func(t *testing.T) {
+		f := &fakeIndex{}
+		f.add("orders", "1")
+		k := newKeeper(f)
+		before := refresh(t, k, orders)
+		f.fillWait = map[string]bool{ko: true}
+		short, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+		defer cancel()
+		if got, err := k.refresh(short, []views.BaselineTable{newerCut(orders)}); err != nil || got[ko].Path != before[ko].Path {
+			t.Fatalf("the tail it had was dropped: %+v %v", got[ko], err)
+		}
+		fills := f.fills
+		if got := refresh(t, k, newerCut(orders)); got[ko].Path != before[ko].Path || f.fills != fills {
+			t.Errorf("rebuilt again at every statement: %+v, %d fills", got[ko], f.fills-fills)
+		}
+	})
+
+	t.Run("a table left too little time by the others waits for the next statement, unjudged", func(t *testing.T) {
+		f := &fakeIndex{fillWait: map[string]bool{ko: true}}
+		f.add("orders", "1")
+		k := newKeeper(f)
+		k.minBuild = time.Hour
+		short, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		if got, err := k.refresh(short, []views.BaselineTable{orders}); err != nil || len(got) != 0 {
+			t.Fatalf("%+v %v", got, err)
+		}
+		if e := k.tables[ko]; e != nil || !f.fillWait[ko] {
+			t.Fatalf("started on a remainder, or judged on it: %+v", e)
+		}
+	})
+
+	t.Run("the time to refresh is counted from when the keeper is the statement's", func(t *testing.T) {
+		f := &fakeIndex{fillWait: map[string]bool{ko: true}}
+		f.add("orders", "1")
+		k := newKeeper(f)
+		k.mu.Lock()
+		go func() { time.Sleep(100 * time.Millisecond); k.mu.Unlock() }()
+		if _, err := k.refreshWithin(ctx, 50*time.Millisecond, []views.BaselineTable{orders}); err != nil {
+			t.Fatal(err)
+		}
+		if e := k.tables[ko]; e == nil || f.fillWait[ko] {
+			t.Fatalf("the wait for another statement was spent from this one's time: %+v", e)
+		}
+	})
+
+	t.Run("a version written over an older cut is not laid over a newer one", func(t *testing.T) {
+		f := &fakeIndex{fillErr: map[string]error{}}
+		f.add("orders", "1")
+		k := newKeeper(f)
+		before := refresh(t, k, orders)
+		if before[ko].Path == "" {
+			t.Fatal("no version written")
+		}
+		f.add("orders", "2")
+		f.fillErr[ko] = errors.New("timeout") // the rebuild fails: the advancing tail stays
+		f.writeErr = errors.New("disk full")  // and its newer version cannot be written
+		if got := refresh(t, k, newerCut(orders)); len(got) != 0 {
+			t.Fatalf("a version of the older cut over the newer one: %+v", got[ko])
+		}
+		f.writeErr = nil
+		if got := refresh(t, k, newerCut(orders)); got[ko].Path == "" {
+			t.Error("no version once it could be written")
 		}
 	})
 
