@@ -15409,6 +15409,22 @@ function routerSecs(sec) {
   if (s < 60) return s.toFixed(1).replace(/\.0$/, "") + " s";
   return plainDuration(s);
 }
+// routerBehindWords says a lag in words, in its two largest units, the
+// smaller ROUNDED UP: a lag is never said smaller than it was ("3 seconds",
+// "1 minute 29 seconds", "1 hour 30 minutes", "2 days 10 hours").
+function routerBehindWords(sec) {
+  const s = Math.max(0, Math.ceil(Number(sec) || 0));
+  const say = (n, unit) => n + " " + unit + (n === 1 ? "" : "s");
+  const two = (big, bigUnit, small, smallUnit) => {
+    let b = Math.floor(s / big), r = Math.ceil((s - b * big) / small);
+    if (r * small >= big) { b++; r = 0; }
+    return say(b, bigUnit) + (r ? " " + say(r, smallUnit) : "");
+  };
+  if (s < 60) return say(s, "second");
+  if (s < 3600) return two(60, "minute", 1, "second");
+  if (s < 86400) return two(3600, "hour", 60, "minute");
+  return two(86400, "day", 3600, "hour");
+}
 function routerSidesModel(view, cur) {
   if (!view || !view.configured || view.error || !view.status || !cur) return null;
   const t = view.status.servers && view.status.servers[cur.id];
@@ -15428,16 +15444,28 @@ function routerSidesModel(view, cur) {
     };
   };
   const out = { mysql: side("mysql", mysql), copy: side("copy", copy), refused: refused, total: mysql + copy,
-    share: mysql + copy > 0 ? copy / (mysql + copy) : 0, age: "" };
-  // The copy's age by the clock of the DBTrail that asked, as routerLines.
-  const read = view.read_at ? new Date(view.read_at) : null;
-  const snap = t.copy_snapshot ? new Date(t.copy_snapshot) : null;
-  // Only from a reading the router made, and made lately: before its first
-  // reading, or once it has stopped looking (routerStaleAfterSec), the age
-  // is not drawn as a fact. routerLines says both in words.
-  const looked = view.status.copy_snapshots_read_at ? new Date(view.status.copy_snapshots_read_at) : null;
-  const fresh = looked && !isNaN(looked) && read && !isNaN(read) && (read - looked) / 1000 <= routerStaleAfterSec;
-  if (fresh && snap && !isNaN(snap)) out.age = fmtAge(Math.max(0, (read - snap) / 1000));
+    share: mysql + copy > 0 ? copy / (mysql + copy) : 0, data: null };
+  // How far behind capture the copy's data was (#2369): the last answer's,
+  // when it ran, and the worst since counting began, as the router measured
+  // them. Not the snapshot's age: with tails the copy answers newer than its
+  // snapshot, and two ages for one copy would contradict each other (the
+  // snapshot's stays in routerLines' words). No data_as_of with answers
+  // counted: the last one's is unknown, which is said, never the worst.
+  if (copy > 0) {
+    const asOf = t.data_as_of ? new Date(t.data_as_of) : null;
+    const age = Number(t.data_age_seconds), worst = Number(t.data_age_max_seconds);
+    const known = asOf && !isNaN(asOf) && t.data_age_seconds != null && isFinite(age) && age >= 0;
+    out.data = {
+      state: known ? "known" : "unknown",
+      age: known ? routerBehindWords(age) : "",
+      at: known ? asOf : null,
+      worst: t.data_age_max_seconds != null && isFinite(worst) && worst >= 0 ? routerBehindWords(worst) : "",
+      // Answers whose lag could not be told: the max cannot include them.
+      unknown: Math.max(0, Number(t.data_age_unknown) || 0),
+      pending: !known && t.data_age_pending === true,
+      why: String(t.data_age_unknown_reason || ""),
+    };
+  }
   const since = view.status.counting_since ? new Date(view.status.counting_since) : null;
   out.since = since && !isNaN(since) ? since : null;
   return out;
@@ -15454,15 +15482,22 @@ function routerSides(m) {
     c.append(el("div", { class: "rs-k", title: ROUTER_SIDE_HELP[s.key] }, el("i", { class: "rs-dot" }), title));
     c.append(el("div", { class: "rs-fig" }, el("span", { class: "rs-num", text: trendCount(s.sent) }), el("span", { class: "rs-unit", text: s.sent === 1 ? "statement" : "statements" })));
     const facts = el("div", { class: "rs-facts" });
+    if (s.key === "copy" && s.sent > 0) facts.append(el("span", { class: "rs-fact" }, "Your MySQL did not have to run " + (s.sent === 1 ? "it" : "these")));
     if (s.avg) facts.append(el("span", { class: "rs-fact" }, el("b", { text: s.avg }), " each"));
     if (s.slowest) facts.append(el("span", { class: "rs-fact" }, "slowest ", el("b", { text: s.slowest })));
     if (s.errors) facts.append(el("span", { class: "rs-fact bad" }, el("b", { text: String(s.errors) }), s.errors === 1 ? " error" : " errors",
       s.timeouts ? " (" + s.timeouts + " out of time)" : ""));
-    if (s.key === "copy" && m.age) facts.append(el("span", { class: "rs-fact" }, "data ", el("b", { text: m.age }), " old"));
+    if (s.key === "copy" && m.data) {
+      const d = m.data;
+      if (d.state === "known") facts.append(el("span", { class: "rs-fact", title: "Its data reached " + d.at.toLocaleString() }, "Lag: ", el("b", { text: d.age }), " (last answer)"));
+      else if (d.pending) facts.append(el("span", { class: "rs-fact", title: "The router works out the lag of an answer over a snapshot within 30 seconds. Refresh to see it." }, "Lag: ", el("b", { text: "being worked out" }), " (last answer)"));
+      else facts.append(el("span", { class: "rs-fact", title: d.why ? "Why: " + d.why + "." : "The router could not tell how far behind it was." }, "Lag: ", el("b", { text: "unknown" }), " (last answer)"));
+      if (d.worst) facts.append(el("span", { class: "rs-fact", title: d.unknown ? d.unknown + (d.unknown === 1 ? " answer's lag" : " answers' lag") + " could not be told, so the max may be higher." : "" }, "Max lag: ", d.unknown ? "at least " : "", el("b", { text: d.worst })));
+    }
     c.append(facts);
     return c;
   };
-  wrap.append(el("div", { class: "rs-cols" }, col(m.mysql, "Your MySQL"), col(m.copy, "DBTrail's copy")));
+  wrap.append(el("div", { class: "rs-cols" }, col(m.mysql, "Answered by your MySQL"), col(m.copy, "Answered by DBTrail's copy")));
   if (m.total > 0) {
     const pct = Math.round(m.share * 100);
     const bar = el("div", { class: "rs-bar", role: "img", "aria-label": "The copy answered " + pct + "% of the statements" });
@@ -15470,7 +15505,8 @@ function routerSides(m) {
     wrap.append(bar);
   }
   const foot = [];
-  if (m.since) foot.push("since " + m.since.toLocaleString());
+  if (m.total > 0) foot.push("The copy answered " + Math.round(m.share * 100) + "% of the statements");
+  if (m.since) foot.push("counted since " + m.since.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) + ", when the router started");
   if (m.refused) foot.push(m.refused + " refused, run by neither");
   if (foot.length) wrap.append(el("div", { class: "rs-foot", text: foot.join(" · ") }));
   return wrap;

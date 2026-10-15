@@ -368,6 +368,40 @@ func routerStatus(st routerSettings, numbers console.RouterNumbers, last *router
 	return doc
 }
 
+// routerStatusResolveBudget is how long the status document waits for the
+// copy answers' lag to be placed before it answers with what is known:
+// well under what the web interface waits for the whole document, so a
+// slow index never makes a live router look down.
+const routerStatusResolveBudget = 750 * time.Millisecond
+
+// resolveCopyAgesFirst places what it can of the copy answers' lag, within
+// routerStatusResolveBudget of the request, then serves next.
+func resolveCopyAgesFirst(resolve func(context.Context), next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), routerStatusResolveBudget)
+		resolve(ctx)
+		cancel()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// resolveCopyAgesEvery calls resolve every so often until ctx ends.
+func resolveCopyAgesEvery(ctx context.Context, resolve func(context.Context), every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			// Bounded: a hung index must not hold the next call off forever.
+			rctx, cancel := context.WithTimeout(ctx, every)
+			resolve(rctx)
+			cancel()
+		}
+	}
+}
+
 // routerStatusHandler serves the document. numbers is read on every request.
 func routerStatusHandler(st routerSettings, numbers func() console.RouterNumbers, last *routerCopySnapshots) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -811,10 +845,14 @@ func runRouter(cmd *cobra.Command, _ []string) error {
 	if !startedWithMemory {
 		go followRouterMemory(ctx, sqlSettingsFilePath(st.ServersFile), st.SQLMemory, routerMemoryEvery, slog.Warn)
 	}
+	// The copy answers' lag is placed in the index here, every 30 seconds,
+	// never by a statement (#2369); with or without a status document, so
+	// what waits on it does not pile up.
+	go resolveCopyAgesEvery(ctx, srv.ResolveCopyAges, routerCopySnapshotEvery)
 	if st.MetricsAddr != "" {
 		last := &routerCopySnapshots{}
 		stopMetrics, err := streamrun.StartMetricsServerWith(st.MetricsAddr, map[string]http.Handler{
-			"GET " + routerStatusPath: routerStatusHandler(st, srv.RouterNumbers, last),
+			"GET " + routerStatusPath: resolveCopyAgesFirst(srv.ResolveCopyAges, routerStatusHandler(st, srv.RouterNumbers, last)),
 		})
 		if err != nil {
 			// Not a reason to leave the MySQL port closed: the numbers are
