@@ -154,6 +154,47 @@ func StartLoop(ctx context.Context, settings func() Settings, targets func() []R
 		// counters each reset while the other condition fires, so an index
 		// alternating defer/fail would never escalate.
 		var unhealthyStreak int
+		// rotated holds every index DSN a cycle has asked about since start.
+		// The targets provider can return more later: the console's servers
+		// come up after the first cycle, and one can be added at any time.
+		// Waiting a whole interval for those leaves an index whose partitions
+		// are behind the clock behind for that long (#2412), so a short poll
+		// rotates each new one right away. A new index can fail its first try
+		// because the console is still creating its database, which comes
+		// with no partition ahead of the clock: the poll tries it again, up to
+		// newTargetTries times, and leaves it to the full cycle after that.
+		// It stays out of the escalation streak and the onCycle callbacks:
+		// the next full cycle covers it again and reports its health.
+		rotated := map[string]bool{}
+		tries := map[string]int{}
+		tracked := func() []RotateTarget {
+			ts := dedupeTargets(targets())
+			for _, t := range ts {
+				rotated[t.DSN] = true
+			}
+			return ts
+		}
+		runNew := func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("built-in rotation of a new index panicked; rotation continues next tick", "panic", r)
+				}
+			}()
+			var s Settings
+			read := false
+			for _, t := range dedupeTargets(targets()) {
+				if rotated[t.DSN] {
+					continue
+				}
+				if !read {
+					s, read = settings(), true
+				}
+				tries[t.DSN]++
+				if _, err := rotateIndex(ctx, t, s); err == nil || tries[t.DSN] >= newTargetTries {
+					rotated[t.DSN] = true
+				}
+			}
+		}
 		// runOne reads the current settings (the console may have edited them
 		// since the last tick), rotates every target, and returns the interval
 		// it saw so the caller can re-tune the ticker. The settings read is
@@ -168,7 +209,7 @@ func StartLoop(ctx context.Context, settings func() Settings, targets func() []R
 						slog.Error("built-in rotation cycle panicked; rotation continues next tick", "panic", r)
 					}
 				}()
-				deferred, failed := runCycle(ctx, s, targets)
+				deferred, failed := runCycle(ctx, s, tracked)
 				if failed || deferred > 0 {
 					unhealthyStreak++
 				} else {
@@ -190,6 +231,8 @@ func StartLoop(ctx context.Context, settings func() Settings, targets func() []R
 			return s.Interval
 		}
 		runOne()
+		poll := time.NewTicker(newTargetPoll)
+		defer poll.Stop()
 		iv := s0.Interval
 		ticker := time.NewTicker(iv)
 		defer ticker.Stop()
@@ -197,6 +240,8 @@ func StartLoop(ctx context.Context, settings func() Settings, targets func() []R
 			select {
 			case <-ctx.Done():
 				return
+			case <-poll.C:
+				runNew()
 			case <-ticker.C:
 				if newIV := runOne(); newIV > 0 && newIV != iv {
 					ticker.Reset(newIV)
@@ -209,6 +254,18 @@ func StartLoop(ctx context.Context, settings func() Settings, targets func() []R
 	return done
 }
 
+// newTargetPoll is how often the loop looks for an index it has not rotated
+// yet, and newTargetTries how many polls try one that fails (#2412). Vars so
+// tests can shrink them.
+var (
+	newTargetPoll  = time.Minute
+	newTargetTries = 3
+)
+
+// rotateIndex is rotateOneIndex; a var so tests can fail and count rotations
+// without a database.
+var rotateIndex = rotateOneIndex
+
 // escalateAfter is how many consecutive unhealthy cycles (failed
 // or deferring) the loop tolerates before escalating from Warn to Error. A
 // var, not a const, so tests can shrink it.
@@ -220,7 +277,7 @@ var escalateAfter = 3
 // drop (Result.Deferred, summed), and whether any database's rotation failed.
 func runCycle(ctx context.Context, s Settings, targets func() []RotateTarget) (deferred int, failed bool) {
 	for _, t := range dedupeTargets(targets()) {
-		d, err := rotateOneIndex(ctx, t, s)
+		d, err := rotateIndex(ctx, t, s)
 		deferred += d
 		if err != nil {
 			failed = true
