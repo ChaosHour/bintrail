@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.104.5] - 2026-10-14
 ### Changed
 - **Explain and the check between snapshots run in a process of their own**
   (#2385). The drill-down on a mismatched table, and each table the check
