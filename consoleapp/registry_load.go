@@ -1,6 +1,10 @@
 package consoleapp
 
-import "github.com/dbtrail/dbtrail/internal/console"
+import (
+	"log/slog"
+
+	"github.com/dbtrail/dbtrail/internal/console"
+)
 
 // loadConsoleRegistry loads the server registry, registers the daemon's own
 // --baseline-s3 bucket with it, and gives every server that read its
@@ -18,7 +22,12 @@ import "github.com/dbtrail/dbtrail/internal/console"
 // naming the same folder is refused every write (#1684,
 // Registry.WriteRefusal). The refresh writes the folder only, so the startup
 // S3 location is not counted, exactly as the refresh loop counts it.
-func loadConsoleRegistry(path string, cliRefreshes bool, baselineDir, baselineS3 string) (*console.Registry, error) {
+//
+// takesSnapshots: this process takes the snapshots (watch, never serve). Then
+// every server that keeps its snapshots only in S3 is given its default local
+// folder (#2431), after the location migration, which can hand an entry the
+// daemon's bucket alone.
+func loadConsoleRegistry(path string, cliRefreshes, takesSnapshots bool, baselineDir, baselineS3 string) (*console.Registry, error) {
 	reg, err := console.LoadRegistry(path)
 	if err != nil {
 		return nil, err
@@ -30,5 +39,30 @@ func loadConsoleRegistry(path string, cliRefreshes bool, baselineDir, baselineS3
 		reg.SetCommandLineWriter(baselineDir, "")
 	}
 	reg.MigrateProcessBaselineLocation(baselineDir, baselineS3)
+	if takesSnapshots {
+		logLocalCopyAssignments(reg.GiveEveryServerALocalCopy())
+	}
 	return reg, nil
+}
+
+// logLocalCopyAssignments says what GiveEveryServerALocalCopy did: once per
+// server, at startup, since an entry given its folder is saved and is not
+// seen again.
+func logLocalCopyAssignments(done []console.LocalCopyAssignment) {
+	for _, a := range done {
+		switch {
+		case a.Err != nil:
+			slog.Error("server keeps its snapshots only in S3 and could not be given a folder on this machine, so it stays as it was; "+
+				"fix the reason and restart, or give it a folder on the "+console.PageSnapshots+" page",
+				"server", a.Name, "id", a.ID, "folder", a.Dir, "error", a.Err)
+		case len(a.Moved) > 0:
+			slog.Warn("server kept its snapshots only in S3; it now also keeps them on this machine, "+
+				"and the snapshots its local mirror held were moved into its folder, so SQL on its copy reads what it read before",
+				"server", a.Name, "id", a.ID, "folder", a.Dir, "moved", a.Moved, "move_error", a.MoveErr)
+		default:
+			slog.Warn("server kept its snapshots only in S3; it now also keeps them on this machine, "+
+				"but SQL on its copy has no snapshot to read until its next one lands in the folder (take one on the "+console.PageSnapshots+" page)",
+				"server", a.Name, "id", a.ID, "folder", a.Dir, "moved", a.Moved, "move_error", a.MoveErr)
+		}
+	}
 }

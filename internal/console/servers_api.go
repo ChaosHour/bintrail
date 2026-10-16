@@ -343,12 +343,7 @@ func (s *Server) buildNewEntry(req serverRequest) (ServerEntry, bool, error) {
 	// Save would. No IO: the folder itself is prepared in persistNewEntry.
 	localDir := strings.TrimSpace(req.BaselineDir)
 	if req.LocalCopy != nil && !*req.LocalCopy {
-		if localDir != "" {
-			return ServerEntry{}, false, errors.New("a folder was given for a server that keeps no copy on this machine; send one or the other")
-		}
-		if strings.TrimSpace(req.BaselineS3) == "" {
-			return ServerEntry{}, false, errors.New(noCopyAnywhereMsg)
-		}
+		return ServerEntry{}, false, errors.New(localCopyRequiredMsg)
 	}
 	return ServerEntry{
 		Name:              strings.TrimSpace(req.Name),
@@ -453,11 +448,14 @@ func (s *Server) persistNewEntry(entry ServerEntry, deriveIndex bool, nameBase s
 		if def := s.cm.reg.DefaultBaselineDir(added.ID); def != "" {
 			fresh := !dirExists(def)
 			if err := prepareLocalSnapshotDir(def); err != nil {
-				// The server is still worth having: it is listed with no
-				// local copy, which is what the page then shows, and the
-				// operator can pick a folder there. Error, because this is
-				// the folder beside the registry DBTrail just wrote.
-				slog.Error("console: new server created without its local snapshot folder", "server", added.Name, "dir", def, "error", err)
+				// Every server keeps a local copy (#2431): one created
+				// without it would keep its snapshots only in S3, or
+				// nowhere, so the create is undone and says why.
+				if delErr := s.cm.reg.UndoAdd(added.ID); delErr != nil {
+					slog.Error("could not remove a server whose snapshot folder could not be made",
+						"server", added.Name, "id", added.ID, "error", delErr.Error())
+				}
+				return ServerEntry{}, created, fmt.Errorf("make this server's snapshot folder: %w", err)
 			} else {
 				if fresh {
 					created = def
@@ -539,6 +537,9 @@ func (s *Server) handleServersUpdate(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(raw, &sent)
 	if _, ok := sent["baseline_dir"]; !ok {
 		req.BaselineDir = old.BaselineDir
+	} else if strings.TrimSpace(req.BaselineDir) == "" && old.BaselineDir != "" {
+		writeJSONError(w, http.StatusBadRequest, localDirRequiredMsg)
+		return
 	}
 	if _, ok := sent["baseline_s3"]; !ok {
 		req.BaselineS3 = old.BaselineS3
@@ -596,6 +597,10 @@ func (s *Server) handleServersUpdate(w http.ResponseWriter, r *http.Request) {
 	s3KeyID, s3Secret, err := resolveS3Keys(req, old.S3AccessKeyID, old.S3SecretAccessKey)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(req.BaselineDir) == "" && strings.TrimSpace(req.BaselineS3) != "" && strings.TrimSpace(req.BaselineS3) != old.BaselineS3 {
+		writeJSONError(w, http.StatusBadRequest, localDirWithS3Msg)
 		return
 	}
 	// A folder this edit changes is checked the way the backup settings

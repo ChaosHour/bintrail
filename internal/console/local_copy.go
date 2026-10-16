@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/copymirror"
 )
 
 // Every server keeps a local copy of its snapshots by default (#1681), in a
@@ -208,9 +209,71 @@ func prepareLocalSnapshotDir(dir string) error {
 	return nil
 }
 
-// noCopyAnywhereMsg refuses a server with neither a local copy nor an
-// external destination: that is not "snapshots elsewhere", it is none at all.
-const noCopyAnywhereMsg = "this server would keep its snapshots nowhere: keep a copy on this machine, or set an S3 destination first"
+// localCopyRequiredMsg refuses a request for a server with no local copy
+// (#2431): every server keeps one, and S3 is kept beside it.
+const localCopyRequiredMsg = "every server keeps a copy of its snapshots on this machine, with S3 beside it when set: local_copy can no longer be false"
+
+// localDirRequiredMsg refuses a request that empties a server's folder.
+const localDirRequiredMsg = "every server keeps a copy of its snapshots on this machine, so its folder cannot be emptied: send another folder, or leave baseline_dir out to keep this one"
+
+// localDirWithS3Msg refuses a request that would give a server with no
+// folder an S3 destination alone.
+const localDirWithS3Msg = "every server keeps a copy of its snapshots on this machine, so an S3 destination needs a folder beside it: " +
+	"send baseline_dir with it, or local_copy true in the server's snapshot settings for its default folder"
+
+// LocalCopyAssignment is one server GiveEveryServerALocalCopy gave its
+// default folder, or could not (Err set, the entry left as it was).
+type LocalCopyAssignment struct {
+	ID, Name, Dir string
+	Err           error
+	// Moved names the snapshots taken from the server's mirror into the
+	// folder; MoveErr says why none or not all were (nil with Moved empty:
+	// the mirror held none).
+	Moved   []string
+	MoveErr error
+}
+
+// GiveEveryServerALocalCopy gives every entry that keeps its snapshots only
+// in S3 (a bucket and no folder: a file saved before #2431, or edited by
+// hand) its default folder, creates it and saves the entry, then moves the
+// complete snapshots its mirror holds into it, so SQL on its copy keeps
+// reading what it read before. Only the process that takes the snapshots
+// calls it; the registry is never changed on read. An entry that already has
+// a folder, or has neither a folder nor a bucket, is not touched; a
+// read-only registry (written by a newer version) is not touched at all.
+// The returned list names what was done, for the log.
+func (r *Registry) GiveEveryServerALocalCopy() []LocalCopyAssignment {
+	if r.ReadOnly() {
+		return nil
+	}
+	var out []LocalCopyAssignment
+	for _, e := range r.List() {
+		if strings.TrimSpace(e.BaselineS3) == "" || strings.TrimSpace(e.BaselineDir) != "" {
+			continue
+		}
+		// The mirror is named by the entry as it is now: once it has a
+		// folder it has none.
+		mirror := r.CopyMirrorDir(e)
+		a := LocalCopyAssignment{ID: e.ID, Name: e.Name, Dir: r.DefaultBaselineDir(e.ID)}
+		if a.Dir == "" {
+			a.Err = errors.New("this registry has no state directory to put the folder in")
+			out = append(out, a)
+			continue
+		}
+		fresh := !dirExists(a.Dir)
+		if a.Err = prepareLocalSnapshotDir(a.Dir); a.Err == nil {
+			e.BaselineDir = a.Dir
+			if a.Err = r.Update(e); a.Err != nil && fresh {
+				_ = os.RemoveAll(a.Dir) // made by this call, for an entry that did not take it
+			}
+		}
+		if a.Err == nil {
+			a.Moved, a.MoveErr = copymirror.MoveSnapshots(mirror, a.Dir)
+		}
+		out = append(out, a)
+	}
+	return out
+}
 
 // adoptsSnapshots refuses to point a server that removes old snapshots at a
 // folder that already holds some (#1681): the next prune would remove every
