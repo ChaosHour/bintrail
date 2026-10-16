@@ -1492,6 +1492,23 @@ one release and warns that it no longer does anything. Remove it.
 - `BINTRAIL_CONSOLE_TLS_CERT` / `BINTRAIL_CONSOLE_TLS_KEY` — same as `--tls-cert` / `--tls-key`.
 - `BINTRAIL_CONSOLE_ALLOWED_HOSTS` — comma-separated, same as `--allowed-hosts`.
 - `BINTRAIL_CONSOLE_ALLOW_SETUP` — `1`/`true`, same as `--allow-setup`.
+- `BINTRAIL_CONSOLE_STARTUP_PAGE` (`watch` only): `0`/`false`/`off` turns off the
+  startup-failure page. When `watch` stops on its configuration before the web
+  interface opens (a malformed index DSN, missing grants, a failed preflight, a
+  public bind with no password), it keeps the web interface's address for five
+  minutes with one page that says why (for a preflight, which checks failed),
+  answering 503 on every path so a health check reports it. Then it exits 1 and
+  its supervisor starts it again, so a failure that heals with time (tables
+  created by an app's migrations, grants applied later) still heals, at one
+  restart every five minutes instead of a tight loop. A failure a restart fixes
+  at once (the index not reachable yet) exits immediately, as before. The
+  messages dbtrail writes itself (a malformed index DSN, the public-bind
+  refusal) show anywhere; any other reason shows only on a loopback bind or
+  with `BINTRAIL_CONSOLE_ALLOW_SETUP`, and only under an IP, `localhost` or a
+  name in `BINTRAIL_CONSOLE_ALLOWED_HOSTS`; elsewhere the page points to the
+  log. Under
+  systemd the unit reads `active (running)` while the page is up; turn the page
+  off if your alerting watches for a failed unit. Not shown over TLS.
 - `BINTRAIL_CONSOLE_URL`: the address people open the web interface at, when it is not
   the listen address (a container whose port is published as another, a reverse
   proxy). Only the startup banner uses it; nothing listens or redirects
