@@ -264,9 +264,11 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 	// advance the durable GTID checkpoint only after the transaction's rows have
 	// been received (#491). It commits the in-flight transaction (currentGTID) and
 	// clears it, so the next-GTID fallback below won't re-commit the same GTID.
-	// No-op for non-GTID sources (currentGTID empty); a GTID-enabled source running
-	// in position mode still emits these, harmlessly — the consumer ignores commit
-	// events when accGTID is nil, and binlogPos lands on the XID boundary.
+	// No-op when no GTID is in flight: that is the next-GTID fallback's case, and
+	// terminators logged without a GTID go through endTxn instead. A GTID-enabled
+	// source running in position mode still emits these, harmlessly: the
+	// consumer ignores commit events when accGTID is nil, and binlogPos lands on
+	// the XID boundary.
 	emitCommit := func(hdr *replication.EventHeader) error {
 		if currentGTID == "" {
 			return nil
@@ -284,6 +286,27 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 		lastCommittedGTID = currentGTID
 		currentGTID = "" // committed; the next-GTID fallback must not re-commit it
 		return nil
+	}
+
+	// endTxn announces the END of a binlog group the server closed with an
+	// explicit terminator: an XID, a QUERY "COMMIT"/"ROLLBACK"/"XA ...", or an
+	// XA_PREPARE_LOG_EVENT (#2391). With a GTID in flight it is emitCommit.
+	// Without one (gtid_mode=OFF, or the XID of a CREATE ... SELECT whose GTID
+	// the DDL already consumed) it still sends an EventCommit, with no GTID, at
+	// the terminator's end position: the only place a position-mode resume can
+	// start without splitting a transaction. It is never fired from a
+	// transaction START: that is the next-GTID fallback in beginTxn, which
+	// only ever commits a GTID it holds.
+	endTxn := func(hdr *replication.EventHeader) error {
+		if currentGTID != "" {
+			return emitCommit(hdr)
+		}
+		return em.send(ctx, Event{
+			BinlogFile: currentFile,
+			EndPos:     uint64(hdr.LogPos),
+			Timestamp:  time.Unix(int64(hdr.Timestamp), 0).UTC(),
+			EventType:  EventCommit,
+		})
 	}
 
 	// beginTxn is shared by both flavors' GTID events. After a rotate, the
@@ -306,7 +329,17 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			}
 			currentGTID = ""
 		}
-		if err := emitCommit(hdr); err != nil {
+		// The fallback learns the pending transaction ended only now, at the
+		// next GTID event, so it reports that end as where THIS event starts:
+		// the event's own end is already inside the next transaction, and a
+		// position-mode resume from there would split it (#2391). LogPos is
+		// the event's end and EventSize its length; a header without a size
+		// keeps its end, as before.
+		prevEnd := *hdr
+		if hdr.EventSize > 0 && hdr.LogPos >= hdr.EventSize {
+			prevEnd.LogPos = hdr.LogPos - hdr.EventSize
+		}
+		if err := emitCommit(&prevEnd); err != nil {
 			return err
 		}
 		currentGTID = gtid
@@ -446,13 +479,12 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			// A new transaction is starting, so the previous one has terminated. If
 			// it wasn't already committed by its XID or a table DDL, commit it now.
 			// This is the catch-all for transactions that carry a GTID but emit no
-			// XID and aren't table DDL — two families:
-			//   * implicitly-committed DDL/DCL: GRANT/REVOKE, CREATE/DROP DATABASE,
+			// XID and aren't table DDL — implicitly-committed DDL/DCL: GRANT/REVOKE, CREATE/DROP DATABASE,
 			//     CREATE/DROP VIEW/TRIGGER/PROCEDURE/FUNCTION, CREATE/DROP INDEX,
 			//     ANALYZE/OPTIMIZE TABLE;
-			//   * explicit terminators logged as a QUERY with no XID: XA COMMIT, or
-			//     a COMMIT of a non-transactional/mixed-engine transaction.
-			// (A normal InnoDB COMMIT does NOT reach here — it ends in an XID_EVENT.)
+			// (Explicit terminators no longer reach here: an XID, a QUERY
+			// "COMMIT"/"ROLLBACK", XA COMMIT/ROLLBACK/PREPARE and MySQL's
+			// XA_PREPARE_LOG_EVENT commit at the terminator itself, #2391.)
 			// Without this their GTID would never advance the checkpoint, causing
 			// endless re-streaming and eventually a false data-loss gap alarm (#491).
 			//
@@ -569,6 +601,12 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 						ConnectionID:  ev.SlaveProxyID,
 					})
 				}
+			} else if isTransactionTerminator(string(ev.Query)) {
+				// A group closed by a QUERY instead of an XID (#2391): see
+				// isTransactionTerminator for which ones and why.
+				if err := endTxn(binlogEv.Header); err != nil {
+					return err
+				}
 			}
 
 		case *replication.XIDEvent:
@@ -581,7 +619,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 				lastCommittedGTID = ddlTxnGTID
 				ddlTxnGTID = ""
 			}
-			if err := emitCommit(binlogEv.Header); err != nil {
+			if err := endTxn(binlogEv.Header); err != nil {
 				return err
 			}
 
@@ -621,6 +659,13 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			}
 
 		default:
+			if binlogEv.Header.EventType == replication.XA_PREPARE_LOG_EVENT {
+				// MySQL closes an XA transaction's prepared group (the one that
+				// carries its rows) with this event, which go-mysql does not
+				// decode. The XA COMMIT comes later as a group of its own.
+				currentQueryText = ""
+				return endTxn(binlogEv.Header)
+			}
 			// Unnamed event types are dropped. Say so at debug level: this
 			// switch's silence is how ROWS_QUERY_EVENT stayed invisible for
 			// years — nothing reported that the stream was seeing an event
