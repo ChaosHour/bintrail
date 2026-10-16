@@ -7967,8 +7967,9 @@ function snapshotHero(b, cov, cur, acts) {
   if (cur && cur.id && cur.kind === "registry" && sessionMay(PERM_SNAPSHOT_CREATE)) {
     // cur is the RAW registry entry, while b.configured also counts the
     // daemon-wide default, which a backup refuses to write to. The precheck
-    // reads the raw fields (hasOwnBackupLocation), so this does too.
-    const ownLoc = !!(cur.baseline_dir || cur.baseline_s3);
+    // reads the raw folder (hasOwnBackupLocation: since #2431 an S3 location
+    // alone is not where a snapshot is written), so this does too.
+    const ownLoc = !!(cur.baseline_dir || "").trim();
     const off = !capsCache.baseline_trigger;
     if (!off && ownLoc && cur.write_refusal) {
       // The location is shared (#1684): the dump would be refused, so the
@@ -7982,7 +7983,7 @@ function snapshotHero(b, cov, cur, acts) {
     } else if (cur.has_source) {
       const why = [];
       if (off) why.push("turned off at startup");
-      if (!ownLoc) why.push("needs this server's own snapshot location");
+      if (!ownLoc) why.push("needs a local snapshot folder for this server");
       hero.append(el("div", { class: "hero-note", text: "Read database now: " + why.join(", and ") + (sessionMayConfigureServer() && acts && acts.settings ? " (under Settings)" : "") }));
     }
   }
@@ -8958,41 +8959,22 @@ function locationMigrationWords(m) {
 
 // s3OnlyBackupWarning is the Backup settings note for a server whose own
 // saved location is a bucket with no folder (#1659), or "" when it does not
-// apply. Since #2212 such a server is updated from the recorded changes too:
-// the update is built in the staging folder, uploaded, and deleted. What is
-// left to say is its cost (each changed table is downloaded, rewritten and
-// uploaded again; an unchanged one is copied inside S3), or, where the
-// staging folder cannot be used
-// (staging_refusal), that every run is a full read. The values are compared
+// apply. Since #2431 no snapshot is written for such a server: every server
+// keeps its snapshots on this machine, with S3 beside it. Only an entry the
+// daemon could not give a folder is left this way. The values are compared
 // as stored, untrimmed, the way the daemon reads them.
 function s3OnlyBackupWarning(srv, fix = true) {
   // A saved schedule that cannot run already says why, more precisely.
   if (!srv || srv.baseline_dir || !srv.baseline_s3 || srv.schedule_refusal) return "";
   // fix: the closing instruction is for a session that can save this row.
   // The problem itself is said to everyone who can see the row.
-  const then = (t) => fix ? " " + t : "";
-  // A process that runs no schedule (the read-only console): the cost below
-  // is the service's to state, and nothing here builds an update.
-  if (!srv.schedule_loop) {
-    return "With S3 only, scheduled updates are built in the working folder of the DBTrail service that runs the schedule. This one runs none.";
-  }
-  if (srv.staging_refusal) {
-    const why = "With S3 only, a scheduled update is built in the working folder, which cannot be used here (" +
-      srv.staging_refusal.replace(/[.\s]+$/, "") + ")";
-    if (!srv.full_backup_possible) {
-      return why + ", and a full read is not available either, so scheduled snapshots cannot run on this server." +
-        then("Fix the working folder, or add a Local folder.");
-    }
-    return why + ", so every scheduled snapshot reads your whole database." + then("Fix the working folder, or add a Local folder.");
-  }
-  return "With S3 only, each scheduled update downloads, rewrites and uploads again the tables that changed. Unchanged tables are usually copied inside S3 without being downloaded; the first update after a full read rewrites every table, as does an update whose previous snapshot is in another bucket." +
-    then("Add a Local folder so changed tables are not downloaded first.");
+  return "With S3 only, no snapshot is written for this server: every server keeps its snapshots on this machine, with S3 beside it." +
+    (fix ? " Add a Local folder." : "");
 }
 
-// s3OnlyBackupFault: the note above is a fault (red) only when no update can
-// run; the cost of a working update is a hint.
+// s3OnlyBackupFault: the note above is always a fault (red): nothing runs.
 function s3OnlyBackupFault(srv) {
-  return !!(srv && srv.schedule_loop && srv.staging_refusal);
+  return !!(srv && !srv.baseline_dir && srv.baseline_s3);
 }
 
 // localCopyWords is what the per-server yes/no means right now (#1681), from

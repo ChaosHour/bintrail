@@ -715,9 +715,8 @@ func FullBackupPossible(e ServerEntry, gates BackupScheduleGates) error {
 // one, so unchanged tables can be carried forward by hard link.
 //
 // The OUTPUT stays local whatever this returns: the fold writes Parquet to a
-// filesystem (the local directory, or a run folder under the staging folder
-// for a server with S3 only, #2212), and the upload is a separate step
-// afterwards.
+// filesystem (the server's local directory: since #2431 every server that is
+// written has one), and the upload is a separate step afterwards.
 func BaselineFoldSource(e ServerEntry) string {
 	if e.BaselineS3 != "" {
 		return e.BaselineS3
@@ -728,22 +727,16 @@ func BaselineFoldSource(e ServerEntry) string {
 // rebuildPossible reports whether a rebuild from the change history can be
 // attempted for e (the fold itself may still refuse), and why not.
 //
-// The fold WRITES Parquet to a filesystem. A server with a local folder
-// writes there; a server whose snapshots go only to S3 writes into a folder
-// of its own under the staging folder, which is uploaded and then deleted
-// (#2212). Before that, an S3-only server could only ever be read in full.
+// The fold WRITES Parquet into the server's local folder. Since #2431 every
+// server has one; one without it (an old entry the daemon could not give a
+// folder) is updated by nothing, and is not read in full either: the
+// precheck refuses it the same way.
 func rebuildPossible(e ServerEntry, gates BackupScheduleGates) error {
 	if e.DSN == "" {
 		return errors.New(BackupWhyNoIndex)
 	}
-	if e.BaselineDir == "" {
-		if e.BaselineS3 == "" {
-			// No destination at all: nothing to write into, here or anywhere.
-			return errors.New(BackupWhyNoLocalDir)
-		}
-		if gates.StagingRefusal != "" {
-			return errors.New(BackupWhyNoStagingPrefix + "; " + gates.StagingRefusal)
-		}
+	if strings.TrimSpace(e.BaselineDir) == "" {
+		return errors.New(BackupWhyNoLocalDir)
 	}
 	return nil
 }
@@ -758,8 +751,9 @@ const (
 	BackupWhyNoIndex = "this server has no index connection to read the recorded changes from"
 	// BackupWhyNoLocalDir is kept for run records written before #2212,
 	// when a server whose snapshots go only to S3 could not be updated at
-	// all. A current daemon records it only for a server with no snapshot
-	// location of any kind.
+	// all. A current daemon writes it only as the second half of a skip
+	// reason, for a server with no local folder (#2431: an S3 location alone
+	// is not one), whose full read is refused first.
 	BackupWhyNoLocalDir = "an update from the recorded changes needs a local snapshot directory"
 	// BackupWhyNoStagingPrefix starts the reason a server whose snapshots go
 	// only to S3 is read in full: its update is built in the working folder,
@@ -976,9 +970,9 @@ var newestSnapshot = reconstruct.NewestSnapshot
 // ChooseBackupMethod decides how the next scheduled run for e will be made,
 // and why, on a daemon with these gates. The rule, in order:
 //
-//   - a server an update cannot serve (no index DSN, no snapshot location,
-//     or S3 only with a staging folder that cannot be used) gets a FULL
-//     backup, with that refusal as the why;
+//   - a server an update cannot serve (no index DSN, or no local folder,
+//     which a full read refuses too since #2431) gets a FULL backup, with
+//     that refusal as the why;
 //   - a server with no previous backup gets a FULL backup: there is nothing
 //     to update. A directory that does not exist yet is that case; one that
 //     cannot be READ is its own error, never "no snapshot yet". The previous
@@ -1021,10 +1015,7 @@ func ChooseBackupMethodAt(ctx context.Context, e ServerEntry, gates BackupSchedu
 	// (#1539): the fold reads the previous snapshot straight from the s3://
 	// source, writes the new one into the server's local directory, and the
 	// scheduled path uploads it to the same destination a full backup would.
-	// A server with NO local directory writes it into a folder of its own
-	// under the staging folder instead, uploads it, and deletes the folder
-	// (#2212); rebuildPossible above refuses only when that folder cannot be
-	// used, and its message names why.
+	// A server with NO local directory is refused above (#2431).
 	source := BaselineFoldSource(e)
 	anchor, tables, listErr := newestSnapshot(ctx, source)
 	if listErr != nil && errors.Is(listErr, fs.ErrNotExist) {
