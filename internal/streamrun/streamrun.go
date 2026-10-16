@@ -1792,8 +1792,28 @@ func mariadbCheckpointCoversFloor(checkpoint, floor *gomysql.MariadbGTIDSet) boo
 
 // ─── Stream loop ────────────────────────────────────────────────────────────────
 
+// The caps on how much of ONE source transaction capture holds in an open
+// index transaction before it makes what it has visible anyway (#2391): see
+// indexer.DefaultMaxTxnRows. Each split is counted in
+// bintrail_stream_transaction_splits_total and the first one logged.
+// Variables so a test can shrink them; they are not configuration.
+var (
+	maxTxnRows = indexer.DefaultMaxTxnRows
+	maxTxnOpen = indexer.DefaultMaxTxnOpen
+)
+
 // streamLoop consumes parser events, flushes batches to MySQL, and writes
 // checkpoints to stream_state at the given interval.
+//
+// A reader of the index never sees part of a source transaction (#2391).
+// Rows of COMPLETE transactions are batched together as before, up to the
+// batch size, and each batch commits in one statement (or one index
+// transaction when it needs more than one). Rows of the transaction still
+// being read are never committed with them: once they fill a batch they go to
+// an index transaction of their own, which commits when the source
+// transaction's end (EventCommit or EventDDL) arrives, or in parts past
+// maxTxnRows / maxTxnOpen. A stop in the middle of a transaction discards its
+// rows, and the next resume reads it again.
 //
 // DDL events flush the current batch and are never inserted. The DDL
 // HANDLING (auto-snapshot + resolver swap + schema_changes record) is NOT
@@ -1827,54 +1847,68 @@ func streamLoop(
 	m *observe.StreamMetrics,
 	hooks *Hooks,
 ) error {
-	batch := make([]parser.Event, 0, idx.BatchSize())
 	ticker := time.NewTicker(checkpointInterval)
 	defer ticker.Stop()
 
-	flush := func() error {
+	// The writer: complete transactions batched together, the one being read
+	// held in an index transaction of its own until its end (#2391).
+	w := indexer.NewTxnBatcher(idx, maxTxnRows, maxTxnOpen, indexer.TxnBatcherHooks{
 		// Checked on every write, not only on the ctx.Done branch below: a
 		// full batch, a DDL or the parser's closed channel can win the select
 		// against a cancellation that already happened.
-		if stopWithoutFlush(ctx) {
-			return ErrStopWithoutFlush
-		}
-		if len(batch) == 0 {
+		Stopped: func() error {
+			if stopWithoutFlush(ctx) {
+				return ErrStopWithoutFlush
+			}
 			return nil
-		}
-		m.BatchSize.Observe(float64(len(batch)))
-		n, err := idx.InsertBatch(batch)
-		state.eventsIndexed += n
-		m.EventsIndexed.Add(float64(n))
-		m.BatchFlushes.Inc()
-		if err == nil {
-			// T2 (#1225): the batch is durable, so its events are queryable and
-			// recoverable NOW. Only on success — a failed InsertBatch may have
-			// written some rows, but nothing about that partial state is an
-			// availability guarantee worth publishing. Read the batch before the
-			// truncation below.
-			observeCommitLag(m, batch, time.Now())
-		}
-		batch = batch[:0]
-		if err != nil {
-			m.Errors.WithLabelValues("batch_flush").Inc()
-			return err
-		}
-		if n > 0 && hooks != nil && hooks.OnIndexed != nil {
-			hooks.OnIndexed(n)
-		}
-		return nil
-	}
+		},
+		Statement: func(rows int) {
+			m.BatchSize.Observe(float64(rows))
+			m.BatchFlushes.Inc()
+		},
+		WriteError: func() { m.Errors.WithLabelValues("batch_flush").Inc() },
+		Published: func(n int64, stamps []indexer.CommitStamp) {
+			state.eventsIndexed += n
+			m.EventsIndexed.Add(float64(n))
+			// T2 (#1225): only at the COMMIT that makes the rows visible,
+			// never at an INSERT inside a still-open transaction.
+			observeCommitStamps(m, stamps, time.Now())
+			if n > 0 && hooks != nil && hooks.OnIndexed != nil {
+				hooks.OnIndexed(n)
+			}
+		},
+		Split: func(why string, rows int64, open time.Duration, first bool) {
+			m.TxnSplits.Inc()
+			if first {
+				slog.Warn("a source transaction is too large to make visible all at once; readers can see part of it until its end is captured",
+					"reason", why, "rows_so_far", rows, "open_for", open.Round(time.Millisecond),
+					"row_cap", maxTxnRows, "time_cap", maxTxnOpen,
+					"file", state.binlogFile, "pos", state.binlogPos)
+			}
+		},
+	})
+	defer w.Close()
 
-	// checkpoint flushes the pending batch, then persists the stream position.
-	// A flush failure is RETURNED to the caller so the stream aborts loudly and
-	// replays from the last durable checkpoint on restart — the same fail-loud
-	// contract the batch-full (len>=BatchSize) and DDL flushes already follow.
+	// ddlClaimed: in GTID mode, the transaction being read began with a DDL
+	// whose GTID is already in the durable set (CREATE TABLE ... SELECT logs
+	// the DDL, then its rows, then an XID). A resume will NOT read that
+	// transaction again, so a stop inside it must keep its rows, not discard
+	// them. Cleared at the next transaction start or end.
+	ddlClaimed := false
+
+	// checkpoint commits the rows of complete transactions, then persists the
+	// stream position, which in both modes never claims more than that (the
+	// position-mode safe point and the GTID set advance only at transaction
+	// ends). A transaction still being read stays uncommitted and keeps
+	// arriving. A flush failure is RETURNED to the caller so the stream aborts
+	// loudly and replays from the last durable checkpoint on restart — the
+	// same fail-loud contract the batch-full and DDL flushes follow.
 	// Swallowing it here let an un-indexable event (e.g. one over the server's
 	// max_allowed_packet) be silently skipped (#652). A saveCheckpoint failure
 	// is NOT data loss — it only re-streams from an older checkpoint on restart —
 	// so it stays a warning.
 	checkpoint := func() error {
-		if err := flush(); err != nil {
+		if err := w.CommitComplete(); err != nil {
 			return err
 		}
 		state.lastSaveErr = nil
@@ -1893,6 +1927,28 @@ func streamLoop(
 				"events_indexed", state.eventsIndexed)
 		}
 		return nil
+	}
+
+	// stop ends the loop on cancellation or a closed channel. The rows of a
+	// transaction still being read are discarded, written or not: committing
+	// them would leave half a transaction visible for as long as capture stays
+	// down. The resume reads that transaction again from the checkpoint. The
+	// one exception is ddlClaimed, whose transaction a resume would not read.
+	stop := func() error {
+		if stopWithoutFlush(ctx) {
+			return ErrStopWithoutFlush
+		}
+		if w.InTxn() {
+			if ddlClaimed {
+				if err := w.End(); err != nil {
+					return err
+				}
+			} else if n := w.Discard(); n > 0 {
+				slog.Info("capture stopped inside a source transaction; its rows are not kept, and the next resume reads it again",
+					"rows_discarded", n, "file", state.binlogFile, "pos", state.binlogPos)
+			}
+		}
+		return checkpoint()
 	}
 
 	// advanceGTID adds a committed transaction's GTID to the durable set. It is
@@ -1927,22 +1983,21 @@ func streamLoop(
 	for {
 		select {
 		case <-ctx.Done():
-			if err := checkpoint(); err != nil {
-				return err
-			}
-			return nil
+			return stop()
 
 		case <-ticker.C:
 			if err := checkpoint(); err != nil {
 				return err
 			}
 
+		case <-w.CapC():
+			if err := w.OnCap(); err != nil {
+				return err
+			}
+
 		case ev, ok := <-events:
 			if !ok {
-				if err := checkpoint(); err != nil {
-					return err
-				}
-				return nil
+				return stop()
 			}
 			// Update position tracking from each event.
 			if ev.BinlogFile != "" {
@@ -1974,19 +2029,30 @@ func streamLoop(
 				// added to the durable set here; that happens at EventCommit, so a
 				// checkpoint mid-transaction can't claim a half-streamed
 				// transaction (#491).
+				ddlClaimed = false
 				continue
 			case parser.EventCommit:
 				// Transaction committed: all its rows have been received, so it is
-				// now safe to advance the durable GTID checkpoint.
+				// now safe to advance the durable GTID checkpoint, and to let
+				// readers see the transaction.
 				advanceGTID(ev.GTID)
+				ddlClaimed = false
+				if err := w.End(); err != nil {
+					return err
+				}
 				continue
 			case parser.EventDDL:
-				// DDL flushes pending rows, then auto-commits its own GTID
-				// (insertion itself is handled by the parser's synchronous hook).
-				if err := flush(); err != nil {
+				// A DDL ends whatever came before it. It writes every pending
+				// row, then auto-commits its own GTID (insertion itself is
+				// handled by the parser's synchronous hook).
+				if err := w.End(); err != nil {
+					return err
+				}
+				if err := w.CommitComplete(); err != nil {
 					return err
 				}
 				advanceGTID(ev.GTID)
+				ddlClaimed = state.accGTID != nil && ev.GTID != ""
 				continue
 			}
 
@@ -2002,11 +2068,8 @@ func streamLoop(
 				"type", ev.EventType,
 				"gtid", ev.GTID)
 
-			batch = append(batch, ev)
-			if len(batch) >= idx.BatchSize() {
-				if err := flush(); err != nil {
-					return err
-				}
+			if err := w.Add(ev); err != nil {
+				return err
 			}
 		}
 	}

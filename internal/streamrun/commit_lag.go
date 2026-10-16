@@ -3,6 +3,7 @@ package streamrun
 import (
 	"time"
 
+	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/observe"
 	"github.com/dbtrail/dbtrail/internal/parser"
 )
@@ -30,6 +31,15 @@ import (
 //     make anything queryable", which is exactly the question the other two
 //     gauges cannot answer once traffic stops.
 func observeCommitLag(m *observe.StreamMetrics, batch []parser.Event, now time.Time) {
+	stamps := make([]indexer.CommitStamp, len(batch))
+	for i := range batch {
+		stamps[i] = indexer.CommitStamp{ReadAt: batch[i].ReadAt, Timestamp: batch[i].Timestamp}
+	}
+	observeCommitStamps(m, stamps, now)
+}
+
+// observeCommitStamps is observeCommitLag over stamps already taken.
+func observeCommitStamps(m *observe.StreamMetrics, batch []indexer.CommitStamp, now time.Time) {
 	if m == nil || len(batch) == 0 {
 		return
 	}
