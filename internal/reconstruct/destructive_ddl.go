@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/query"
 	mysqldriver "github.com/go-sql-driver/mysql"
 )
@@ -59,6 +60,11 @@ type destructiveDDL struct {
 	File                        string
 	Pos                         uint64
 	AfterSince, AtOrBeforeUntil bool
+	// Inferred is a PostgreSQL row inferred from a shape change (#2441):
+	// the statement committed after Bracket.Low and at or before
+	// Bracket.High, and DetectedAt is the low end (High when there is none).
+	Inferred bool
+	Bracket  event.InferredBracket
 }
 
 func (d destructiveDDL) hasPos() bool { return d.File != "" && d.Pos > 0 }
@@ -198,6 +204,17 @@ func destructiveDDLErr(schema, table string, f ddlFinding, w DDLWindow) error {
 	if d.hasPos() {
 		where = fmt.Sprintf("recorded at %s:%d", d.File, d.Pos)
 	}
+	when := "run at " + d.DetectedAt.UTC().Format(time.RFC3339)
+	if d.Inferred {
+		// No statement reached the index: the change was inferred from the
+		// stream, which only says between which two changes it committed.
+		where = "recorded at stream position " + d.File + ", inferred from the change stream"
+		when = "run at or before " + d.Bracket.High.UTC().Format(time.RFC3339)
+		if d.Bracket.HasLow {
+			when = fmt.Sprintf("run after %s and at or before %s",
+				d.Bracket.Low.UTC().Format(time.RFC3339), d.Bracket.High.UTC().Format(time.RFC3339))
+		}
+	}
 	where += fmt.Sprintf(", row %d of schema_changes", d.ID)
 	// Every row this window counts by position alone, in one statement: an
 	// operator removing them one refusal at a time would rerun once per row.
@@ -209,6 +226,20 @@ func destructiveDDLErr(schema, table string, f ddlFinding, w DDLWindow) error {
 	placed := "between the snapshot this starts from and the requested point in time"
 	todo := fmt.Sprintf("Take a new snapshot of the table, which will hold it as it is after the %s, and start from that one",
 		strings.ToLower(d.Type))
+	if d.Inferred {
+		high := d.Bracket.High.UTC().Format(time.RFC3339)
+		if w.Until.Before(d.Bracket.High) {
+			// The requested point is inside the range: no snapshot can start
+			// a rebuild of a point it is newer than.
+			todo = "The requested point in time falls where the change may or may not have happened yet, so it cannot be rebuilt reliably. Pick a point after " + high + " and start from a snapshot taken after " + high
+			if d.Bracket.HasLow {
+				todo += ", or a point before " + d.Bracket.Low.UTC().Format(time.RFC3339)
+			}
+		} else {
+			todo = fmt.Sprintf("Take a new snapshot of the table after %s, which will hold it as it is after the %s, and start from that one",
+				high, strings.ToLower(d.Type))
+		}
+	}
 	switch how {
 	case ddlByPosition:
 		// The cause is not stated: a statement indexed late and a source
@@ -224,10 +255,14 @@ func destructiveDDLErr(schema, table string, f ddlFinding, w DDLWindow) error {
 		todo = "A snapshot from a full backup taken by DBTrail clears this. Otherwise the rows this window " +
 			"counts by position alone have to be removed from the index database: " + deleteSQL
 	}
+	lies := "lies " + placed
+	if d.Inferred && how == ddlByTime {
+		lies = "may lie between the snapshot this starts from and the requested point in time (the change stream only says it happened inside that range)"
+	}
 	return fmt.Errorf(
-		"%w: %s on %s.%s, run at %s (%s), lies %s. "+
+		"%w: %s on %s.%s, %s (%s), %s. "+
 			"It wrote no row changes to replay, so the result would keep the rows it removed as if they still existed. %s",
-		ErrDestructiveDDL, d.Type, schema, table, d.DetectedAt.UTC().Format(time.RFC3339), where, placed, todo)
+		ErrDestructiveDDL, d.Type, schema, table, when, where, lies, todo)
 }
 
 // errSchemaChangesMissing marks an index that has no schema_changes table at
@@ -338,7 +373,7 @@ func loadDestructiveDDLs(ctx context.Context, db *sql.DB, schema, table string, 
 		sinceOp = ">="
 	}
 	q := `SELECT id, ddl_type, detected_at, binlog_file, binlog_pos,
-			detected_at ` + sinceOp + ` ?, detected_at <= ?
+			detected_at ` + sinceOp + ` ?, detected_at <= ?, LEFT(ddl_query, 400)
 		FROM schema_changes
 		WHERE (schema_name = ? OR schema_name = '') AND table_name = ?
 		AND ddl_type IN ('TRUNCATE TABLE', 'DROP TABLE', 'RENAME TABLE', 'CREATE OR REPLACE TABLE')
@@ -363,8 +398,21 @@ func loadDestructiveDDLs(ctx context.Context, db *sql.DB, schema, table string, 
 	var out []destructiveDDL
 	for rows.Next() {
 		var d destructiveDDL
-		if err := rows.Scan(&d.ID, &d.Type, &d.DetectedAt, &d.File, &d.Pos, &d.AfterSince, &d.AtOrBeforeUntil); err != nil {
+		var head string
+		if err := rows.Scan(&d.ID, &d.Type, &d.DetectedAt, &d.File, &d.Pos, &d.AfterSince, &d.AtOrBeforeUntil, &head); err != nil {
 			return nil, fmt.Errorf("check schema_changes for destructive DDL on %s.%s: %w", schema, table, err)
+		}
+		// An inferred row committed somewhere in its bracket, so it is in the
+		// window whenever the bracket overlaps it: its low end at or before
+		// Until (always, when there is no low end), and its high end after
+		// Since. Placing it by detected_at alone would miss a drop whose
+		// bracket starts before the snapshot and ends after it. Both ends are
+		// read from the marker, which keeps fractions of a second;
+		// detected_at is rounded to the second.
+		if b, ok := event.ParseInferredBracket(head); ok {
+			d.Inferred, d.Bracket = true, b
+			d.AfterSince = b.High.After(w.Since) || (w.sinceInclusive && b.High.Equal(w.Since))
+			d.AtOrBeforeUntil = !b.HasLow || !b.Low.After(w.Until)
 		}
 		out = append(out, d)
 	}

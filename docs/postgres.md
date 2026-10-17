@@ -729,10 +729,11 @@ coerce, but verify your own round-trip.
   trail MySQL's DDL leaves — surfaced by the `list_schema_changes` MCP tool and in
   the `schema_changes` table. It is a *record that the truncate happened*, not a
   reversible event: `recover` has no per-row before-images to put back, and a
-  `reconstruct` that crosses the truncate does not yet consume the marker (it can
-  still resurrect the pre-truncate rows from baseline + deltas). A multi-table
-  `TRUNCATE a, b` records one marker per published table; a truncate of an
-  out-of-scope table records nothing.
+  `reconstruct` whose window crosses the truncate refuses instead of bringing the
+  removed rows back. A multi-table `TRUNCATE a, b` records one marker per
+  published table; a truncate of an out-of-scope table records nothing.
+- **Other schema changes are inferred, not read.** See
+  [Schema changes on PostgreSQL](#schema-changes-on-postgresql).
 - **Sequence cursors are not captured.** The materialized id values in your rows
   *are* captured; the sequence's own `last_value` (a separate catalog object) is
   not — logical decoding does not replicate sequences. After a restore, re-point
@@ -783,6 +784,88 @@ presentation including the live replication-health panel (v0.20.1).
 `verify` — baseline-anchored, live-source, and recover-input — is supported.
 
 ---
+
+## Schema changes on PostgreSQL
+
+PostgreSQL's change stream carries row changes, not schema statements: no
+`CREATE TABLE`, `ALTER TABLE` or `DROP TABLE` ever reaches bintrail-pg as text.
+What the stream does carry is a description of each table (its name and its
+columns with their types) sent before the first change made under a new shape.
+bintrail-pg compares each description with the last one it saw for the same
+table, identified by the table's internal number (its OID, which survives a
+rename), and records what changed in `schema_changes`:
+
+| What the stream shows | Recorded as |
+|---|---|
+| Same table, new name or new schema | `RENAME TABLE` (one row under each name) |
+| Same table, other columns | `ALTER TABLE`, listing the columns added, dropped and retyped (a renamed column reads as one dropped plus one added, and the text says so) |
+| A new table under a name another table held, the old one gone | `DROP TABLE` then `CREATE TABLE` |
+| A new table under a name another table held, the old one still there under another name | `RENAME TABLE` for the old one, then `CREATE TABLE` |
+| A table that was not in the publication when capture started | `CREATE TABLE` (labelled when it is a partition) |
+| A `TRUNCATE` | `TRUNCATE TABLE` |
+
+Nothing is installed in your database for this; it is read from the stream
+alone.
+
+**Which rows belong to which shape is exact.** PostgreSQL decodes every
+change with the table as it was when that change was made, so a row is never
+assigned to the wrong set of columns.
+
+**When the change happened is a range, not an instant.** The stream says the
+change happened after the last change made under the old shape and at or
+before the first one under the new shape, nothing finer. Each inferred row
+starts with a marker carrying that range, for example:
+
+```
+/* dbtrail: inferred from relation shape; oid=16411; instant=at-or-before; low=0/16B3748@2026-10-17T10:00:00Z; high=0/16B9A20@2026-10-17T10:20:00Z */ ALTER TABLE shop.orders: added note (text)
+```
+
+The row's `detected_at` is the start of the range (the end, when the range has
+no start) and its stream position the end. `reconstruct` refuses a point in
+time whose window overlaps the range of an inferred `DROP TABLE` or `RENAME
+TABLE`, since the table may or may not have changed yet at that point; the
+refusal says so and says which points in time can still be rebuilt. A
+`TRUNCATE TABLE` is reported by PostgreSQL with its exact transaction, so it
+has no range and refuses exactly where it happened. A table that was not written
+to for a while after the change has a wide range.
+
+**What cannot be seen.** Anything that changes neither a column's name or type
+nor the table's name or schema: indexes, constraints, defaults, `NOT NULL`,
+ownership, grants, comments, `SET LOGGED` / `UNLOGGED`. A `DROP TABLE` that is
+not followed by a new table of the same name leaves no row: the table simply
+stops appearing. A table created while bintrail-pg was stopped is taken as
+already existing when capture starts again, so it gets no `CREATE TABLE` row.
+On the first restart after upgrading to a version that records table
+identities, a table whose stored shape predates that is matched by name: if
+its columns differ, the change is recorded as an `ALTER TABLE` whose text says
+it could also have been a drop and a create, and `reconstruct` does not refuse
+on it the way it does on a `DROP TABLE`. The statement text and the role that
+ran it are never available.
+
+**If detection cannot start.** What detection needs is read when capture
+starts. If that read fails (for example a very slow index database),
+bintrail-pg captures rows as usual and does not detect schema changes until
+its next restart, and logs that at ERROR level. The table shapes seen during
+that run are stored without their position in the stream, so the next start
+compares against the last shapes detection did see, and a change made in
+between is still found then (its range covers the whole run).
+
+**After a restart.** PostgreSQL resends changes from the point it last
+confirmed, which can be earlier than what bintrail-pg had already recorded.
+Each table description is compared with the shape that table had just before
+it in the stream, so a resent stretch is read exactly as it was the first time,
+and a change already recorded is not recorded again.
+
+**Changes that look like DDL but are not.** Narrowing a publication's column
+list (`ALTER PUBLICATION ... SET TABLE t (a, b)`, PostgreSQL 15+), or on
+PostgreSQL 18 turning `publish_generated_columns` on or off, changes the
+columns the stream carries without changing the table. It is recorded as an
+`ALTER TABLE`.
+
+**Where names come from during catch-up.** When bintrail-pg is behind and a
+name moved to a new table, whether the old table was dropped or renamed (and
+to what) is read from the database as it is now, which can be later than the
+point being processed. The row says so.
 
 ## Managed PostgreSQL
 

@@ -3,6 +3,7 @@ package pgstreamrun
 import (
 	"database/sql"
 	"encoding/json"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"log/slog"
 	"strings"
 	"testing"
@@ -196,5 +197,85 @@ func TestResolveStartLSN(t *testing.T) {
 	// ConsistentPoint (this must NOT be an error).
 	if got := resolveStartLSN(nil, 0, log); got != 0 {
 		t.Errorf("first run: got %d, want 0", got)
+	}
+}
+
+func TestInferredOID_2441(t *testing.T) {
+	for q, want := range map[string]uint32{
+		event.InferredDDLPrefix + " oid=16411; instant=at-or-before; low=none; high=0/1@2026-01-01T00:00:00Z */ x": 16411,
+		event.InferredDDLPrefix + " oid=0; low=none */ x":                                                          0,
+		event.InferredDDLPrefix + " instant=at-or-before */ x":                                                     0,
+		"ALTER TABLE t ADD c INT": 0,
+	} {
+		got, ok := inferredOID(q)
+		if got != want || ok != (want != 0) {
+			t.Errorf("inferredOID(%q) = %d %v, want %d", q, got, ok, want)
+		}
+	}
+}
+
+// Two ALTERs of one table in one transaction carry the same position, OID
+// and kind. After a resend, the index already holding the first must skip
+// only the first: the second is a real change.
+func TestInferredCounter_twoChangesOfOneKindInOneTransaction_2441(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	alter := func(text string) event.Event {
+		return event.Event{BinlogFile: "0/2", EndPos: 2, Schema: "s", Table: "a", EventType: event.EventDDL, DDLType: event.DDLAlterTable,
+			DDLQuery: event.InferredDDLPrefix + " oid=10; instant=at-or-before; low=none; high=0/2@2026-01-01T00:00:00Z */ " + text}
+	}
+	held := sqlmock.NewRows([]string{"ddl_type"}).AddRow("ALTER TABLE")
+	mock.ExpectQuery("FROM schema_changes").WithArgs(uint64(2), "0/2", "s", "a", event.InferredDDLPrefix+" oid=10;%").WillReturnRows(held)
+	mock.ExpectQuery("FROM schema_changes").WithArgs(uint64(2), "0/2", "s", "a", event.InferredDDLPrefix+" oid=10;%").
+		WillReturnRows(sqlmock.NewRows([]string{"ddl_type"}).AddRow("ALTER TABLE"))
+
+	c := &inferredCounter{}
+	if dup, err := c.recorded(db, alter("ALTER TABLE s.a: added x (text)")); err != nil || !dup {
+		t.Fatalf("first ALTER: dup %v err %v, want recorded already", dup, err)
+	}
+	if dup, err := c.recorded(db, alter("ALTER TABLE s.a: added y (text)")); err != nil || dup {
+		t.Fatalf("second ALTER: dup %v err %v, want a new row", dup, err)
+	}
+	c.reset()
+
+	// A RENAME is counted on the row that carries its text, the old name's;
+	// a DROP at the same position and OID is the same change.
+	mock.ExpectQuery("FROM schema_changes").WithArgs(uint64(2), "0/2", "s", "old", event.InferredDDLPrefix+" oid=10;%").
+		WillReturnRows(sqlmock.NewRows([]string{"ddl_type"}).AddRow("RENAME TABLE"))
+	drop := event.Event{BinlogFile: "0/2", EndPos: 2, Schema: "s", Table: "old", EventType: event.EventDDL, DDLType: event.DDLDropTable,
+		DDLQuery: event.InferredDDLPrefix + " oid=10; instant=at-or-before; low=none; high=0/2@2026-01-01T00:00:00Z */ DROP TABLE s.old"}
+	if dup, err := c.recorded(db, drop); err != nil || !dup {
+		t.Fatalf("DROP after a recorded RENAME of the same OID: dup %v err %v", dup, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// The text row of an inferred DROP or RENAME is a release; a rename's
+// pointer row (its new name) and a row whose marker does not parse are not.
+func TestLoadKnownReleases_2441(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	m := event.InferredDDLPrefix + " oid=7; instant=at-or-before; low=none; high=0/2@2026-01-01T00:00:00Z */ "
+	mock.ExpectQuery("FROM schema_changes").WithArgs(event.InferredDDLPrefix + "%").WillReturnRows(
+		sqlmock.NewRows([]string{"schema_name", "table_name", "binlog_pos", "head"}).
+			AddRow("s", "old", 2, m+"RENAME TABLE s.old TO s.new").
+			AddRow("s", "new", 2, m+"(same RENAME TABLE statement as the row for s.old)").
+			AddRow("s", "gone", 3, m+"DROP TABLE s.gone (its name now belongs to a new table)").
+			AddRow("s", "x", 4, event.InferredDDLPrefix+" instant=at-or-before */ DROP TABLE s.x"))
+	got, err := loadKnownReleases(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []pgcapture.KnownRelease{{OID: 7, Schema: "s", Table: "old", LSN: 2}, {OID: 7, Schema: "s", Table: "gone", LSN: 3}}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("got %+v, want %+v", got, want)
 	}
 }

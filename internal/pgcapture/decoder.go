@@ -48,6 +48,10 @@ type Decoder struct {
 	// for the caller to drain via TakePending after every Decode (#827).
 	pending []event.Event
 
+	// infer, when set (WithDDLInference), turns Relation shape changes into
+	// inferred schema_changes rows (#2441). nil = shapes change silently.
+	infer *inferState
+
 	// timescaleWarned makes the TimescaleDB out-of-scope guard (#559) warn ONCE per
 	// stream: a busy hypertable has many chunk relations, and one warning per chunk
 	// would flood the log.
@@ -130,15 +134,38 @@ func (d *Decoder) Decode(msg pglogrepl.Message) (event.Event, bool, error) {
 		if err := d.cacheRelation(m); err != nil {
 			return event.Event{}, false, err
 		}
+		// Inferred DDL first (#2441): the consumer writes each event in order,
+		// and a schema-change row written before the new shape's snapshot
+		// survives a crash between the two (the redelivered Relation writes a
+		// duplicate row); the reverse order would lose the change, because the
+		// restart would find the new shape already known. Inference tracks
+		// every relation; only in-scope rows are emitted.
+		var out []event.Event
+		if d.infer != nil {
+			inScope := func(n relName) bool { return d.filters.Matches(n.schema, n.table) }
+			inferred, err := d.infer.observe(m, d.txn, inScope, d.logger.Warn)
+			if err != nil {
+				return event.Event{}, false, err
+			}
+			for _, ev := range inferred {
+				if d.ddlInScope(ev) {
+					out = append(out, ev)
+				}
+			}
+		}
 		// Emit a schema snapshot for the consumer to persist (#533), but only for an
 		// in-scope relation: cacheRelation caches EVERY relation so row decoding can
 		// resolve any OID, yet a filtered-out table must not write snapshot rows or
 		// stamp a SchemaVersion. Gate the EMIT, not the cache.
 		rel := d.relations[m.RelationID]
-		if !d.filters.Matches(rel.schema, rel.table) {
+		if d.filters.Matches(rel.schema, rel.table) {
+			out = append(out, relationEvent(rel, d.txn, d.infer != nil))
+		}
+		if len(out) == 0 {
 			return event.Event{}, false, nil
 		}
-		return relationEvent(rel), true, nil
+		d.pending = append(d.pending, out[1:]...)
+		return out[0], true, nil
 
 	case *pglogrepl.InsertMessage:
 		return d.decodeInsert(m)
@@ -338,10 +365,24 @@ func isTimescaleChunk(schema, table string) bool {
 // MySQL's TakeSnapshot — no information_schema). IsPK is by name; rel.pkCols is
 // already in table-ordinal order (cacheRelation reordered it), so the snapshot's PK
 // columns align with the resolver. Ordinal is the table-column position.
-func relationEvent(rel *relationInfo) event.Event {
+func relationEvent(rel *relationInfo, txn txnContext, inferring bool) event.Event {
 	pkNames := make(map[string]bool, len(rel.pkCols))
 	for _, pk := range rel.pkCols {
 		pkNames[pk.Name] = true
+	}
+	var seenLSN uint64
+	var seenAt time.Time
+	// Where the shape was seen. While DDL inference is off, the time is left
+	// out: such a shape was never compared, so the next start does not use it
+	// as the reference (it compares against the last shape inference saw,
+	// and a change made meanwhile is still found), and its position marks a
+	// stretch where the index's own rows cannot bound a change (some of them
+	// may already be under a new shape).
+	if txn.open {
+		seenLSN = uint64(txn.commitLSN)
+		if inferring {
+			seenAt = txn.commitTime
+		}
 	}
 	cols := make([]metadata.PGRelationColumn, len(rel.columns))
 	for i, c := range rel.columns {
@@ -361,6 +402,8 @@ func relationEvent(rel *relationInfo) event.Event {
 		EventType: event.EventRelation,
 		Relation: &metadata.PGRelationSchema{
 			OID:     rel.oid,
+			SeenLSN: seenLSN,
+			SeenAt:  seenAt,
 			Schema:  rel.schema,
 			Table:   rel.table,
 			Columns: cols,
@@ -549,6 +592,9 @@ func (d *Decoder) rowEvent(rel *relationInfo, typ event.EventType, before, after
 	// MySQL's distinct per-row byte offsets). This is intentional and safe: the
 	// downstream stack treats position fields as opaque metadata it never orders or
 	// compares on (see event.Event); the durable cursor advances on EventCommit.
+	if d.infer != nil {
+		d.infer.noteChange(rel.oid, d.txn)
+	}
 	lsn := d.txn.commitLSN.String()
 	return event.Event{
 		BinlogFile: lsn,
@@ -585,6 +631,20 @@ func (d *Decoder) truncateEvent(rel *relationInfo) event.Event {
 		DDLType:    event.DDLTruncateTable,
 		DDLQuery:   fmt.Sprintf("TRUNCATE TABLE %s.%s", rel.schema, rel.table),
 	}
+}
+
+// ddlInScope reports whether an inferred DDL event names an in-scope table; a
+// rename is in scope when either name is.
+func (d *Decoder) ddlInScope(ev event.Event) bool {
+	if d.filters.Matches(ev.Schema, ev.Table) {
+		return true
+	}
+	for _, t := range ev.DDLTables {
+		if d.filters.Matches(t.Schema, t.Table) {
+			return true
+		}
+	}
+	return false
 }
 
 // TakePending returns and clears the events the last Decode buffered beyond its

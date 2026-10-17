@@ -5,6 +5,7 @@ package metadata
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
@@ -32,7 +33,7 @@ func TestLoadPGShapes_integration(t *testing.T) {
 		return id
 	}
 
-	shapes, err := LoadPGShapes(ctx, indexDB)
+	shapes, err := LoadPGShapes(ctx, indexDB, 0)
 	if err != nil || len(shapes) != 0 {
 		t.Fatalf("empty index: %d shapes, err %v", len(shapes), err)
 	}
@@ -49,7 +50,7 @@ func TestLoadPGShapes_integration(t *testing.T) {
 		(snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, is_nullable)
 		VALUES (999, NOW(), 'shop', 'mysql_table', 'id', 1, 'PRI', 'int', 'NO')`)
 
-	shapes, err = LoadPGShapes(ctx, indexDB)
+	shapes, err = LoadPGShapes(ctx, indexDB, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,5 +87,42 @@ func TestLoadPGShapes_integration(t *testing.T) {
 		if shapes[i-1].SnapshotID >= shapes[i].SnapshotID {
 			t.Errorf("not ordered by snapshot: %v", ids(shapes))
 		}
+	}
+}
+
+// For a resume position, every shape seen from it on is returned, plus the
+// one in effect where PostgreSQL's resend starts; the position and time each
+// was seen read back.
+func TestLoadPGShapes_fromAResumePosition(t *testing.T) {
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+	ctx := context.Background()
+	at := time.Date(2026, 10, 17, 12, 0, 0, 123456000, time.UTC)
+	write := func(lsn uint64, cols ...string) int {
+		t.Helper()
+		r := &PGRelationSchema{OID: 40, Schema: "public", Table: "t", SeenLSN: lsn, SeenAt: at.Add(time.Duration(lsn) * time.Second)}
+		for i, c := range cols {
+			r.Columns = append(r.Columns, PGRelationColumn{Name: c, Ordinal: i + 1, TypeOID: 23, TypeMod: -1})
+		}
+		id, err := WritePGSnapshot(ctx, indexDB, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	old := write(100, "id")
+	write(200, "id", "x")
+	for _, c := range []struct {
+		from uint64
+		n    int
+	}{{150, 2}, {0, 1}, {300, 1}, {50, 2}} {
+		shapes, err := LoadPGShapes(ctx, indexDB, c.from)
+		if err != nil || len(shapes) != c.n {
+			t.Fatalf("from %d: %d shapes, err %v, want %d", c.from, len(shapes), err, c.n)
+		}
+	}
+	shapes, _ := LoadPGShapes(ctx, indexDB, 150)
+	if s := shapes[0]; s.SnapshotID != old || s.Relation.SeenLSN != 100 || !s.Relation.SeenAt.Equal(at.Add(100*time.Second)) {
+		t.Errorf("base shape = id %d seen %d@%v", s.SnapshotID, s.Relation.SeenLSN, s.Relation.SeenAt)
 	}
 }

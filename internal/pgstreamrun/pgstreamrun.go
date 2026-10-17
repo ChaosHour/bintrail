@@ -17,6 +17,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -169,6 +171,12 @@ func One(ctx context.Context, cfg Config) error {
 		ExpectExistingSlot: saved != nil, // resuming → the slot must still exist + be valid
 		OnStarted:          sourceConnectedHook(cfg.Hooks),
 		Logger:             logger,
+		// The shapes the index holds (#2441), loaded by the capturer once it
+		// knows where the slot resends from. If they cannot be read, the
+		// capturer captures rows without detecting schema changes for that
+		// run and says so at ERROR level; it never stops capture.
+		LoadKnownShapes: func(from uint64) (pgcapture.KnownState, error) { return loadKnownState(indexDB, from) },
+		LastChange:      lastIndexedChange(indexDB),
 	})
 	idx := indexer.New(indexDB, cfg.BatchSize)
 
@@ -425,6 +433,11 @@ func streamLoopPG(
 	// never hits (its RelationMessage always precedes it).
 	snapshotByTable := make(map[string]uint32)
 
+	// inferredSeen counts the inferred schema changes written in the current
+	// transaction, so a resent one is recognised without dropping a second
+	// real change of the same kind in the same transaction (#2441).
+	inferredSeen := &inferredCounter{}
+
 	// The writer (#2391): rows of complete transactions are batched together,
 	// and the transaction being read is held in an index transaction of its
 	// own until its commit, so a reader never sees part of it (past the
@@ -520,7 +533,12 @@ func streamLoopPG(
 				}
 				return nil
 			}
-			if !ev.Timestamp.IsZero() {
+			// An inferred schema change is dated at the LOW end of its bracket
+			// (#2441), possibly long before the stream's position, so it is not
+			// a reading of how far the stream is. (The change and commit of the
+			// same transaction follow it and would set the time anyway; this
+			// keeps a checkpoint between them from saving the older time.)
+			if !ev.Timestamp.IsZero() && !strings.HasPrefix(ev.DDLQuery, event.InferredDDLPrefix) {
 				state.lastEventTime = sql.NullTime{Time: ev.Timestamp, Valid: true}
 			}
 			switch ev.EventType {
@@ -528,12 +546,15 @@ func streamLoopPG(
 				// The boundary: record the commit LSN; its rows are already in the
 				// writer (pgoutput delivers them before the commit).
 				lastCommitLSN = ev.EndPos
+				inferredSeen.reset()
 				if err := w.End(); err != nil {
 					return err
 				}
 			case event.EventDDL:
-				// A DDL marker — on the PostgreSQL path today only a TRUNCATE audit
-				// record (#827). Persist it to schema_changes immediately, the
+				// A DDL marker: a TRUNCATE audit record (#827), or a schema change
+				// inferred from a Relation shape (#2441; the decoder emits it
+				// BEFORE that shape's EventRelation, so a crash between the two
+				// re-delivers and re-records it rather than losing it). Persist it to schema_changes immediately, the
 				// source-neutral analog of the MySQL DDL path, so the truncate is a
 				// durable, queryable record (bintrail-mcp list_schema_changes / the
 				// schema_changes table) rather than a transient warn. Like the
@@ -543,8 +564,13 @@ func streamLoopPG(
 				// cursor) and does NOT force a flush of the in-flight batch. A crash
 				// before the next checkpoint re-delivers the TRUNCATE and re-records a
 				// benign duplicate marker.
+				if dup, err := inferredSeen.recorded(indexDB, ev); err != nil {
+					return fmt.Errorf("pgstreamrun: check for an already recorded %s on %s.%s: %w", ev.DDLType, ev.Schema, ev.Table, err)
+				} else if dup {
+					continue
+				}
 				if err := indexer.InsertSchemaChange(indexDB, ev, nil); err != nil {
-					return fmt.Errorf("pgstreamrun: record TRUNCATE marker for %s.%s: %w", ev.Schema, ev.Table, err)
+					return fmt.Errorf("pgstreamrun: record %s for %s.%s: %w", ev.DDLType, ev.Schema, ev.Table, err)
 				}
 			case event.EventRelation:
 				// A relation's shape (#533): persist it as a schema snapshot and record
@@ -660,4 +686,188 @@ func resolveStartLSN(saved *pgStreamState, flagLSN uint64, logger *slog.Logger) 
 	}
 	logger.Info("pgstreamrun: first run — starting from the slot's consistent point")
 	return 0
+}
+
+// loadKnownState reads what DDL inference needs at start (#2441): the shapes
+// a resend from the slot's position is compared against, and the inferred
+// DROP/RENAME rows already recorded, which say where a table gave up a name.
+func loadKnownState(indexDB *sql.DB, from uint64) (pgcapture.KnownState, error) {
+	shapes, err := loadKnownShapes(indexDB, from)
+	if err != nil {
+		return pgcapture.KnownState{}, err
+	}
+	releases, err := loadKnownReleases(indexDB)
+	if err != nil {
+		return pgcapture.KnownState{}, err
+	}
+	return pgcapture.KnownState{Shapes: shapes, Releases: releases}, nil
+}
+
+// loadKnownReleases reads the inferred DROP TABLE and RENAME TABLE rows that
+// carry the text (not a rename's pointer row under its new name): each says
+// table OID gave up schema_name.table_name at binlog_pos.
+func loadKnownReleases(indexDB *sql.DB) ([]pgcapture.KnownRelease, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), indexer.WriteTimeout)
+	defer cancel()
+	rows, err := indexDB.QueryContext(ctx, `
+		SELECT schema_name, table_name, binlog_pos, LEFT(ddl_query, 600) FROM schema_changes
+		WHERE ddl_type IN ('DROP TABLE', 'RENAME TABLE') AND ddl_query LIKE ?`,
+		event.InferredDDLPrefix+"%")
+	if err != nil {
+		return nil, fmt.Errorf("pgstreamrun: load recorded table drops and renames: %w", err)
+	}
+	defer rows.Close()
+	var out []pgcapture.KnownRelease
+	for rows.Next() {
+		var r pgcapture.KnownRelease
+		var head string
+		if err := rows.Scan(&r.Schema, &r.Table, &r.LSN, &head); err != nil {
+			return nil, fmt.Errorf("pgstreamrun: scan recorded table drops and renames: %w", err)
+		}
+		oid, ok := inferredOID(head)
+		if !ok {
+			continue
+		}
+		if end := strings.Index(head, "*/"); end < 0 || strings.HasPrefix(strings.TrimSpace(head[end+2:]), "(same ") {
+			continue // a pointer row: its table is the name taken, not given up
+		}
+		r.OID = oid
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pgstreamrun: load recorded table drops and renames: %w", err)
+	}
+	return out, nil
+}
+
+// loadKnownShapes reads the stored shapes per table for DDL inference.
+func loadKnownShapes(indexDB *sql.DB, from uint64) ([]pgcapture.KnownShape, error) {
+	shapes, err := metadata.LoadPGShapes(context.Background(), indexDB, from)
+	if err != nil {
+		return nil, fmt.Errorf("pgstreamrun: load the last known table shapes: %w", err)
+	}
+	out := make([]pgcapture.KnownShape, len(shapes))
+	for i, s := range shapes {
+		k := pgcapture.KnownShape{OID: s.Relation.OID, Schema: s.Relation.Schema, Table: s.Relation.Table,
+			SeenLSN: s.Relation.SeenLSN, SeenAt: s.Relation.SeenAt}
+		for _, c := range s.Relation.Columns {
+			k.Columns = append(k.Columns, pgcapture.ShapeColumn{Name: c.Name, TypeOID: c.TypeOID, TypeMod: c.TypeMod})
+		}
+		out[i] = k
+	}
+	return out, nil
+}
+
+// lastIndexedChange returns the newest indexed change to a table that
+// committed before an LSN: the lower bound of a schema change when the stream
+// has not decoded one since it started (#2441). The plain comparison uses
+// idx_row_lookup; the BINARY one keeps the index's case-insensitive collation
+// from answering for "A" when asked about a.
+func lastIndexedChange(indexDB *sql.DB) func(schema, table string, beforeLSN uint64) (uint64, time.Time, bool, error) {
+	return func(schema, table string, beforeLSN uint64) (uint64, time.Time, bool, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), indexer.WriteTimeout)
+		defer cancel()
+		var lsn uint64
+		var at time.Time
+		err := indexDB.QueryRowContext(ctx, `
+			SELECT end_pos, event_timestamp FROM binlog_events
+			WHERE schema_name = ? AND table_name = ?
+			  AND BINARY schema_name = ? AND BINARY table_name = ?
+			  AND end_pos < ?
+			ORDER BY event_timestamp DESC, event_id DESC
+			LIMIT 1`, schema, table, schema, table, beforeLSN).Scan(&lsn, &at)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, time.Time{}, false, nil
+		}
+		if err != nil {
+			return 0, time.Time{}, false, err
+		}
+		return lsn, at.UTC(), true, nil
+	}
+}
+
+// inferredCounter recognises an inferred schema change (#2441) that is
+// already in schema_changes, written before a restart made PostgreSQL resend
+// the transaction that produced it.
+//
+// The same change is the same table OID at the same stream position with the
+// same kind; a DROP and a RENAME of one OID at one position count as one kind
+// (which of the two depends on the live catalog, read again on the resend).
+// The text is not compared: a resend can word the same change differently.
+// One transaction can change one table twice the same way (two ALTERs), so
+// existence is not enough: the n-th such change of a transaction is a resend
+// only when the index already holds more than n-1 of them. A resend emits
+// them in the same order. Other DDL markers are not checked (a TRUNCATE
+// recorded twice stays a benign duplicate, as before).
+type inferredCounter struct{ emitted map[string]int }
+
+func (c *inferredCounter) reset() { c.emitted = nil }
+
+func inferredFamily(k event.DDLKind) string {
+	if k == event.DDLDropTable || k == event.DDLRenameTable {
+		return "gone"
+	}
+	return string(k)
+}
+
+func (c *inferredCounter) recorded(indexDB *sql.DB, ev event.Event) (bool, error) {
+	if !strings.HasPrefix(ev.DDLQuery, event.InferredDDLPrefix) {
+		return false, nil
+	}
+	oid, ok := inferredOID(ev.DDLQuery)
+	if !ok {
+		return false, nil
+	}
+	// The row that carries the text: the first table's (a rename writes a
+	// second row, under the new name, that points at it).
+	sch, tbl := ev.Schema, ev.Table
+	if len(ev.DDLTables) > 0 {
+		sch, tbl = ev.DDLTables[0].Schema, ev.DDLTables[0].Table
+	}
+	fam := inferredFamily(ev.DDLType)
+	key := fmt.Sprintf("%d/%d/%s", ev.EndPos, oid, fam)
+	if c.emitted == nil {
+		c.emitted = map[string]int{}
+	}
+	before := c.emitted[key]
+	c.emitted[key] = before + 1
+
+	ctx, cancel := context.WithTimeout(context.Background(), indexer.WriteTimeout)
+	defer cancel()
+	rows, err := indexDB.QueryContext(ctx, `
+		SELECT ddl_type FROM schema_changes
+		WHERE binlog_pos = ? AND binlog_file = ?
+		  AND BINARY schema_name = ? AND BINARY table_name = ?
+		  AND ddl_query LIKE ?`,
+		ev.EndPos, ev.BinlogFile, sch, tbl, fmt.Sprintf("%s oid=%d;%%", event.InferredDDLPrefix, oid))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	held := 0
+	for rows.Next() {
+		var kind string
+		if err := rows.Scan(&kind); err != nil {
+			return false, err
+		}
+		if inferredFamily(event.DDLKind(kind)) == fam {
+			held++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return held > before, nil
+}
+
+// inferredOID reads the table OID from an inferred row's marker.
+func inferredOID(q string) (uint32, bool) {
+	rest := strings.TrimPrefix(q, event.InferredDDLPrefix)
+	f, _, _ := strings.Cut(strings.TrimSpace(rest), ";")
+	v, found := strings.CutPrefix(f, "oid=")
+	if !found {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(v, 10, 32)
+	return uint32(n), err == nil && n != 0
 }
