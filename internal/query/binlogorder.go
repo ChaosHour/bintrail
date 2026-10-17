@@ -306,6 +306,14 @@ func binlogBaseNames(rows []ResultRow) []string {
 }
 
 func binlogBaseName(file string) string {
+	// A PostgreSQL LSN (#1596): one sequence per cluster, so one base name,
+	// which no binlog file can have (a base name holds no slash).
+	// reconstruct.BinlogBaseName deliberately keeps each LSN its own base
+	// name for now: its callers (event marks, the console's copies) still
+	// order by binlog file text, and a differing base name makes them decline.
+	if strings.Contains(file, "/") {
+		return "/"
+	}
 	i := strings.LastIndexByte(file, '.')
 	if i < 0 || i == len(file)-1 {
 		return file

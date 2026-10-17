@@ -175,16 +175,32 @@ func ProfileExists(ctx context.Context, db *sql.DB, profile string) (bool, error
 // (constant basename, numeric suffix zero-padded to a minimum width) this
 // equals numeric-suffix order, including past the .999999 → .1000000 rollover
 // where the suffix grows a digit and plain lexicographic order inverts (#840).
+//
+// On a PostgreSQL source the coordinate is an LSN (#1596): File holds its text
+// as pgcapture writes it ("0/16B3748", unpadded %X/%X) and Pos its number.
+// Such positions are ordered by Pos alone, and the fetch predicates compare
+// start_pos/end_pos by number (every row of a transaction carries its commit
+// LSN in both): the file-name rule would put "1/0" before "0/16B3748".
 type BinlogPos struct {
 	File string
 	Pos  uint64
 }
+
+// IsLSN reports whether p is a PostgreSQL LSN rather than a binlog
+// coordinate. A binary log base name cannot hold a slash (the server stores
+// only the name after the last one); an LSN always does.
+func (p BinlogPos) IsLSN() bool { return strings.Contains(p.File, "/") }
 
 // AtOrBefore reports whether p is at or before q in binlog order, by the same
 // rule buildQuery's SincePos/UntilPos predicates use BELOW in this file: the
 // file by name length first, then lexicographically (the #840 rollover), then
 // the position. In SQL that rule is applied to start_pos for the lower bound
 // and to end_pos for the upper one; here it compares two coordinates as such.
+//
+// A PostgreSQL LSN orders by its number, and an LSN never orders against a
+// binlog coordinate (see the IsLSN branches): the copies below are MySQL-only,
+// reached with no LSN (cascade reads binlog anchors only, the Iceberg export
+// refuses a PostgreSQL source).
 //
 // Two packages carry their own copy: cascade.afterSnapshot compares a whole
 // ResultRow against a coordinate, and icebergexport.binlogBefore is this same
@@ -195,6 +211,16 @@ type BinlogPos struct {
 // len() counts bytes where MySQL's CHAR_LENGTH and DuckDB's length count
 // characters; identical for the ASCII basenames a binlog actually carries.
 func (p BinlogPos) AtOrBefore(q BinlogPos) bool {
+	if p.IsLSN() && q.IsLSN() {
+		return p.Pos <= q.Pos
+	}
+	if p.IsLSN() != q.IsLSN() {
+		// One LSN and one binlog coordinate: rows of two sources in one index
+		// (an index reused after `reset`), which no order relates. True is
+		// the answer that keeps a read: every floor caller asks "may this
+		// hold something at or after the anchor".
+		return true
+	}
 	if len(p.File) != len(q.File) {
 		return len(p.File) < len(q.File)
 	}
@@ -978,7 +1004,11 @@ func buildQuery(opts Options) (string, []any) {
 			args = append(args, since)
 		}
 	}
-	if opts.SincePos != nil {
+	if opts.SincePos != nil && opts.SincePos.IsLSN() {
+		// A PostgreSQL anchor (#1596): the commit LSN, by number.
+		where = append(where, "start_pos >= ?")
+		args = append(args, opts.SincePos.Pos)
+	} else if opts.SincePos != nil {
 		// Exact binlog lower bound: events whose start position is at-or-after
 		// the anchor (a later file, or the same file at-or-after the position).
 		// MySQL's SHOW MASTER STATUS position is the NEXT-write position at
@@ -1007,7 +1037,11 @@ func buildQuery(opts Options) (string, []any) {
 		where = append(where, "event_timestamp <= ?")
 		args = append(args, until)
 	}
-	if opts.UntilPos != nil {
+	if opts.UntilPos != nil && opts.UntilPos.IsLSN() {
+		// A PostgreSQL anchor (#1596): the commit LSN, by number.
+		where = append(where, "end_pos <= ?")
+		args = append(args, opts.UntilPos.Pos)
+	} else if opts.UntilPos != nil {
 		// Exact binlog upper bound: events whose end position is at-or-before the
 		// anchor (an earlier file, or the same file no further than the position).
 		// "Earlier file" is length-then-lexicographic (see BinlogPos): MySQL pads
