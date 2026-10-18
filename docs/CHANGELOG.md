@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.108.1] - 2026-10-18
+
+The first published build of the changes listed under 0.108.0, which was
+tagged and has no binaries or packages of its own: its release stopped in the
+PostgreSQL-source tests, whose server in the release workflow lacked a setting
+the CI one had. The demo image `0.108.0` was published and runs the same code.
+
+### Changed
+- **The release starts its PostgreSQL test server with the same settings as
+  CI**, and a check fails every pull request where the two differ (#2462).
+
 ## [0.108.0] - 2026-10-18
 ### Added
 - **AI clients connected to the web interface can ask about the data as it is now.** The console's `/mcp` gains a `sql` tool: one read-only statement on the copy, through the same engine as the SQL page, for totals, rankings, trends and joins across tables. Each answer carries the statement that ran, verbatim, and the time of the copy that answered, and the tool asks the model to show both. At most 500 rows and 1 MiB per answer; a cut answer says so and points to the SQL page or the MySQL port for every row. It needs `sql:execute`, is refused per call on a server with access rules (a data profile, denied tables or redacted columns), takes the same one-query-at-a-time slot as the SQL page, keyed by the token, and is audited as `sql.run`. The model learns the tables from the copy itself (`SHOW ALL TABLES`, `DESCRIBE schema.table`). The standalone `bintrail-mcp` binary keeps its six tools. New section "Questions about your data" in the MCP guide (#2456, #2460, #2461).
