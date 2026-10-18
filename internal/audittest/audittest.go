@@ -144,6 +144,11 @@ var Required = []Requirement{
 		Why:   "an LLM client generating a cascade reversal script with SYNTHESIZED child rows",
 	},
 	{
+		Pair:  Pair{Surface: "mcp", Action: "sql.run"},
+		Owner: OwnerMCP,
+		Why:   "an LLM client running free read-only SQL over the copy's Parquet files (only the console registers the tool, so real records carry Surface console-mcp; internal/console's MCP sql test pins that tag)",
+	},
+	{
 		Pair:  Pair{Surface: "mcp", Action: "reconstruct.row"},
 		Owner: OwnerMCPIntegration,
 		Why:   "an LLM client reading point-in-time row state (baseline + deltas)",
