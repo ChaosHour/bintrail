@@ -6,16 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-### Changed
-- **The MCP Server page is one panel that shows what Claude will ask for.** The three cards become three short steps beside a drawing of the box Claude Desktop shows while installing DBTrail, already holding this console's address and, the one time it is shown, the new token, each with its own Copy button. Under it the page says whether an AI client has reached DBTrail, and updates that line by itself while it is open. Example questions sit under the panel, and the setup for other AI tools folds into one line.
-- **Opened on this computer's own address (`localhost`, `127.x`, `::1`), the MCP Server page says the address works for Claude only while the tunnel that reached DBTrail stays open**, and folds the commands that keep one open (ssh, autossh, AWS Session Manager), with this page's port filled in. On the claude.ai path it says the browser version cannot reach such an address at all.
 
+## [0.109.0] - 2026-10-18
 ### Added
 - **`GET /api/mcp-token` says when each token last reached a server**: `last_used_at` for the managed token (the current value only, so a new or deleted token reads as unused), `static_last_used_at` for the static one, and `counting_since`, when the process started. A refused token or an unknown `/mcp/{id-or-name}` is not a use. Kept in memory.
 
-
 ### Changed
+- **The MCP Server page is one panel that shows what Claude will ask for.** The three cards become three short steps beside a drawing of the box Claude Desktop shows while installing DBTrail, already holding this console's address and, the one time it is shown, the new token, each with its own Copy button. Under it the page says whether an AI client has reached DBTrail, and updates that line by itself while it is open. Example questions sit under the panel, and the setup for other AI tools folds into one line.
+- **Opened on this computer's own address (`localhost`, `127.x`, `::1`), the MCP Server page says the address works for Claude only while the tunnel that reached DBTrail stays open**, and folds the commands that keep one open (ssh, autossh, AWS Session Manager), with this page's port filled in. On the claude.ai path it says the browser version cannot reach such an address at all.
 - **The bundled index MySQL sizes its buffer pool to the machine when `INDEX_BUFFER_POOL` is unset** (compose file version 6). Before, a stack started from `docker-compose.yml` alone, without `install.sh`, ran the index MySQL with InnoDB's 128 MB default whatever the machine had, which caps capture on a busy source and slows every refresh of the copy for SQL: measured on a 4-core, 8 GB host under a TPC-C load, a refresh of 5 minutes of changes took 10 to 12 minutes at 128 MB and 2 to 3 minutes at the 1G this rule picks there. The `index-mysql` entrypoint now applies the rule `install.sh` and `doctor` already use (a quarter of the memory, whole GB from 1G, at most 32G, the default under about 1 GB) and prints the value in `docker compose logs index-mysql`. A value in `.env` is still used as written. **On upgrade**: taking the version 6 file restarts an index MySQL that ran at 128 MB with a quarter of the machine's memory; set `INDEX_BUFFER_POOL` in `.env` first to keep a lower value.
+- **The DuckDB schema and the Iceberg export moved to Snapshots, Download.** They sat on MCP Server and on MySQL clients; both now live in a fold, "Use it where it lives", under the download lanes. The "To open in DuckDB" lane is one download: the archive already carries its own `views.sql`, which opens wherever it is unpacked (#2463).
 
 ## [0.108.1] - 2026-10-18
 
