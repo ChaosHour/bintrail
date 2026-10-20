@@ -1178,6 +1178,12 @@ func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schem
 				narrowed.Baselines = tables
 				narrowed.NonUTCSession = true
 			}
+			// For each table the statement reads, whether the one pair it
+			// is read through removes any base row (#2478); a pair that
+			// removes none is read without the dead-row join. Here and not
+			// where the input is built, which also serves checks that
+			// render no view.
+			markReadTablesWithoutDeadRows(narrowed.Baselines, readTables)
 			viewsSQL = views.Generate(narrowed) + sqlUsedSchema(in, narrowed.OnlyViews, schema)
 			return viewsSQL, nil
 		},
@@ -1890,4 +1896,20 @@ func csvCell(v any) string {
 		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 	}
 	return s
+}
+
+// markReadTablesWithoutDeadRows runs views.MarkTableDeltasWithoutDeadRows on
+// the entries of tables that are also in read, matched by schema and table:
+// one footer read per table the statement reads (every table, when the parse
+// could not tell which ones).
+func markReadTablesWithoutDeadRows(tables, read []views.BaselineTable) {
+	want := make(map[[2]string]bool, len(read))
+	for _, t := range read {
+		want[[2]string{t.Schema, t.Table}] = true
+	}
+	for i := range tables {
+		if want[[2]string{tables[i].Schema, tables[i].Table}] {
+			views.MarkTableDeltasWithoutDeadRows(tables[i : i+1])
+		}
+	}
 }
