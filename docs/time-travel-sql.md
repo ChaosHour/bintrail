@@ -758,7 +758,12 @@ The copy answers with what capture has indexed, not only with its last
 snapshot. For each table a statement reads, the newest change of each row the
 index holds after the table's snapshot (the table's tail) replaces the
 snapshot's row, so the answer is about as far behind as capture, usually
-seconds. A statement reads every table at one moment: if one table it reads
+seconds, plus about a second more: the tails are brought up to date in the
+background, a second after the previous update ends, while statements read
+them, and a statement reads the newest version ready instead of waiting for
+the index. While an update is slow, the answers are older by as long as it
+takes.
+A statement reads every table at one moment: if one table it reads
 has no tail, or tails stopped at different moments, the statement reads every
 table as it was at its snapshot, so a join never pairs a row of now with a
 row of an hour ago. A table has no tail when:
@@ -769,8 +774,11 @@ row of an hour ago. A table has no tail when:
 - more than 200,000 rows changed since its snapshot (its tail then stops
   advancing until the next snapshot);
 - capture does not record it, or `bintrail index` also wrote the index;
-- its changes since its snapshot could not be read in the time a statement
-  waits for them (until its next snapshot);
+- its tail is being built (the first statement over it, or the first after
+  a newer snapshot of it that the tail cannot be moved to), until the build
+  is in;
+- the last update of the tails failed or ran out of time: then no table has
+  one, for every statement, until an update succeeds;
 - the statement is answered from an earlier snapshot, because the newest
   holds more unmerged changes than it can read.
 
