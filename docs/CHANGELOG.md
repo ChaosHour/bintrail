@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.111.1] - 2026-10-21
+### Fixed
+- **A statement on the routed MySQL port no longer waits for a table's recent changes to be rebuilt after a refresh** (#2483). Each statement there overlays every table's changes indexed since its published snapshot. When a refresh published a newer snapshot, the next statement rebuilt that overlay from the index, inside a 2-second budget. On busy tables the rebuild did not fit: the statement waited the full 2 s, and the table then read without its recent changes until the next refresh. Two changes:
+  - When a newer snapshot arrives, the overlay a table already has is trimmed in memory to what the snapshot does not hold, instead of being rebuilt (#2485).
+  - The rebuilds still needed (a new table, an overlay that grew past its budget, a snapshot it cannot be trimmed to) run in the background, with retries. No statement waits for them (#2486). Until a rebuild is ready, a statement reads that table as of its snapshot, or keeps the previous overlay where that is still exact.
+- **The GROUP BY key rewrite from 0.111.0 is removed** (#2488). It was faster on a synthetic copy. On real copies, the per-group check that keeps it safe made the statement it targets 16–22% slower than running it as written, so the 2.21 s → 1.29 s figure in the 0.111.0 notes does not hold.
+
+
 ## [0.111.0] - 2026-10-20
 ### Changed
 - **SQL on the copy reads a table with recent changes faster.** A table the copy has caught up after its snapshot is read as the snapshot plus a chain of deltas, and every row of the snapshot went through a join against the rows those deltas removed, even when they removed none. Now a delta pair that removed no rows is read without that join (#2480), and when the removed rows sit in one stretch of the snapshot no larger than half of it, only that stretch goes through the join and the rest is read directly (#2481). On a 6-million-row table: the empty-chain overhead (about a third of the statement) is gone, and with 400 thousand removed rows the read went from 0.60 s to 0.37 s. Both shortcuts check their own premise inside the statement and take the full path when it does not hold; answers are unchanged. Removed rows spread across the whole table still take the full join.
