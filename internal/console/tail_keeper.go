@@ -30,13 +30,25 @@ import (
 // would skip it.
 //
 // A tail only advances. When a refresh publishes a newer cut of a table, its
-// tail is rebuilt from that cut, to shrink it; a rebuild that fails keeps the
-// old one while it is still advancing: it holds every change after an older
-// cut up to the cursor, and the cursor is past anything a refresh can have
-// published. A tail that grows past its budget stops advancing (frozen) and
-// goes on serving what it holds, with its own older instant, until the next
-// published cut rebuilds it; a frozen tail is never laid over a newer cut,
-// whose rows may be newer than its own.
+// tail is pruned to that cut, to shrink it (#2483): an advancing tail holds
+// every change after its older cut up to the cursor, so dropping the keys
+// whose last change the newer cut already holds leaves exactly what a rebuild
+// from the newer cut would read, with no read of the index and no wait. That
+// holds only while the cursor stands at or past the newer cut, which is not a
+// given: a dump's cut is where the source stood when it was read, and capture
+// may still be behind it; a refresh's cut ends after its last event, which is
+// past where that event starts (its last event id says it then). So pruneTo
+// checks it (reached), with every other condition the argument needs, and the
+// tail is rebuilt from the cut when one fails; a tail built over a cut the
+// cursor has not reached folds, as it advances, only the changes after that
+// cut (tailFloor.admits), as its first read did. A rebuild that fails keeps
+// the old tail while it is still advancing and the cursor has reached the
+// newer cut: it then holds every change after an older cut up to the cursor,
+// and a change it folds after that is newer than what the cut holds. A tail
+// that grows past its
+// budget stops advancing (frozen) and goes on serving what it holds, with its
+// own older instant, until the next published cut rebuilds it; a frozen tail
+// is never laid over a newer cut, whose rows may be newer than its own.
 //
 // Events are read and folded a page at a time, so the memory a refresh takes
 // is a page and the tails, never the backlog since the last statement.
@@ -66,15 +78,29 @@ type tailSource interface {
 	// Since hands page the events of tables with from < id <= upTo, a page
 	// at a time, in id order.
 	Since(ctx context.Context, tables []views.BaselineTable, from, upTo uint64, page func([]query.ResultRow) error) error
+	// Cut is where the read of t's window starts, as Fill reads it: the
+	// position of its published cut and the last event id it records (0:
+	// none), or why that cannot be read.
+	Cut(t views.BaselineTable) (tailFloor, string)
 	// Broken says, by tailKey, why a table's tail cannot go on, asked at
 	// every refresh (its definition changed after its cut, capture lost
 	// events since). Tables it leaves out can.
 	Broken(ctx context.Context, tables []views.BaselineTable) (map[string]string, error)
 }
 
+// tailFloor is where the read of a table's changes after its published cut
+// starts: events whose start position is at or after anchor and, when
+// lastEventID is not 0, whose id is above it (query.Options.SincePos and
+// SinceEventID).
+type tailFloor struct {
+	anchor      query.BinlogPos
+	lastEventID uint64
+}
+
 // tailTable is a reconstruct.Tail as the keeper drives it.
 type tailTable interface {
 	Apply(page []query.ResultRow) error
+	PruneThrough(anchor query.BinlogPos, afterID uint64) (int, error)
 	Keys() int
 	WriteFile(path string) (int64, error)
 	PKColumns() []string
@@ -110,8 +136,13 @@ func tailCutOf(t views.BaselineTable) string {
 
 // tailEntry is one table's tail and what the keeper knows of it.
 type tailEntry struct {
-	table   views.BaselineTable
-	cut     string
+	table views.BaselineTable
+	cut   string
+	// from is where the read the tail holds started (nil: not on record, and
+	// the tail is never pruned). Set when the tail is built or pruned, never
+	// when it is only kept standing for a newer cut: it still holds what it
+	// read from its older one.
+	from    *tailFloor
 	tail    tailTable
 	refused string
 	frozen  bool
@@ -322,7 +353,7 @@ func (k *tailKeeper) advance(ctx context.Context, upTo uint64) error {
 			}
 			last = at
 			key := tailKey(ev.SchemaName, ev.TableName)
-			if e := k.tables[key]; e != nil && e.refused == "" && !e.frozen {
+			if e := k.tables[key]; e != nil && e.refused == "" && !e.frozen && e.from.admits(at, ev.EventID) {
 				byTable[key] = append(byTable[key], ev)
 			}
 		}
@@ -372,10 +403,14 @@ func (k *tailKeeper) entryFor(ctx context.Context, key string, t views.BaselineT
 	if e != nil && e.cut == cut {
 		return e
 	}
+	// Before the statement's clock is looked at: a prune reads nothing.
+	if e != nil && k.pruneTo(e, t, cut) {
+		return e
+	}
 	if dl, ok := ctx.Deadline(); ctx.Err() != nil || ok && time.Until(dl) < k.minBuild {
 		// The statement's time went on another table: this one is not
 		// judged on what is left of it, and is built at the next statement.
-		if e != nil && e.refused == "" && !e.frozen {
+		if e != nil && e.refused == "" && !e.frozen && k.reached(t) {
 			return e
 		}
 		return nil
@@ -386,7 +421,7 @@ func (k *tailKeeper) entryFor(ctx context.Context, key string, t views.BaselineT
 		// the whole wait. A tail it already had stays, now standing for the
 		// newer cut too (it is correct over it, see the top of this file);
 		// else the table has none until its cut moves again.
-		if e != nil && e.refused == "" && !e.frozen {
+		if e != nil && e.refused == "" && !e.frozen && k.reached(t) {
 			e.cut = cut
 			return e
 		}
@@ -399,7 +434,7 @@ func (k *tailKeeper) entryFor(ctx context.Context, key string, t views.BaselineT
 		// before the newer cut, and laid over it would put older values over
 		// newer ones.
 		slog.Debug("Engine Routing: a table's tail could not be rebuilt over its newer snapshot", "table", t.Schema+"."+t.Table, "error", err)
-		if e != nil && e.refused == "" && !e.frozen {
+		if e != nil && e.refused == "" && !e.frozen && k.reached(t) {
 			return e
 		}
 		return nil
@@ -412,6 +447,96 @@ func (k *tailKeeper) entryFor(ctx context.Context, key string, t views.BaselineT
 		k.refuse(fresh, why)
 	}
 	return fresh
+}
+
+// pruneTo moves e's tail to t's newer cut by dropping what that cut holds,
+// and says whether it did; when it did not, nothing changed and the tail is
+// rebuilt from the cut. A tail is the newer cut's when, besides being live
+// (not refused, not frozen: it holds every change after its own cut through
+// the cursor):
+//   - t reads the same base file: the tail's columns, key and the checks of
+//     NewTail were made against it, and a copy written again (a new snapshot)
+//     may differ;
+//   - both cuts and the cursor are positions in one numbering of the binary
+//     log, the only order the comparisons below mean anything in;
+//   - the newer cut is after the older one: one that moved back or did not
+//     move is another copy, not a later point of the same one;
+//   - the newer cut's last event id is not below the older's: the tail did
+//     not read the ids the newer window would;
+//   - the cursor has folded everything the newer cut holds (reached): an
+//     event between the cursor and the cut is in the cut and would be folded
+//     later as a change after it.
+//
+// The event exactly at the newer cut's position is kept, as Fill keeps it:
+// the position is where the next write begins.
+func (k *tailKeeper) pruneTo(e *tailEntry, t views.BaselineTable, cut string) bool {
+	if e.refused != "" || e.frozen || e.from == nil || e.tail == nil || t.Path != e.table.Path {
+		return false
+	}
+	to, why := k.src.Cut(t)
+	if why != "" {
+		return false
+	}
+	from, mark := e.from.anchor, k.mark.Pos
+	base := reconstruct.BinlogBaseName(to.anchor.File)
+	switch {
+	case to.anchor.File == "" || to.anchor.IsLSN() || from.IsLSN() || mark.IsLSN():
+		return false
+	case reconstruct.BinlogBaseName(from.File) != base || reconstruct.BinlogBaseName(mark.File) != base:
+		return false
+	case from == to.anchor || !from.AtOrBefore(to.anchor):
+		return false
+	case to.lastEventID < e.from.lastEventID:
+		return false
+	case !k.reachedFloor(to):
+		return false
+	}
+	n, err := e.tail.PruneThrough(to.anchor, to.lastEventID)
+	if err != nil {
+		slog.Warn("Engine Routing: a table's tail could not be pruned to its newer snapshot; it is built again", "table", t.Schema+"."+t.Table, "error", err)
+		return false
+	}
+	// Dirty even when nothing was dropped: the file written is laid only
+	// over the cut it was written for (fileCut).
+	e.table, e.cut, e.from, e.dirty = t, cut, &to, true
+	slog.Debug("Engine Routing: a table's tail was pruned to its newer snapshot", "table", t.Schema+"."+t.Table, "dropped", n, "keys", e.tail.Keys())
+	return true
+}
+
+// reached says whether the cursor has folded every change t's published cut
+// holds, so that a change of t the keeper folds from now on is newer than the
+// cut's: only then may a tail read from an older cut, or pruned to this one,
+// be laid over it. The cursor's position is where its event STARTS, so a cut
+// that ends exactly after that event is seen by its last event id instead (a
+// refresh's cut records the last event of the table it folded; every event of
+// the table it holds is at or below it, and indexed before the cursor was
+// read). A dump's cut records no id, and the source may be ahead of capture:
+// only the position says it then.
+func (k *tailKeeper) reached(t views.BaselineTable) bool {
+	to, why := k.src.Cut(t)
+	return why == "" && k.reachedFloor(to)
+}
+
+func (k *tailKeeper) reachedFloor(to tailFloor) bool {
+	mark := k.mark.Pos
+	if to.anchor.File == "" || to.anchor.IsLSN() || mark.IsLSN() ||
+		reconstruct.BinlogBaseName(to.anchor.File) != reconstruct.BinlogBaseName(mark.File) {
+		return false
+	}
+	return to.anchor.AtOrBefore(mark) || to.lastEventID != 0 && to.lastEventID <= k.mark.ID
+}
+
+// admits says whether the read of a window from f would return an event at
+// at with id: Fill's own floor, applied to the events advance folds after the
+// cursor, so a tail built over a cut the cursor had not reached (a dump ahead
+// of capture) does not fold the changes the cut already holds. A floor in
+// another numbering than at, or none on record, admits it (the numbering is
+// the cursor's check, errTailRenumbered).
+func (f *tailFloor) admits(at query.BinlogPos, id uint64) bool {
+	if f == nil || f.anchor.File == "" || reconstruct.BinlogBaseName(f.anchor.File) != reconstruct.BinlogBaseName(at.File) {
+		return true
+	}
+	return f.anchor.AtOrBefore(at) && (f.lastEventID == 0 || id > f.lastEventID)
 }
 
 // refuse ends e's tail for why, said once: statements over the table read
@@ -448,6 +573,12 @@ func (k *tailKeeper) note(err error) {
 // the cursor.
 func (k *tailKeeper) build(ctx context.Context, t views.BaselineTable, cut string) (*tailEntry, error) {
 	refused := func(why string) (*tailEntry, error) { return &tailEntry{table: t, cut: cut, refused: why}, nil }
+	// Where the read below starts, from the same footer Fill reads it from;
+	// none on record (Fill refuses then) leaves a tail that is never pruned.
+	var from *tailFloor
+	if f, why := k.src.Cut(t); why == "" {
+		from = &f
+	}
 	tail, why, err := k.src.Start(ctx, t)
 	if err != nil {
 		return nil, err
@@ -475,7 +606,7 @@ func (k *tailKeeper) build(ctx context.Context, t views.BaselineTable, cut strin
 	case why != "":
 		return refused(why)
 	}
-	return &tailEntry{table: t, cut: cut, tail: tail, dirty: true}, nil
+	return &tailEntry{table: t, cut: cut, from: from, tail: tail, dirty: true}, nil
 }
 
 // view is what a statement reads of e: its newest version, written first if
