@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.113.0] - 2026-10-22
 ### Added
 - **A correctness oracle over the copy pipeline** (#2499, slice 1). `internal/oracle` runs deterministic random DML on a real MySQL source through the real capture, takes snapshot cuts and refreshes with table deltas by seed, reads the copy the way the MySQL port does and compares it row by row with the source at the same cut. It is an integration test (`go test -tags integration -run TestOracle ./internal/oracle/`), with `BINTRAIL_ORACLE_SEEDS`, `BINTRAIL_ORACLE_STEPS` and `BINTRAIL_ORACLE_SEED` to run longer or replay one failure. Before it was trusted, three breakages planted by hand (dead rows ignored, a key the delta forgot, the read pinned to an older snapshot) each failed with its message. The remaining mechanisms (tails, resolved pairs, compaction) join as steps in later slices.
 
