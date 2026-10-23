@@ -17,6 +17,8 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/baselineintegrity"
 	"github.com/dbtrail/dbtrail/internal/consistency"
+	"github.com/dbtrail/dbtrail/internal/duckdbutil"
+	"github.com/dbtrail/dbtrail/internal/keyidx"
 )
 
 // Version is embedded in Parquet file metadata.
@@ -297,6 +299,12 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 						}
 						slog.Info("skipping existing file (--retry)",
 							"db", tf.Database, "table", tf.Table, "file", outPath)
+						// The index beside it (#2496): a run killed between
+						// the conversion and the build left the file without
+						// one, and nothing else would ever build it.
+						if rawSchema, serr := os.ReadFile(tf.SchemaFile); serr == nil {
+							keyidx.EnsureBeside(ctx, tf.Database, tf.Table, outPath, keyidx.PrimaryKeyColumns(string(rawSchema)), duckdbutil.DefaultTuningFor(ctx))
+						}
 						mu.Lock()
 						stats.TablesProcessed++
 						stats.FilesWritten++
@@ -346,7 +354,8 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 			// an older baseline or a schema-file read error just leaves the
 			// key absent and full-table reconstruct will abort with a clear
 			// "re-run bintrail baseline" message.
-			if rawSchema, schemaErr := os.ReadFile(tf.SchemaFile); schemaErr != nil {
+			rawSchema, schemaErr := os.ReadFile(tf.SchemaFile)
+			if schemaErr != nil {
 				slog.Warn("could not read schema file for CREATE TABLE embed",
 					"db", tf.Database, "table", tf.Table,
 					"path", tf.SchemaFile, "error", schemaErr)
@@ -360,6 +369,14 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 			}
 
 			n, err := processTable(ctx, tf, outPath, writerCfg)
+			if err == nil {
+				// The key index beside the table's file (#2496), for the
+				// refreshes that will look its rows up; logged, never a
+				// failure of the conversion. The key is the dump's PRIMARY
+				// KEY line; a table without one, or with a non-integer key,
+				// gets none.
+				keyidx.WriteBeside(ctx, tf.Database, tf.Table, outPath, keyidx.PrimaryKeyColumns(string(rawSchema)), duckdbutil.DefaultTuningFor(ctx))
+			}
 			if err == nil && cfg.RemoveConvertedData {
 				// Outside the lock below: unlinking a table's worth of dump
 				// can take a while, and every worker that finishes waits on
