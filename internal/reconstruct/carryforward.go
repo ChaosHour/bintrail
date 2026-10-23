@@ -57,17 +57,40 @@ import (
 // # Integrity
 //
 // The source is validated against its own snapshot's _MANIFEST before it is
-// copied. Skipping that would let a corrupt file propagate into a fresh
-// snapshot and be re-certified under the new manifest, which is worse than
-// reading it: the merge path validates on read (materializeBaselineLocal), so
-// carrying forward without validating would be the one route into a snapshot
-// that bypasses the check.
+// linked or copied. Skipping that would let a corrupt file propagate into a
+// fresh snapshot and be re-certified under the new manifest (the manifest
+// writer reuses the source manifest's digest for a linked file, #1717), which
+// is worse than reading it: the merge path validates on read
+// (materializeBaselineLocal), so carrying forward without validating would be
+// the one route into a snapshot that bypasses the check.
 //
-// What that check does NOT do is worth stating: ValidateLocalFile passes when
-// the snapshot has no manifest at all, or lists no entry for this file. It
-// catches a CRC mismatch, not an absent guarantee. A legacy snapshot with no
-// manifest is carried forward unverified, exactly as the merge path would read
-// it unverified.
+// The check is ValidateLocalFileOnce (#2517): the guarantee is kept, the
+// repetition is dropped. A base is read whole and hashed when it is new to
+// the process (its identity, device + inode + size + mtime, is not in the
+// memo), when its snapshot's manifest lists a digest other than the one the
+// memo matched, and when its last check is older than the memo's TTL (about
+// a week, spread per file). A file carried forward by hard link keeps all
+// four, so the base this refresh links into snapshot N+1 is the inode the
+// process verified, or wrote, at snapshot N (the manifest writer remembers
+// what it hashed), and it is not read again; before this every refresh
+// re-read every base end to end, on a host whose bases exceed RAM about two
+// thirds of the refresh. A rewritten base is a new inode with a new digest
+// in its manifest, which is what covers the writers' rewrites. The copy
+// fallback below is a new inode too: the manifest writer hashes it (nothing
+// to reuse, #1717) and remembers it. Corruption that appears on the disk
+// between a check and the TTL's end changes none of the four and is not
+// seen until then; the digest reuse re-certifies the same inode under each
+// new manifest for that long. Within one process every reader of a base
+// shares the memo, except the compaction job (consoleapp, deliberate: it is
+// the one path where bytes it reads become a freshly certified file, and
+// its full read is the daemon's real periodic re-check) and `query
+// --include-snapshot`.
+//
+// What that check does NOT do is worth stating: ValidateLocalFileOnce, like
+// ValidateLocalFile, passes when the snapshot has no manifest at all, or lists
+// no entry for this file. It catches a CRC mismatch, not an absent guarantee.
+// A legacy snapshot with no manifest is carried forward unverified, exactly
+// as the merge path would read it unverified.
 //
 // # Hard link, then copy
 //
@@ -159,9 +182,10 @@ func carryKeyIndex(srcPath, dst string, linked bool, schema, table string) {
 
 // carryForwardFile is carryForward for one file at an explicit destination:
 // the base, or one file of a table delta's chain (#1718), which travel the
-// same way. validate runs the manifest check on the source first; a caller
+// same way. validate runs the manifest check on the source first
+// (ValidateLocalFileOnce: a read per process per identity, #2517); a caller
 // that just validated the file (readTableDelta, over every pair of a chain)
-// passes false rather than hash the same bytes twice per refresh.
+// passes false rather than resolve the manifest twice per refresh.
 // A caller passing validate=false asserts that srcPath was already validated
 // against its snapshot's manifest in this run (readTableDelta does, for every
 // pair of a chain): the manifest writer reuses that manifest's digest for the
@@ -172,7 +196,7 @@ func carryForwardFile(ctx context.Context, srcPath, dst string, validate bool) (
 		return false, err
 	}
 	if validate {
-		if err := baselineintegrity.ValidateLocalFile(srcPath); err != nil {
+		if err := baselineintegrity.ValidateLocalFileOnce(srcPath); err != nil {
 			return false, fmt.Errorf("validate the snapshot being carried forward: %w", err)
 		}
 	}
