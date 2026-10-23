@@ -19,6 +19,8 @@ type header struct {
 	BaseSize  int64
 	FooterCRC uint32
 	BaseRows  int64
+	BaseIno   uint64
+	BaseMtime int64
 }
 
 // blockEntry is one skip-table entry: a block's first key and the CRC-32C of
@@ -29,9 +31,9 @@ type blockEntry struct {
 }
 
 // index is an open index file: its header, its skip table, and where the
-// body starts. Blocks are read on demand (block), each verified against its
-// CRC. This is the reader the lookup of the next slice searches with; here
-// it is what the tests check the writer against.
+// body starts. Blocks are read on demand (blockBytes, block), each verified
+// against its CRC. Reader (lookup.go) wraps it for the lookup; the tests
+// check the writer against it directly.
 type index struct {
 	header
 	path        string
@@ -92,6 +94,8 @@ func readIndex(f *os.File) (*index, error) {
 	h.BaseSize = int64(binary.BigEndian.Uint64(fixed[20:28]))
 	h.FooterCRC = binary.BigEndian.Uint32(fixed[28:32])
 	h.BaseRows = int64(binary.BigEndian.Uint64(fixed[32:40]))
+	h.BaseIno = binary.BigEndian.Uint64(fixed[40:48])
+	h.BaseMtime = int64(binary.BigEndian.Uint64(fixed[48:56]))
 	codes := make([]byte, ncols)
 	if _, err := f.ReadAt(codes, fixedHeader); err != nil {
 		return nil, fmt.Errorf("%w: type codes: %v", errCorrupt, err)
@@ -150,6 +154,11 @@ func readIndex(f *os.File) (*index, error) {
 	for i := range nblocks {
 		e := skip[i*(keyWidth+4):]
 		ix.blocks = append(ix.blocks, blockEntry{FirstKey: bytes.Clone(e[:keyWidth]), CRC: binary.BigEndian.Uint32(e[keyWidth:])})
+		// The search relies on the first keys ascending; a skip table that
+		// does not, CRC or no CRC, would make it answer a subset.
+		if i > 0 && bytes.Compare(ix.blocks[i-1].FirstKey, ix.blocks[i].FirstKey) > 0 {
+			return nil, fmt.Errorf("%w: skip table out of order at block %d", errCorrupt, i)
+		}
 	}
 	return ix, nil
 }
@@ -165,9 +174,10 @@ func (ix *index) blockRecords(i int) int64 {
 	return n
 }
 
-// block reads block i's records, verified against the skip table's CRC and
-// first key.
-func (ix *index) block(i int) ([]record, error) {
+// blockBytes reads block i's bytes, verified against the skip table's CRC
+// and first key: blockRecords(i) records of recordWidth bytes each. The
+// lookup searches these bytes in place (Find); block decodes them.
+func (ix *index) blockBytes(i int) ([]byte, error) {
 	if i < 0 || i >= len(ix.blocks) {
 		return nil, fmt.Errorf("block %d of %d", i, len(ix.blocks))
 	}
@@ -182,7 +192,25 @@ func (ix *index) block(i int) ([]record, error) {
 	if !bytes.Equal(buf[:ix.keyWidth], ix.blocks[i].FirstKey) {
 		return nil, fmt.Errorf("%w: block %d starts with another key than its skip entry", errCorrupt, i)
 	}
-	out := make([]record, n)
+	// Records ascend by (key, row); the in-block search relies on it, and
+	// a block that does not, CRC or no CRC, would make Find answer a subset.
+	w := ix.recordWidth
+	for j := 1; j < int(n); j++ {
+		if bytes.Compare(buf[(j-1)*w:j*w], buf[j*w:(j+1)*w]) > 0 {
+			return nil, fmt.Errorf("%w: block %d: record %d is out of order", errCorrupt, i, j)
+		}
+	}
+	return buf, nil
+}
+
+// block reads block i's records, verified against the skip table's CRC and
+// first key.
+func (ix *index) block(i int) ([]record, error) {
+	buf, err := ix.blockBytes(i)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]record, len(buf)/ix.recordWidth)
 	for j := range out {
 		r := buf[j*ix.recordWidth:]
 		out[j] = record{Key: bytes.Clone(r[:ix.keyWidth]), Row: int64(binary.BigEndian.Uint64(r[ix.keyWidth:ix.recordWidth]))}
