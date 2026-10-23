@@ -433,17 +433,17 @@ func ForSource(source string) *StreamMetrics {
 var (
 	indexOldestEvent = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "bintrail", Subsystem: "index", Name: "oldest_event_timestamp_seconds",
-		Help: "Unix timestamp of the oldest event still in the index (recovery floor).",
+		Help: "Unix timestamp of the oldest event still in the index (recovery floor), to the hour: the lower bound of the oldest partition whose row estimate is not zero.",
 	}, []string{"source"})
 
 	indexNewestEvent = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "bintrail", Subsystem: "index", Name: "newest_event_timestamp_seconds",
-		Help: "Unix timestamp of the newest event in the index.",
+		Help: "Unix timestamp of the newest row in the index, by primary key.",
 	}, []string{"source"})
 
 	indexRetentionHorizon = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "bintrail", Subsystem: "index", Name: "retention_horizon_seconds",
-		Help: "How far back the index reaches: now minus the oldest event timestamp.",
+		Help: "How far back the index reaches: now minus the oldest event timestamp (to the hour).",
 	}, []string{"source"})
 
 	indexEventsTotal = promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -486,6 +486,10 @@ type IndexSnapshot struct {
 	// so a swallowed partial-load failure can't mask the real values with a 0 —
 	// the same misleading-zero defense as the OldestEvent/NewestEvent guards.
 	HaveCoverage bool
+	// EventsUnknown: the coverage load could not say how many events the
+	// index holds (#2509: the estimate read 0 beside a row that exists), so
+	// Events is not published and the gauge keeps its last value.
+	EventsUnknown bool
 }
 
 // IndexMetrics is the index gauge set curried to one source.
@@ -514,7 +518,9 @@ func (m *IndexMetrics) Set(snap IndexSnapshot, now time.Time) {
 	// events_total and storage_bytes{mysql} are coverage-derived — skip them on a
 	// degraded load so a swallowed failure can't publish a misleading 0.
 	if snap.HaveCoverage {
-		indexEventsTotal.WithLabelValues(s).Set(float64(snap.Events))
+		if !snap.EventsUnknown {
+			indexEventsTotal.WithLabelValues(s).Set(float64(snap.Events))
+		}
 		indexStorageBytes.WithLabelValues(s, "mysql").Set(float64(snap.MySQLBytes))
 	}
 	indexPartitions.WithLabelValues(s, "active").Set(float64(snap.ActivePartitions))

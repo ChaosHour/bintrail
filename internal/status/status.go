@@ -214,7 +214,11 @@ type CoverageInfo struct {
 	// EarliestEvent and LatestEvent are exact either way, and they, never the
 	// count, are what says whether the index holds anything.
 	TotalEventsEstimated bool
-	SchemaChanges        int
+	// TotalEventsUnknown: the gauges' span (#2509) found a row while every
+	// partition's estimate read 0 (statistics not caught up), and did not
+	// count; TotalEvents is then 0 and must not be published as a count.
+	TotalEventsUnknown bool
+	SchemaChanges      int
 	// UncoveredDDLs counts schema_changes rows (one per table a statement
 	// changed) with snapshot_id IS NULL whose
 	// DDL type NEEDS a snapshot — i.e. file-mode indexing without --source-dsn,
@@ -370,8 +374,20 @@ const UncoveredDDLWhere = `(snapshot_id IS NULL AND ddl_type <> 'TRUNCATE TABLE'
 // archive_state (e.g. "p_2026021914" → 2026-02-19 14:00 UTC) without reading
 // Parquet files.
 func LoadCoverage(ctx context.Context, db *sql.DB) (*CoverageInfo, error) {
+	return loadCoverage(ctx, db, loadEventSpan)
+}
+
+// LoadCoverageForGauges is LoadCoverage with the event span the capture's
+// gauge loop can afford every minute (loadEventSpanForGauges, #2509): the
+// newest row by key, the oldest to the hour, the count an estimate or
+// unknown. Everything else is read as LoadCoverage reads it.
+func LoadCoverageForGauges(ctx context.Context, db *sql.DB) (*CoverageInfo, error) {
+	return loadCoverage(ctx, db, loadEventSpanForGauges)
+}
+
+func loadCoverage(ctx context.Context, db *sql.DB, span func(context.Context, *sql.DB, *CoverageInfo) error) (*CoverageInfo, error) {
 	var c CoverageInfo
-	err := loadEventSpan(ctx, db, &c)
+	err := span(ctx, db, &c)
 	if err != nil {
 		return nil, fmt.Errorf("query binlog_events coverage: %w", err)
 	}
@@ -761,6 +777,19 @@ type BaselineInfo struct {
 // Servers, StreamState, ArchiveStats, and Coverage are best-effort
 // (failures are logged as warnings and the field is left nil).
 func CollectStatus(ctx context.Context, db *sql.DB, dbName string) (*StatusData, error) {
+	return collectStatus(ctx, db, dbName, false)
+}
+
+// CollectStatusForGauges is CollectStatus for the capture daemon's gauge
+// loop (#2509): the same snapshot, with the coverage's event span read the
+// cheap way (LoadCoverageForGauges) instead of the exact probes that read
+// two whole partitions. The on-demand readers, `bintrail status`, the
+// console and MCP, keep CollectStatus.
+func CollectStatusForGauges(ctx context.Context, db *sql.DB, dbName string) (*StatusData, error) {
+	return collectStatus(ctx, db, dbName, true)
+}
+
+func collectStatus(ctx context.Context, db *sql.DB, dbName string, gauges bool) (*StatusData, error) {
 	files, err := LoadIndexState(ctx, db)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load index state: %w", err)
@@ -806,7 +835,13 @@ func CollectStatus(ctx context.Context, db *sql.DB, dbName string) (*StatusData,
 		d.Archives = archives
 	}
 
-	if coverage, err := LoadCoverage(ctx, db); err != nil {
+	var coverage *CoverageInfo
+	if gauges {
+		coverage, err = LoadCoverageForGauges(ctx, db)
+	} else {
+		coverage, err = LoadCoverage(ctx, db)
+	}
+	if err != nil {
 		slog.Warn("could not load coverage info; the coverage section will report itself unreadable", "error", err)
 		// Record the failure so the output renders a coverage tombstone instead
 		// of silently omitting the section — a monitor keyed on
