@@ -103,10 +103,12 @@ type sqlResponse struct {
 	// ("runs on the copy updated N min ago"); null when the copy has no
 	// snapshot and only the change log is queryable.
 	CopyUpdatedAt *time.Time `json:"copy_updated_at"`
-	// PhasesMS is where the time went (#2026): view_build (the daemon's
-	// discovery and script generation), then the sandbox's phases.
-	// Milliseconds with microsecond precision, so a sub-millisecond phase
-	// reads as the small number it is, not as "not measured".
+	// PhasesMS is where the time went (#2026): slot_wait, view_build (the
+	// daemon's discovery and script generation), views_for and tails (the
+	// statement's callback inside the worker's run, #2504), the sandbox's
+	// phases, and wall (the parent's whole statement, #2504). Milliseconds
+	// with microsecond precision, so a sub-millisecond phase reads as the
+	// small number it is, not as "not measured".
 	PhasesMS map[string]float64 `json:"phases_ms"`
 	// OlderCopy says why the answer comes from an earlier copy than the
 	// newest (#2210); omitted when it does not. CopyUpdatedAt is then that
@@ -114,19 +116,71 @@ type sqlResponse struct {
 	OlderCopy string `json:"older_copy,omitempty"`
 }
 
+// sqlParentPhases is the parent's side of a statement's phases: the clocks
+// runSQLAt holds itself, beside the sandbox's (sqlsandbox.Phases, which the
+// worker reports and whose Total is the worker's run, not the statement's).
+type sqlParentPhases struct {
+	// SlotWait is the wait for one of the runner's slots (#2112).
+	SlotWait time.Duration
+	// ViewBuild is the daemon's discovery of the copy and its checks, from
+	// the slot to the job: it stops BEFORE the worker runs (#2026).
+	ViewBuild time.Duration
+	// ViewsFor is the whole ViewsFor callback (#2504): the tails step, the
+	// chain check, the strict-star and time-zone checks and the views
+	// script, run inside the worker's run (so inside Total and spawn) once
+	// the worker has parsed the statement. Zero only when the worker never
+	// asked, which is a failed run, and failed runs are not observed.
+	ViewsFor time.Duration
+	// Tails is the time inside statementTails (#2504): the read of the
+	// tails the follower published, or a whole update of them when the
+	// follower has none over the snapshot the statement reads. Part of
+	// ViewsFor. TailsRan says the step ran at all: a statement that read no
+	// tails (the SQL card, MCP, BINTRAIL_SQL_TAILS=off, a copy with no
+	// index) has no tails phase, not a zero one, so the key is left out of
+	// sqlPhases and the histogram's quantiles are not pulled to zero by
+	// every console statement.
+	Tails    time.Duration
+	TailsRan bool
+	// Wall is the statement as the parent saw it (#2504): from its
+	// acceptance, before the slot was asked for, to the result being handed
+	// back to the port or the HTTP handler. Wall - Total - SlotWait -
+	// ViewBuild is what no phase accounts for. A statement answered from an
+	// earlier copy (#2210) ran twice; Wall covers both runs and the search
+	// in between, and the other clocks are the two runs' summed (add).
+	Wall time.Duration
+}
+
+// add folds an earlier run's clocks into p (#2210): a statement answered
+// from an earlier copy paid the first run's slot wait, discovery, callback
+// and tails step too, and the first run, refused, observed nothing itself.
+func (p *sqlParentPhases) add(first sqlParentPhases) {
+	p.SlotWait += first.SlotWait
+	p.ViewBuild += first.ViewBuild
+	p.ViewsFor += first.ViewsFor
+	p.Tails += first.Tails
+	p.TailsRan = p.TailsRan || first.TailsRan
+}
+
 // sqlPhases names a statement's phases once, for the response, the log
-// and the histogram, so the three cannot disagree on a key.
-func sqlPhases(slotWait, viewBuild time.Duration, p sqlsandbox.Phases) map[string]time.Duration {
-	return map[string]time.Duration{
-		"slot_wait": slotWait, "view_build": viewBuild, "spawn": p.Spawn, "open": p.Open, "lockdown": p.Lockdown,
-		"views": p.Views, "query": p.Query, "decode": p.Decode, "total": p.Total,
+// and the histogram, so the three cannot disagree on a key. Total stays the
+// sandbox's (the worker's run); wall is the parent's. tails is present only
+// when the step ran: "not measured" and "took nothing" must not read alike.
+func sqlPhases(parent sqlParentPhases, p sqlsandbox.Phases) map[string]time.Duration {
+	out := map[string]time.Duration{
+		"slot_wait": parent.SlotWait, "view_build": parent.ViewBuild, "views_for": parent.ViewsFor,
+		"spawn": p.Spawn, "open": p.Open, "lockdown": p.Lockdown,
+		"views": p.Views, "query": p.Query, "decode": p.Decode, "total": p.Total, "wall": parent.Wall,
 	}
+	if parent.TailsRan {
+		out["tails"] = parent.Tails
+	}
+	return out
 }
 
 // sqlPhasesMS renders the phases for the response and the log.
-func sqlPhasesMS(slotWait, viewBuild time.Duration, p sqlsandbox.Phases) map[string]float64 {
+func sqlPhasesMS(parent sqlParentPhases, p sqlsandbox.Phases) map[string]float64 {
 	out := map[string]float64{}
-	for k, d := range sqlPhases(slotWait, viewBuild, p) {
+	for k, d := range sqlPhases(parent, p) {
 		out[k] = float64(d.Microseconds()) / 1000
 	}
 	return out
@@ -492,7 +546,7 @@ func (s *Server) handleSQL(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, sqlResponse{
 			Columns: res.Columns, Rows: res.Rows, Truncated: res.Truncated,
 			TruncatedCells: res.TruncatedCells, ElapsedMS: res.Elapsed.Milliseconds(),
-			CopyUpdatedAt: copyUpdatedAt, PhasesMS: sqlPhasesMS(out.SlotWait, out.ViewBuild, res.Phases),
+			CopyUpdatedAt: copyUpdatedAt, PhasesMS: sqlPhasesMS(out.Phases, res.Phases),
 			OlderCopy: out.OlderCopyNote,
 		})
 	}
@@ -800,12 +854,10 @@ type sqlOutcome struct {
 	// CopyUpdatedAt is the newest snapshot the state views were pinned to;
 	// nil when the copy has no snapshot and only the change log is queryable.
 	CopyUpdatedAt *time.Time
-	// ViewBuild is the daemon's own part of the statement's time: snapshot
-	// discovery, the archive reads when the statement names events, and the
-	// views script. The sandbox's phases are in Result.Phases.
-	ViewBuild time.Duration
-	// SlotWait is how long the statement waited for a worker slot (#2033).
-	SlotWait time.Duration
+	// Phases is the parent's side of the statement's time (the slot wait,
+	// the daemon's discovery, the ViewsFor callback and its tails step, and
+	// the whole statement's wall). The sandbox's phases are in Result.Phases.
+	Phases sqlParentPhases
 	// OlderCopyNote says why the statement was answered from an earlier
 	// copy than the newest (#2210), "" when it was not.
 	OlderCopyNote string
@@ -873,8 +925,12 @@ type sqlUnchanged func(ctx context.Context, tables []views.BaselineTable) string
 // refused too: an answer nobody vouched for is not the one that was asked
 // for.
 func (s *Server) runSQLVouched(ctx context.Context, b *bundle, user, statement, schema string, maxRows int, sess sqlsandbox.Session, unchanged sqlUnchanged) (sqlOutcome, error) {
+	// The wall clock (#2504) starts here, not in the run: a statement
+	// answered from an earlier copy (#2210) runs twice, and its wall is
+	// both runs and the search for that copy in between.
+	wallStart := time.Now()
 	var heavy *sqlHeavyRun
-	out, err := s.runSQLAt(ctx, b, user, statement, schema, maxRows, sess, unchanged, time.Time{}, &heavy)
+	out, err := s.runSQLAt(ctx, b, user, statement, schema, maxRows, sess, unchanged, time.Time{}, wallStart, nil, &heavy)
 	if heavy == nil || !sqlMayAnswerOlder(statement, sess) {
 		return out, err
 	}
@@ -888,7 +944,7 @@ func (s *Server) runSQLVouched(ctx context.Context, b *bundle, user, statement, 
 		return out, err
 	}
 	var again *sqlHeavyRun
-	older, oerr := s.runSQLAt(ctx, b, user, statement, schema, maxRows, sess, unchanged, at, &again)
+	older, oerr := s.runSQLAt(ctx, b, user, statement, schema, maxRows, sess, unchanged, at, wallStart, &heavy.phases, &again)
 	if oerr != nil {
 		// Whatever stopped the run on the earlier copy (busy, its own time
 		// cap, a column that copy does not have yet, the copy removed in
@@ -917,6 +973,10 @@ type sqlHeavyRun struct {
 	chain  sqlHeavyChain
 	limit  int64
 	newest time.Time
+	// phases is what the refused run paid (#2504): the run on the earlier
+	// copy adds them to its own before observing, so the statement's
+	// phases are the statement's, not the second run's alone.
+	phases sqlParentPhases
 }
 
 // sqlMayAnswerOlder says whether a statement may be answered from an
@@ -1006,7 +1066,11 @@ func sqlOlderCopyNote(h *sqlHeavyRun, at time.Time) string {
 
 // runSQLAt is runSQLVouched over the copy of time at (zero: the newest).
 // *heavy is set when the statement was refused for unmerged changes.
-func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schema string, maxRows int, sess sqlsandbox.Session, unchanged sqlUnchanged, at time.Time, heavy **sqlHeavyRun) (sqlOutcome, error) {
+//
+// wallStart is when the statement was accepted, before any run; first, when
+// not nil, is the clocks of an earlier run of the same statement that was
+// refused for unmerged changes (#2210), added to this run's before observing.
+func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schema string, maxRows int, sess sqlsandbox.Session, unchanged sqlUnchanged, at time.Time, wallStart time.Time, first *sqlParentPhases, heavy **sqlHeavyRun) (sqlOutcome, error) {
 	// What is known without any I/O is refused before the slot: a copy that
 	// lives only on S3 is never served here, and listing it would hold one
 	// of the daemon's two slots while it waits on the network. A local
@@ -1019,10 +1083,15 @@ func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schem
 	// copy. An unused slot is given back on every early return, and said so
 	// at debug with how long it was held: the slot is one of a few (two by
 	// default), so a build that holds it for long is everybody else's "busy".
+	// The parent's phases (#2504). Wall started in the caller, before the
+	// slot is asked for, so that what no other phase accounts for is wall -
+	// total - slot_wait - view_build, readable on every log line.
+	var parent sqlParentPhases
 	slot, slotWait, err := reserveSQLSlot(ctx, s.sqlRunner, user)
 	if err != nil {
 		return sqlOutcome{}, err
 	}
+	parent.SlotWait = slotWait
 	// Read once (#2210): a change saved while this statement runs applies to
 	// the next one, and this one's refusal or hint names what it ran with.
 	memory, _ := s.sqlMemoryNow()
@@ -1089,7 +1158,7 @@ func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schem
 		at := in.BaselineSnapshot.UTC()
 		copyUpdatedAt = &at
 	}
-	viewBuild := time.Since(viewsStart)
+	parent.ViewBuild = time.Since(viewsStart)
 
 	// The worker parses the statement first and asks for the views it names
 	// (#2029): installing every table's view was half of a short statement's
@@ -1110,6 +1179,14 @@ func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schem
 		User:     user,
 		CopyDirs: copyDirs,
 		ViewsFor: func(refs sqlsandbox.Refs) (string, error) {
+			// The whole callback, refusals included, is the views_for
+			// phase (#2504): it runs inside the worker's run, after
+			// view_build stopped, where the tails step used to hide.
+			viewsForStart := time.Now()
+			defer func() { parent.ViewsFor += time.Since(viewsForStart) }()
+			if s.sqlViewsForHook != nil {
+				s.sqlViewsForHook()
+			}
 			narrowed := in
 			narrowed.OnlyViews = sqlWantedViews(in, refs)
 			if sess.UnchangedWithin > 0 {
@@ -1131,7 +1208,10 @@ func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schem
 			// Not over a statement whose tables the parse could not tell: it
 			// would build a tail for every table of the copy.
 			if tails != nil && narrowed.OnlyViews != nil {
+				tailsStart := time.Now()
 				narrowed.Baselines, tailThrough, allTailed = s.statementTails(ctx, tails, narrowed.Baselines, readTables)
+				parent.Tails += time.Since(tailsStart)
+				parent.TailsRan = true
 				allTailed = tailsSayTheInstant(statement, allTailed)
 			}
 			if h := sqlChainTooHeavy(named, limit, sqlFileSize); h.Table != "" {
@@ -1197,6 +1277,10 @@ func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schem
 	res, err := slot.Run(ctx, job)
 	if err != nil {
 		if viewsRefusal != nil {
+			if *heavy != nil {
+				// After Run, so the callback's own clocks are complete.
+				(*heavy).phases = parent
+			}
 			return sqlOutcome{}, viewsRefusal
 		}
 		var qerr *sqlsandbox.QueryError
@@ -1216,13 +1300,20 @@ func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schem
 	}
 	// The measurement #2026 asks for, per statement, at debug so a run under
 	// load can be read back from the log.
+	// The result is in hand: the wall stops here, before the log line and
+	// the histogram, which are the instrument's own cost, not the
+	// statement's.
+	if first != nil {
+		parent.add(*first)
+	}
+	parent.Wall = time.Since(wallStart)
 	slog.Debug("console: sql statement phases", "user", user, "events", sqlMentionsEvents(statement),
-		"views_sql_bytes", len(viewsSQL), "phases_ms", sqlPhasesMS(slotWait, viewBuild, res.Phases))
-	for phase, d := range sqlPhases(slotWait, viewBuild, res.Phases) {
+		"views_sql_bytes", len(viewsSQL), "phases_ms", sqlPhasesMS(parent, res.Phases))
+	for phase, d := range sqlPhases(parent, res.Phases) {
 		observe.ObserveSQLStatementPhase(phase, d)
 	}
 	readFrom, readFromOK := copyReadFrom(in, readTables)
-	return sqlOutcome{Result: res, CopyUpdatedAt: copyUpdatedAt, ViewBuild: viewBuild, SlotWait: slotWait,
+	return sqlOutcome{Result: res, CopyUpdatedAt: copyUpdatedAt, Phases: parent,
 		ReadFrom: readFrom, ReadFromOK: readFromOK, TailThrough: tailThrough, AllTailed: allTailed}, nil
 }
 
