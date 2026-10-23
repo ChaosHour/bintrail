@@ -38,10 +38,9 @@ import (
 // A table the port answers as of the published cut (no tail) is compared
 // with the rows read at that cut, AND the step asserts why there is no
 // tail: a key the tail does not support (only integer keys have one, the
-// product's own rule: t_text's VARCHAR key), a PK-changing UPDATE the
-// generator did in the window, or no change to the table since the cut.
-// Any other reason fails the run naming it: that is the detector for tails
-// silently off.
+// product's own rule: t_text's VARCHAR key), or no change to the table since
+// the cut. Any other reason fails the run naming it: that is the detector
+// for tails silently off.
 
 func TestOracleTails(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
@@ -65,7 +64,7 @@ func TestOracleTails(t *testing.T) {
 				if res.Applied["tail"] == 0 {
 					t.Fatalf("no tail step applied in %d steps: %v", steps, res.Applied)
 				}
-				t.Logf("seed %d: %d steps, %d ops, applied %v, %d fallbacks, chains up to %d files, in %s", seed, res.Steps, res.Ops, res.Applied, res.Fallbacks, chains.longest, res.Wall.Round(time.Millisecond))
+				t.Logf("seed %d: %d steps, %d ops, applied %v, chains up to %d files, in %s", seed, res.Steps, res.Ops, res.Applied, chains.longest, res.Wall.Round(time.Millisecond))
 			})
 		}
 	})
@@ -203,10 +202,12 @@ func (s *tailStep) read(ctx context.Context, cut *oracle.Cut, wallClock bool, wa
 
 // whyNoTail is "" when the port legitimately has no tail over tb at cut: the
 // table's key is not one a tail supports (the product's own rule, asked of
-// the source's CREATE TABLE: t_text's VARCHAR key), the keeper refused it
-// for a PK-changing UPDATE the generator did since the published cut, or
-// nothing changed the table since that cut (an empty tail is retired).
-// Anything else is the reason, as a failure.
+// the source's CREATE TABLE: t_text's VARCHAR key), or nothing changed the
+// table since that cut (an empty tail is retired). Anything else is the
+// reason, as a failure — a tail refused for a PK-changing UPDATE included:
+// since #2501 the tail folds such an UPDATE as a DELETE of the old key and an
+// INSERT of the new one, so that refusal is a finding, not the generator's
+// doing.
 func (s *tailStep) whyNoTail(tb views.BaselineTable, cut *oracle.Cut) string {
 	s.k.mu.Lock()
 	e := s.k.tables[tailKey(tb.Schema, tb.Table)]
@@ -228,11 +229,6 @@ func (s *tailStep) whyNoTail(tb views.BaselineTable, cut *oracle.Cut) string {
 		return ""
 	case refused != "" && refused == s.keyRefusal(tb):
 		return ""
-	case refused != "" && strings.Contains(refused, "PK-changing UPDATE"):
-		if cut.HadPKChangeSincePublishOn(tb.Table) {
-			return ""
-		}
-		return "refused for a PK-changing UPDATE, and no op since the published cut moved a key: " + refused
 	case refused != "":
 		// Before the untouched case on purpose: a refusal for a reason the
 		// generator did not cause is a finding even over a table no op
@@ -339,7 +335,7 @@ func runTailSeed(t *testing.T, seed uint64, steps int, tables []oracle.Table, wS
 	run := &oracle.Run{
 		Seed: seed, Steps: steps, Schema: sourceName, Tables: tables,
 		Source: sourceDB, Index: indexDB, Capture: captureErr, Root: root,
-		Between: between, Fallback: snapshot,
+		Between: between,
 		Read: func(ctx context.Context, cut *oracle.Cut, wallClock bool) (oracle.Read, error) {
 			return tail.read(ctx, cut, wallClock, watch)
 		},

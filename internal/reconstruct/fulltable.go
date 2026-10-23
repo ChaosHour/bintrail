@@ -65,19 +65,24 @@ import (
 // baseline Parquet end to end, so each is deferred behind its own follow-up
 // issue.
 //
-// UPDATE events that mutate the primary key itself cannot be folded safely:
-// the change map is keyed by the before-image PK, so a changed PK would emit
-// the after-image row under the OLD key and resurrect a row a later DELETE
-// removed, duplicate one another event already targets, or (when its old key is
-// reused) silently drop the moved row (#782). Rather than ship a silently wrong
-// dump, every full-table entry point detects such an UPDATE up front and
-// REFUSES the run with an actionable error. The authoritative check
-// (pkChangingUpdateInEvents) scans the RAW pre-collapse event slice — the map
-// alone would miss a PK-changing UPDATE whose old key a later event reused
-// (`UPDATE 1->2; INSERT 1`) — so the paths that fetch the full window (this dump
-// path and the binlog-only fallback) catch every case; pkChangingUpdate is a
-// cheap map backstop. Re-snapshot the baseline at or after the PK change and
-// reconstruct from there.
+// UPDATE events that mutate the primary key itself cannot be folded under one
+// key: the change map is keyed by the before-image PK, so a changed PK would
+// emit the after-image row under the OLD key and resurrect a row a later
+// DELETE removed, duplicate one another event already targets, or (when its
+// old key is reused) silently drop the moved row (#782). The paged fold
+// (foldPage, every reconstruct and refresh path on a MySQL/MariaDB source)
+// folds such an UPDATE as the two events it is, a DELETE of the old key and an
+// INSERT of the new one at the UPDATE's own binary log position, and the
+// window's "last change per key" rule resolves each shape above (#2501,
+// splitPKChange says what still refuses there: a PostgreSQL window and a key
+// whose decoded spelling is not the stored one). Three paths still REFUSE the
+// run with an actionable error, by design: the shim's `_snapshot` and verify
+// (SnapshotFullTableImages, which fetches one change per key and cannot
+// rebuild the chain; its check, pkChangingUpdateInEvents, scans the raw
+// event slice it is handed, and pkChangingUpdate is its map backstop), the
+// Iceberg export (icebergexport/fold.go, its own per-event guard, not changed
+// by #2501) and single-row reconstruct. There, re-snapshot the baseline at or
+// after the PK change and reconstruct from the new one.
 // Output formats FullTableConfig.OutputFormat accepts.
 const (
 	// OutputFormatMydumper writes a mydumper-compatible SQL dump directory —
@@ -2184,10 +2189,15 @@ type mergeInput struct {
 // Both now run per event inside foldEventWindow, on the untrimmed event, before
 // it is ever folded — which is also strictly stronger for #782: the map only
 // held the surviving last event per PK, so a PK-changing UPDATE whose old key a
-// later event reused was invisible to a map scan. The map-level helpers
-// (checkChangesToast, pkChangingUpdate) still exist for the two callers whose
-// maps DO carry before-images (the shim's _snapshot path and the binlog-only
-// fallback); they are simply not applicable to this one.
+// later event reused was invisible to a map scan. Since #2501 the #782 check
+// there is not a refusal but a split: the map this function receives holds a
+// PK-changing UPDATE as a DELETE entry under the old key and an INSERT entry
+// under the new one, each ordered against the other changes of its key, so
+// the merge below needs no notion of a moved row — a base row whose key is
+// dead is skipped, a key the base lacks is appended. The map-level helpers
+// (checkChangesToast, pkChangingUpdate) still exist for the callers whose maps
+// DO carry before-images and keep refusing (the shim's _snapshot path and
+// verify); they are simply not applicable to this one.
 func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableReport) (retErr error) {
 	colNames, err := prepareMerge(ctx, in)
 	if err != nil {
@@ -2770,12 +2780,14 @@ func pkChangedInEvent(ev *query.ResultRow, pkCols []metadata.ColumnMeta) (before
 //     overwritten UPDATE, so the moved row (pk=2) is never emitted.
 //
 // The slice is already sorted ascending by (event_timestamp, event_id), so this
-// returns the EARLIEST offender deterministically. Callers that fetch the full
-// window (reconstruct dump, binlog-only fallback) pass their raw events here so
-// the check is window-complete; the map-scan backstop (pkChangingUpdate) covers
-// callers that don't. Note that callers fetching LimitPerPK=1 (shim `_snapshot`,
-// verify) hand a raw slice already collapsed by the query to the latest event
-// per PK, so their detection is bounded by that fetch, not by this scan.
+// returns the EARLIEST offender deterministically. Its one caller today is
+// SnapshotFullTableImages (the shim's `_snapshot` and verify), whose raw slice
+// is already collapsed by the query to the latest event per PK (LimitPerPK=1),
+// so its detection is bounded by that fetch, not by this scan; the map-scan
+// backstop (pkChangingUpdate) follows it. The paged paths (the reconstruct
+// dump, the binlog-only fallback, the refresh) stopped passing their events
+// here with #1097 — foldPage handles the event itself, since #2501 by
+// splitting it (splitPKChange).
 func pkChangingUpdateInEvents(events []query.ResultRow, pkCols []metadata.ColumnMeta) (before, after string, found bool) {
 	for i := range events {
 		if b, a, ok := pkChangedInEvent(&events[i], pkCols); ok {
@@ -3141,10 +3153,12 @@ func writeBinlogOnlyChanges(
 	changes map[string]*query.ResultRow,
 	rep *TableReport,
 ) (retErr error) {
-	// The #592 (unresolved-TOAST) and #782 (PK-changing UPDATE) guards are NOT
-	// here: like the baseline path, this one now streams its window through
-	// foldEventWindow, which runs both per event on the untrimmed event before
-	// folding it. Re-adding a before-image check against `changes` would be a
+	// The #592 (unresolved-TOAST) guard and the #782 (PK-changing UPDATE)
+	// split are NOT here: like the baseline path, this one now streams its
+	// window through foldEventWindow, which runs both per event on the
+	// untrimmed event before folding it (a moved row reaches this function as
+	// a dead old key and a live new key, #2501). Re-adding a before-image
+	// check against `changes` would be a
 	// no-op that reads as a guard — retainEvent has blanked RowBefore by the
 	// time the map reaches this function. See the note above
 	// mergeBaselineIntoWriter.

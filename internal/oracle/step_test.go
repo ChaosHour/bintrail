@@ -2,59 +2,9 @@ package oracle
 
 import (
 	"context"
-	"errors"
 	"math/rand/v2"
 	"testing"
-
-	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
-
-// pkChangeErr is the fold's own refusal text, so a reword of it fails here
-// instead of silently turning every refused refresh into a run failure.
-func pkChangeErr(table string) error {
-	return reconstruct.PKChangingUpdateError("s", table, "7", "28")
-}
-
-// TestRefreshStep_refusedOnlyForTheGeneratorsPKChange: a refresh counts as
-// refused only when every failed table failed on the fold's PK-change guard
-// and an op since the published cut moved a row on that table. Anything
-// else is a failure of the run, so a product defect cannot hide behind the
-// fallback.
-func TestRefreshStep_refusedOnlyForTheGeneratorsPKChange(t *testing.T) {
-	s := &RefreshStep{}
-	pkMove := []Op{{Table: "t_int", Changes: []Change{{Kind: KindPKUpdate, Key: 7, NewKey: 28}}}}
-	moved := &Cut{Ops: pkMove, SincePublish: pkMove}
-	// Moved two steps ago, after the last publish: the window the refresh
-	// folds holds it, this step's ops do not.
-	movedEarlier := &Cut{Ops: []Op{{Table: "t_int", Changes: []Change{{Kind: KindUpdate, Key: 9}}}},
-		SincePublish: append(append([]Op{}, pkMove...), Op{Table: "t_int", Changes: []Change{{Kind: KindUpdate, Key: 9}}})}
-	// Moved before the last publish: that window was folded or snapshotted
-	// already; this refresh's window holds no move.
-	movedBefore := &Cut{Ops: pkMove}
-	quiet := &Cut{Ops: []Op{{Table: "t_int", Changes: []Change{{Kind: KindUpdate, Key: 7}}}}, SincePublish: []Op{{Table: "t_int", Changes: []Change{{Kind: KindUpdate, Key: 7}}}}}
-	cases := []struct {
-		name string
-		err  error
-		cut  *Cut
-		want bool
-	}{
-		{"pk change on the moved table", &RefreshError{Failures: []reconstruct.TableFailure{{Table: "t_int", Err: pkChangeErr("t_int")}}, Err: pkChangeErr("t_int")}, moved, true},
-		{"pk change moved by an earlier step since the publish", &RefreshError{Failures: []reconstruct.TableFailure{{Table: "t_int", Err: pkChangeErr("t_int")}}, Err: pkChangeErr("t_int")}, movedEarlier, true},
-		{"pk change moved before the last publish", &RefreshError{Failures: []reconstruct.TableFailure{{Table: "t_int", Err: pkChangeErr("t_int")}}, Err: pkChangeErr("t_int")}, movedBefore, false},
-		{"pk change on a table whose ops moved nothing", &RefreshError{Failures: []reconstruct.TableFailure{{Table: "t_text", Err: pkChangeErr("t_text")}}, Err: pkChangeErr("t_text")}, moved, false},
-		{"pk change with no PK-changing op", &RefreshError{Failures: []reconstruct.TableFailure{{Table: "t_int", Err: pkChangeErr("t_int")}}, Err: pkChangeErr("t_int")}, quiet, false},
-		{"one table refused, another failed otherwise", &RefreshError{Failures: []reconstruct.TableFailure{
-			{Table: "t_int", Err: pkChangeErr("t_int")}, {Table: "t_comp", Err: errors.New("capture gap")}}, Err: errors.New("joined")}, moved, false},
-		{"another error on the moved table", &RefreshError{Failures: []reconstruct.TableFailure{{Table: "t_int", Err: errors.New("capture gap")}}, Err: errors.New("capture gap")}, moved, false},
-		{"an error that is not a RefreshError", pkChangeErr("t_int"), moved, false},
-		{"a RefreshError without failures", &RefreshError{Err: errors.New("index unreachable")}, moved, false},
-	}
-	for _, c := range cases {
-		if got := s.Refused(c.err, c.cut); got != c.want {
-			t.Errorf("%s: refused = %v, want %v", c.name, got, c.want)
-		}
-	}
-}
 
 type fakeStep struct {
 	name string
@@ -67,9 +17,8 @@ func (f fakeStep) Apply(context.Context, *Cut) error { return nil }
 func (f fakeStep) Publishes() bool                   { return true }
 
 // TestCut_sincePublish: the window since the published cut is what a
-// refresh folds and a tail holds, so a PK move and a touch are asked over
-// it, not over this step's ops; a no-op and an op that changed nothing do
-// not touch.
+// refresh folds and a tail holds, so a touch is asked over it, not over
+// this step's ops; a no-op and an op that changed nothing do not touch.
 func TestCut_sincePublish(t *testing.T) {
 	c := &Cut{
 		Ops: []Op{{Table: "t_int", Changes: []Change{{Kind: KindUpdate, Key: 1}}}},
@@ -79,9 +28,6 @@ func TestCut_sincePublish(t *testing.T) {
 			{Table: "t_text"},
 			{Table: "t_int", Changes: []Change{{Kind: KindUpdate, Key: 1}}},
 		},
-	}
-	if !c.HadPKChangeSincePublishOn("t_uniq") || c.HadPKChangeSincePublishOn("t_int") {
-		t.Fatalf("since publish: t_uniq=%v t_int=%v; want true false", c.HadPKChangeSincePublishOn("t_uniq"), c.HadPKChangeSincePublishOn("t_int"))
 	}
 	for table, want := range map[string]bool{"t_int": true, "t_uniq": true, "t_comp": false, "t_text": false, "t_none": false} {
 		if got := c.TouchedSincePublish(table); got != want {

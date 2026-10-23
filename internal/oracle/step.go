@@ -3,7 +3,6 @@ package oracle
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -39,12 +38,6 @@ type Cut struct {
 	PublishedStep int
 }
 
-// HadPKChangeSincePublishOn reports whether an op since the last published
-// cut moved a row of table to another key: the window a refresh folds and a
-// tail holds, so the one that decides whether their refusal is the
-// generator's doing.
-func (c *Cut) HadPKChangeSincePublishOn(table string) bool { return hadPKChange(c.SincePublish, table) }
-
 // TouchedSincePublish reports whether an op since the last published cut
 // changed a row of table: a tail with no key over it is then a tail that
 // was lost, not an idle table.
@@ -57,26 +50,14 @@ func (c *Cut) TouchedSincePublish(table string) bool {
 	return false
 }
 
-func hadPKChange(ops []Op, table string) bool {
-	for _, op := range ops {
-		if table != "" && op.Table != table {
-			continue
-		}
-		for _, ch := range op.Changes {
-			if ch.Kind == KindPKUpdate {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // Step is what a run does to the copy at a cut, before reading it: a
 // snapshot cut, a refresh with table deltas (both publish the cut), or a
 // tail laid by the port's keeper (which does not). A step knows nothing of
-// the oracle; the read after it must equal the source. Weight is its share
-// of the draw between steps; the first cut of a run always takes the first
-// step of the list.
+// the oracle; the read after it must equal the source, and a step that fails
+// fails the run (no step refuses by design: the fold's refusal of a window
+// with a PK-changing UPDATE, once excused here, went with #2501). Weight is
+// its share of the draw between steps; the first cut of a run always takes
+// the first step of the list.
 type Step interface {
 	Name() string
 	Weight() int
@@ -87,14 +68,6 @@ type Step interface {
 	// it was, and a table the port answers as of that cut is compared
 	// with the rows read there.
 	Publishes() bool
-}
-
-// Refuser is a Step that can refuse a cut for a reason the generator
-// caused, which the run then answers with its Fallback step instead of
-// failing. The only such reason today: the fold refuses a window with a
-// PK-changing UPDATE and tells the operator to take a new snapshot.
-type Refuser interface {
-	Refused(err error, cut *Cut) bool
 }
 
 // SnapshotStep writes a full snapshot of the source rows at the cut, the way
@@ -262,25 +235,6 @@ type RefreshError struct {
 
 func (e *RefreshError) Error() string { return e.Err.Error() }
 func (e *RefreshError) Unwrap() error { return e.Err }
-
-// Refused: the fold refuses a window holding a PK-changing UPDATE and says
-// to take a new snapshot (reconstruct's #782 guard). A refresh is refused
-// only when EVERY failed table failed that way and an op since the last
-// published cut (the window the refresh folds, not only this step's ops)
-// moved a row on that table; any other failure, or that error on a table
-// whose window changed no key, is a failure of the run.
-func (s *RefreshStep) Refused(err error, cut *Cut) bool {
-	var re *RefreshError
-	if !errors.As(err, &re) || len(re.Failures) == 0 {
-		return false
-	}
-	for _, f := range re.Failures {
-		if !strings.Contains(f.Err.Error(), "PK-changing UPDATE") || !cut.HadPKChangeSincePublishOn(f.Table) {
-			return false
-		}
-	}
-	return true
-}
 
 // PortViews is the port's read of the copy under root, as `bintrail views`
 // and the console's SQL on the copy build it: the newest complete snapshot,

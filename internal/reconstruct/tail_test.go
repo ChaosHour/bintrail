@@ -379,13 +379,6 @@ func TestTail_applyOnlyItsTable(t *testing.T) {
 	if err := tail.Apply([]query.ResultRow{ddl}); err == nil {
 		t.Error("a DDL event was folded")
 	}
-	// A key-changing UPDATE refuses, as the refresh refuses it (#782).
-	moved := tailEvent(4, event.EventUpdate, "5", "x", 30)
-	moved.RowBefore = map[string]any{"id": json.Number("4"), "status": "x"}
-	moved.PKValues = "4"
-	if err := tail.Apply([]query.ResultRow{moved}); err == nil {
-		t.Error("a key-changing UPDATE was folded")
-	}
 }
 
 func TestTailKeyValues(t *testing.T) {
