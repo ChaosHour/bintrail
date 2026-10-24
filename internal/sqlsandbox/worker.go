@@ -240,7 +240,7 @@ func runJobOn(sess *session, job wireJob, ask func(Refs) (string, error), stderr
 		phase = now
 	}
 
-	stmt, reason := parseStatement(ctx, conn, job.SQL)
+	stmt, reason := parseStatement(ctx, conn, job.SQL, job.NoFileReaders)
 	if reason != "" {
 		return wireResult{Error: &wireError{Kind: errRefused, Message: reason}}
 	}
@@ -622,6 +622,98 @@ var allowedTableFunctions = map[string]bool{
 	"pragma_collations": true, "pragma_show": true, "pragma_user_agent": true,
 }
 
+// fileReaderFunctions are the allowed table functions that read a file of the
+// copy, or the SQL of the views over it, directly: refused on a server with
+// hidden rules (#2529), where only the views may read the files.
+var fileReaderFunctions = map[string]bool{
+	"read_parquet": true, "parquet_scan": true,
+	"read_csv": true, "read_csv_auto": true, "sniff_csv": true,
+	"read_json": true, "read_json_auto": true, "read_json_objects": true, "read_json_objects_auto": true,
+	"read_ndjson": true, "read_ndjson_auto": true, "read_ndjson_objects": true,
+	"read_text": true, "read_blob": true, "glob": true,
+	"parquet_metadata": true, "parquet_schema": true, "parquet_file_metadata": true,
+	"parquet_kv_metadata": true, "parquet_bloom_probe": true,
+	"duckdb_views": true,
+}
+
+// viewTextCatalogs are the catalog relations that print the views' SQL, which
+// names the copy's files and the hidden columns (#2529).
+var viewTextCatalogs = map[string]bool{
+	"duckdb_views": true, "sqlite_master": true, "sqlite_schema": true,
+	"sqlite_temp_master": true, "sqlite_temp_schema": true, "pg_views": true,
+}
+
+// fileOrViewTextRef returns what a table reference in the statement tree
+// reads that only the views may: a file named in quotes (a replacement scan,
+// which DuckDB's parser keeps as a table reference, not a function call), or
+// a catalog relation that prints the views' text. "" when there is none. The
+// walk is over every BASE_TABLE node at any depth, CTE bodies included.
+func fileOrViewTextRef(node any) string {
+	switch x := node.(type) {
+	case map[string]any:
+		if x["type"] == "BASE_TABLE" {
+			name, _ := x["table_name"].(string)
+			schema, _ := x["schema_name"].(string)
+			lname, lschema := strings.ToLower(name), strings.ToLower(schema)
+			switch {
+			case strings.ContainsAny(name, `/\`):
+				return "reading a file by its path"
+			case viewTextCatalogs[lname], lschema == "information_schema" && lname == "views":
+				return name
+			}
+		}
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if r := fileOrViewTextRef(x[k]); r != "" {
+				return r
+			}
+		}
+	case []any:
+		for _, e := range x {
+			if r := fileOrViewTextRef(e); r != "" {
+				return r
+			}
+		}
+	}
+	return ""
+}
+
+// fileReaderFunction returns the first table function in the statement tree
+// that reads a file of the copy directly, or "".
+func fileReaderFunction(node any) string {
+	switch x := node.(type) {
+	case map[string]any:
+		if x["type"] == "TABLE_FUNCTION" {
+			fn, _ := x["function"].(map[string]any)
+			name, _ := fn["function_name"].(string)
+			if fileReaderFunctions[strings.ToLower(name)] {
+				return name
+			}
+		}
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if r := fileReaderFunction(x[k]); r != "" {
+				return r
+			}
+		}
+	case []any:
+		for _, e := range x {
+			if r := fileReaderFunction(e); r != "" {
+				return r
+			}
+		}
+	}
+	return ""
+}
+
 func tableFunctionAllowed(name string) bool {
 	return allowedTableFunctions[name] || strings.HasPrefix(name, "duckdb_")
 }
@@ -679,7 +771,7 @@ func refusedTableFunction(node any) string {
 //
 // The parsed statement comes back with the verdict so the caller can read
 // what it names (collectRefs) from the same parse that allowed it.
-func parseStatement(ctx context.Context, conn *sql.Conn, text string) (any, string) {
+func parseStatement(ctx context.Context, conn *sql.Conn, text string, noFileReaders bool) (any, string) {
 	var raw string
 	if err := conn.QueryRowContext(ctx, "SELECT json_serialize_sql(?::VARCHAR)::VARCHAR", text).Scan(&raw); err != nil {
 		return nil, "could not parse the statement: " + err.Error()
@@ -704,6 +796,14 @@ func parseStatement(ctx context.Context, conn *sql.Conn, text string) (any, stri
 		return nil, "the query is empty"
 	case len(parsed.Statements) > 1:
 		return nil, fmt.Sprintf("one statement at a time: %d statements were given", len(parsed.Statements))
+	}
+	if noFileReaders {
+		if what := fileOrViewTextRef(parsed.Statements[0]); what != "" {
+			return nil, fmt.Sprintf("%s is not allowed on this server: it hides some tables and columns, and the copy's files and the views' text hold them; query its tables by name", what)
+		}
+		if name := fileReaderFunction(parsed.Statements[0]); name != "" {
+			return nil, fmt.Sprintf("%s is not allowed on this server: it hides some tables and columns, and the copy's files hold them; query its tables by name", name)
+		}
 	}
 	if name := refusedTableFunction(parsed.Statements[0]); name != "" {
 		return nil, fmt.Sprintf("the table function %s is not allowed here; only readers (read_parquet, glob, the parquet_* metadata functions, range, unnest, json_each and the duckdb_* catalog) can run on the copy", name)

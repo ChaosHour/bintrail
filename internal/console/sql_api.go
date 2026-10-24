@@ -432,10 +432,14 @@ func (s *Server) handleSQLInfo(w http.ResponseWriter, r *http.Request) {
 	if !s.sqlGate(w, r, b) {
 		return
 	}
-	in, err := s.buildViewsInput(r.Context(), b, viewsRequest{PinSnapshot: true, OmitEvents: true, LocalCopy: true})
+	in, err := s.buildViewsInput(r.Context(), b, viewsRequest{PinSnapshot: true, OmitEvents: true, LocalCopy: true, ApplyHidden: true})
+	var hiddenErr *hiddenRulesError
 	switch {
 	case errors.Is(err, errNoViewSources):
 		writeJSONError(w, http.StatusConflict, errNoViewSources.Error()+"; there is no copy to run SQL on yet")
+		return
+	case errors.As(err, &hiddenErr):
+		writeJSONError(w, http.StatusConflict, hiddenErr.Error())
 		return
 	case err != nil:
 		writeJSONError(w, http.StatusBadGateway, err.Error())
@@ -456,6 +460,10 @@ func (s *Server) handleSQLInfo(w http.ResponseWriter, r *http.Request) {
 		names = append(names, n)
 	}
 	if len(names) == 0 {
+		if in.HiddenEveryTable {
+			writeJSONError(w, http.StatusConflict, sqlAllHiddenMessage)
+			return
+		}
 		if why := viewsLeftOutMessage(in); why != "" {
 			writeJSONError(w, http.StatusConflict, why)
 			return
@@ -1108,15 +1116,21 @@ func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schem
 	buildCtx, cancelBuild := context.WithTimeout(ctx, baselineListTimeout)
 	in, eventsInS3, err := s.sqlViewsFor(buildCtx, b, statement, at)
 	cancelBuild()
+	var hiddenErr *hiddenRulesError
 	switch {
 	case errors.Is(err, errNoViewSources):
 		return sqlOutcome{}, &sqlRefusal{http.StatusConflict,
 			errNoViewSources.Error() + "; there is no copy to run SQL on yet"}
+	case errors.As(err, &hiddenErr):
+		return sqlOutcome{}, &sqlRefusal{http.StatusConflict, hiddenErr.Error()}
 	case err != nil:
 		return sqlOutcome{}, &sqlRefusal{http.StatusBadGateway, err.Error()}
 	}
 	if why := viewsLeftOutMessage(in); why != "" {
 		return sqlOutcome{}, &sqlRefusal{http.StatusConflict, why}
+	}
+	if in.HiddenEveryTable && !in.RendersAnyView() {
+		return sqlOutcome{}, &sqlRefusal{http.StatusConflict, sqlAllHiddenMessage}
 	}
 	if in.NeedsS3() || (!in.RendersAnyView() && eventsInS3) {
 		// The tables themselves are in S3, or the change log in S3 is all
@@ -1178,6 +1192,9 @@ func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schem
 		// shared automation token as one identity.
 		User:     user,
 		CopyDirs: copyDirs,
+		// A server with hidden rules (#2529): the copy's files hold what
+		// the views leave out, so nothing may read them but the views.
+		NoFileReaders: in.Hidden != nil,
 		ViewsFor: func(refs sqlsandbox.Refs) (string, error) {
 			// The whole callback, refusals included, is the views_for
 			// phase (#2504): it runs inside the worker's run, after
@@ -1204,6 +1221,18 @@ func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schem
 			named := sqlNamedTables(in, refs)
 			if readTables = named; narrowed.OnlyViews == nil {
 				readTables = in.Baselines
+			}
+			// A hidden column is a column MySQL has and the view does not, so
+			// a name the reader writes for it can bind to ANOTHER table's
+			// column of that name (a join, a correlated subquery) and answer
+			// other rows with no error, and a NATURAL JOIN pairs on fewer
+			// columns (#2529). Refused before anything heavier runs. Where no
+			// rebinding is possible the statement goes on, and DuckDB answers
+			// as for a name that does not exist. The names are not secret
+			// (the server's settings list them); the values are.
+			if why := sqlHiddenNameRefusal(refs, readTables); why != "" {
+				viewsRefusal = &sqlRefusal{http.StatusUnprocessableEntity, why}
+				return "", viewsRefusal
 			}
 			// Not over a statement whose tables the parse could not tell: it
 			// would build a tail for every table of the copy.
@@ -1295,6 +1324,9 @@ func (s *Server) runSQLAt(ctx context.Context, b *bundle, user, statement, schem
 				// (#2078): nothing here knows whether events exists.
 				return sqlOutcome{}, &sqlRefusal{http.StatusBadGateway, sqlEventsLookupFailedMessage}
 			}
+		}
+		if in.Hidden != nil && qerr != nil && sqlHiddenNameMissing.MatchString(qerr.Message) {
+			return sqlOutcome{}, &sqlsandbox.QueryError{Message: qerr.Message + sqlHiddenHint}
 		}
 		return sqlOutcome{}, sqlWithMemoryHint(err, memory)
 	}
@@ -1810,7 +1842,7 @@ func (s *Server) sqlViewsFor(ctx context.Context, b *bundle, statement string, a
 	// fixed cost per statement, paid by every statement. A copy that gives
 	// no state view this way (no snapshot, or every table in a schema
 	// DuckDB keeps for itself) falls through to the archive, as before.
-	tablesOnly := viewsRequest{PinSnapshot: true, OmitEvents: true, StateOnly: true, ForStatement: true, LocalCopy: true, SnapshotAt: at}
+	tablesOnly := viewsRequest{PinSnapshot: true, OmitEvents: true, StateOnly: true, ForStatement: true, LocalCopy: true, SnapshotAt: at, ApplyHidden: true}
 	if !sqlMentionsEvents(statement) {
 		in, err = s.buildViewsInput(ctx, b, tablesOnly)
 		if err == nil && in.RendersAnyView() {
@@ -1825,7 +1857,7 @@ func (s *Server) sqlViewsFor(ctx context.Context, b *bundle, statement string, a
 	// S3 change log is detected from the sources alone and answered with
 	// the tables, exactly as before; only a local change log is then built
 	// with the events view on.
-	in, err = s.buildViewsInput(ctx, b, viewsRequest{PinSnapshot: true, OmitEvents: true, ForStatement: true, LocalCopy: true, SnapshotAt: at})
+	in, err = s.buildViewsInput(ctx, b, viewsRequest{PinSnapshot: true, OmitEvents: true, ForStatement: true, LocalCopy: true, SnapshotAt: at, ApplyHidden: true})
 	if err != nil {
 		return views.Input{}, false, err
 	}
@@ -1835,12 +1867,89 @@ func (s *Server) sqlViewsFor(ctx context.Context, b *bundle, statement string, a
 	if !sqlArchivesLocal(in.ArchiveSources) {
 		return in, true, nil
 	}
-	in, err = s.buildViewsInput(ctx, b, viewsRequest{PinSnapshot: true, ForStatement: true, LocalCopy: true, SnapshotAt: at})
+	in, err = s.buildViewsInput(ctx, b, viewsRequest{PinSnapshot: true, ForStatement: true, LocalCopy: true, SnapshotAt: at, ApplyHidden: true})
 	if err != nil {
 		return views.Input{}, false, err
 	}
 	return in, false, nil
 }
+
+// sqlHiddenNameMissing matches DuckDB's answers to a statement naming a
+// table or column that is not in its view (#2529): on a server with hidden
+// rules the name may be hidden rather than mistyped, and the bare answer
+// would read as "no such thing on the source".
+var sqlHiddenNameMissing = regexp.MustCompile(`(?i)Referenced column|Table with name|Referenced table|does not have a column named|does not exist on (left|right) side of join|resulted in an empty set of columns`)
+
+// sqlHiddenNameRefusal refuses a statement in which a hidden column's name
+// could bind to another column: an UNQUALIFIED reference to it while
+// another table the statement may read has (or may have) a column of that
+// name, or a NATURAL JOIN over a table with hidden columns. It reads DuckDB's parse (Refs.Columns), never the text.
+func sqlHiddenNameRefusal(refs sqlsandbox.Refs, tables []views.BaselineTable) string {
+	hiddenIn := map[string][]views.BaselineTable{} // folded column -> tables hiding it
+	for _, t := range tables {
+		for _, c := range t.HiddenColumns {
+			k := strings.ToLower(c)
+			hiddenIn[k] = append(hiddenIn[k], t)
+		}
+	}
+	if len(hiddenIn) == 0 {
+		return ""
+	}
+	if refs.Natural {
+		return "a NATURAL JOIN pairs on the columns its tables share, and some columns are not in the copy for this server" +
+			sqlHiddenHint + "; write the join with ON or USING"
+	}
+	hides := func(t views.BaselineTable, col string) bool {
+		for _, c := range t.HiddenColumns {
+			if strings.EqualFold(c, col) {
+				return true
+			}
+		}
+		return false
+	}
+	// mayHold: a visible column of that name in t, or t's columns unknown.
+	mayHold := func(t views.BaselineTable, col string) bool {
+		if hides(t, col) {
+			return false
+		}
+		if len(t.Columns) == 0 {
+			return true
+		}
+		for _, c := range t.Columns {
+			if strings.EqualFold(c, col) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, ref := range refs.Columns {
+		col := strings.ToLower(ref.Name)
+		if len(hiddenIn[col]) == 0 {
+			continue
+		}
+		if ref.Qualifier != "" {
+			// A qualified name binds inside the relation it names (a table,
+			// a subquery, a CTE), whose columns come from the views: it
+			// answers there or fails there, and cannot reach another table.
+			continue
+		}
+		for _, t := range tables {
+			if mayHold(t, ref.Name) {
+				return fmt.Sprintf("the statement names %q, which is not in the copy for this server", ref.Name) + sqlHiddenHint
+			}
+		}
+	}
+	return ""
+}
+
+// sqlAllHiddenMessage answers a server whose every table the rules hide: the
+// copy is there, which "no snapshot" or "only on S3" would deny.
+const sqlAllHiddenMessage = "every table of this server's copy is hidden by this server's rules; its settings list them"
+
+// sqlHiddenHint is appended to those answers. It names no hidden table or
+// column: the rules are visible in the server settings to whoever may edit
+// them, and the error must not list them to whoever may not.
+const sqlHiddenHint = "; this server hides some tables and columns from SQL on the copy (its settings list them), so a hidden name reads as missing"
 
 // sqlEventsMissing matches DuckDB's answer to a statement that reads a
 // table named events that is not defined.
