@@ -79,6 +79,9 @@ type serverDTO struct {
 	SourceServerID  uint32 `json:"source_server_id,omitempty"`
 	Schemas         string `json:"schemas,omitempty"`
 	MonitorDesired  bool   `json:"monitor_desired"`
+	// Hidden are the tables and columns the analytical surfaces leave out
+	// for this server (#2529). Edited through /api/servers/{id}/hidden only.
+	Hidden *hiddenListsDTO `json:"hidden,omitempty"`
 	// Flavor is the source family ("mysql" | "mariadb" | "postgres"); the
 	// frontend gates per-server without opening the index. SourceDatabase /
 	// SourceSlot / SourcePublication are the PostgreSQL-only source parts (the
@@ -1553,6 +1556,7 @@ func (s *Server) entryDTO(e ServerEntry) serverDTO {
 		SourceServerID:       e.SourceServerID,
 		Schemas:              e.Schemas,
 		MonitorDesired:       e.MonitorDesired,
+		Hidden:               newHiddenListsDTO(e.Hidden),
 		Flavor:               e.SourceFlavor(),
 		SourceSlot:           e.SourceSlot,
 		SourcePublication:    e.SourcePublication,
