@@ -262,6 +262,7 @@ What a stale compose file costs:
 | the `iceberg-export` profile and its volume | there is no one-shot Iceberg export to run | `docker compose --profile iceberg-export run ...` says the service does not exist |
 | the `host.docker.internal` mapping (`extra_hosts`) | on Linux, a database on this same machine cannot be reached by that name | Adding the server fails with `lookup host.docker.internal: no such host` |
 | `cpu_shares` on the `router` service (file version 7) | statements on the copy run with half the machine's cores, about half as fast on an analytical query (a full-table aggregate over 78 M rows: 7 to 10 s against 3 s on 4 cores) | the router's startup line and its card in the web interface say "statements use 2 of this machine's 4 cores". Taking the version 7 file gives them all |
+| `SQL_FRESH` passed to the `router` service (file version 8) | nothing changes in the default fast mode | `SQL_FRESH=on` in `.env` has no effect: the router's startup line says "fast mode" and its card in the web interface says the same. Taking the version 8 file lets it through |
 | the `index-mysql` entrypoint that sizes the buffer pool when `INDEX_BUFFER_POOL` is unset (file version 6) | without a value in `.env`, the index MySQL keeps InnoDB's 128 MB buffer pool, which caps capture on a busy source and slows every refresh of the copy for SQL | `doctor` warns "Index buffer pool" at 128 MB on a machine with about 4 GB or more; capture lag keeps growing. Taking the version 6 file changes this on the next `up -d`: an index MySQL that ran at 128 MB restarts with a quarter of the machine's memory. To keep it lower, set `INDEX_BUFFER_POOL` in `.env` first |
 | `--innodb-buffer-pool-size=${INDEX_BUFFER_POOL:-128M}` on `index-mysql` | `INDEX_BUFFER_POOL` in `.env` does nothing, and the index MySQL keeps the 128 MB buffer pool | as above |
 | `BINTRAIL_CONSOLE_SQL_PANEL` (the current file does not set it) | nothing: the SQL page it switched was removed in 0.75.0 | Remove the variable. It is read for one release and warns. SQL in the browser is on the Overview now and this variable does not control it |
@@ -711,27 +712,29 @@ Two setups this does not protect: capture's service lowered as well (leave
 the other services at the default priority), and Kubernetes, where a
 container's weight competes only inside its pod, so the router ignores it
 there and keeps half; set a CPU limit on the router there. For memory it plans with half of the
-machine for its statements and a fifth for its tails (the newest changes
-laid over the copy), since capture uses the machine too. Each service can instead plan
+machine for its statements, since capture uses the machine too, and in the
+fresh mode (`SQL_FRESH=on`) a fifth for its tails (the newest changes laid
+over the copy). Each service can instead plan
 with a share of the machine's memory (`BINTRAIL_MEMORY_SHARE`: `ROUTER_MEMORY_SHARE`
 and `DAEMON_MEMORY_SHARE` in `.env`, empty by default): 0.3 for the router and
 0.4 for the `bintrail` service beside the index MySQL's quarter add up to the
 machine instead of each taking its own cut of all of it, which is the setting
 for a host where the kernel stops DBTrail's processes for memory. Inside the
-router's share, its tails and its statements come out of the same number.
+router's share, its statements and, in the fresh mode, its tails come out
+of the same number.
 Set `ROUTER_MEMORY` and `ROUTER_CPUS` in `.env` to give it hard ceilings: a
 share then applies to that ceiling, and a statement that outgrows its memory
 is stopped inside the router's own. To set the number of statements yourself,
 set `ROUTER_CONCURRENCY`. Each statement
 may reach `SQL_MEMORY` (2 GB unless set) plus a quarter, and the router keeps
 half a gigabyte for itself. `docker compose logs router` shows the numbers it
-worked out and why, as the budget less the tails.
+worked out and why, as the budget less the tails in the fresh mode.
 
 Two things to know before setting shares. A smaller share means less for
 everything the process sizes from it: with 0.4 on an 8 GB host the `bintrail`
-service's snapshot sessions drop to their 512 MiB floor and its tails to a
-fifth of 3.2 GB, so the copy is refreshed with less memory and the tails
-freeze earlier on busy tables; a `SQL_MEMORY` or `ROUTER_CONCURRENCY` that
+service's snapshot sessions drop to their 512 MiB floor, so the copy is
+refreshed with less memory, and in the fresh mode the router's tails freeze
+earlier on busy tables; a `SQL_MEMORY` or `ROUTER_CONCURRENCY` that
 fitted the whole machine may not fit the share (the SQL card's 2 statements at
 2 GB each are more than 3.2 GB), and the startup log says so naming the share;
 and the router runs fewer statements at once on a mid-size host (16 GB: 3 with
@@ -817,11 +820,12 @@ surface, use the demo image ([demo.md](./demo.md)).
 | `CONSOLE_TOKEN` | compose (optional) | Opt-in static API-automation token (default: none; humans sign in with a username and password) |
 | `METRICS_ADDR` | compose (optional) | Container-side bind for the watch daemon's Prometheus `/metrics` (default `:9090`, published on the host loopback as `127.0.0.1:9090`; set empty to disable) |
 | `ROUTER_MEMORY` | compose `router` service (optional) | Memory ceiling of the router (e.g. `8g`). Unset = none: the router plans with its share of the machine |
-| `ROUTER_MEMORY_SHARE` | compose `router` service (optional) | Fraction of the machine's memory (or of `ROUTER_MEMORY`) the router plans with: its tails and its statements together. Unset = the whole machine (half for statements, a fifth for tails); `0.3` beside `DAEMON_MEMORY_SHARE=0.4` and the index's quarter adds up to the machine |
-| `DAEMON_MEMORY_SHARE` | compose `bintrail` service (optional) | Fraction of the machine's memory the watch daemon plans with: its snapshot work, its tails and its SQL card. Unset = the whole machine; a share also shrinks the snapshot work and the tails |
+| `ROUTER_MEMORY_SHARE` | compose `router` service (optional) | Fraction of the machine's memory (or of `ROUTER_MEMORY`) the router plans with: its statements and, in the fresh mode, its tails together. Unset = the whole machine (half for statements, and a fifth for tails in the fresh mode); `0.3` beside `DAEMON_MEMORY_SHARE=0.4` and the index's quarter adds up to the machine |
+| `DAEMON_MEMORY_SHARE` | compose `bintrail` service (optional) | Fraction of the machine's memory the watch daemon plans with: its snapshot work and its SQL card. Unset = the whole machine; a share also shrinks the snapshot work |
 | `KEY_INDEX` | compose `bintrail` service (optional) | Whether a snapshot refresh resolves the keys a window changed through the key index beside each table's file instead of scanning the file. Unset = on; a file with no index gets one built at its next refresh. `0` turns it off |
 | `ROUTER_CPUS` | compose `router` service (optional) | CPU ceiling of the router (e.g. `4`). Unset = none |
 | `ROUTER_CPU_SHARES` | compose `router` service (optional) | CPU priority of the router against the other services (`cpu_shares`). Unset = 256, well below the default, so statements use every core and capture takes them back when it needs them. The weight it becomes depends on the runtime; the router's log says what it read |
+| `SQL_FRESH` | compose `router` service (optional) | `on` = the fresh mode: the newest captured changes laid over each table's snapshot, answers about as far behind as capture, for a fifth of the router's memory and an update every second. Unset = the fast mode: each table's last snapshot, as old as its last refresh |
 | `ROUTER_CONCURRENCY` | compose `router` service (optional) | How many statements run on the copy at once, 1 to 64. Unset = the router works it out: one per two of its cores, as many as its memory holds. The rest wait their turn. Needs the current `docker-compose.yml` |
 | `ROUTER_MAX_WAIT` | compose `router` service (optional) | How long a statement waits for its turn on the copy when every worker is busy (e.g. `30s`); past it the client gets an error. Unset = no limit: it waits for as long as its client stays connected |
 | `ROUTER_READ_ONLY` | compose `router` service (optional) | The router refuses every statement that is not a read, and never sends it to the source (default `1`). `0` forwards writes too |

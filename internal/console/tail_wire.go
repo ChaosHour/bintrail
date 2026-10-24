@@ -20,7 +20,8 @@ import (
 // (#2369): what capture has indexed since the snapshot, so a statement on the
 // copy is as current as the index, not only as the last refresh. Only the
 // port's statements (SQLOnCopy.Run) do; the console's own SQL card reads
-// the published copy. BINTRAIL_SQL_TAILS=off turns tails off.
+// the published copy. Tails are the opt-in fresh mode: BINTRAIL_SQL_TAILS=on
+// (tailsOff).
 
 // Tail budgets: keys one tail may hold and memory all of them may (#2494,
 // tailBudgetFor), how long a replaced version stays for a statement that may
@@ -73,13 +74,25 @@ func tailsFor(ctx context.Context) (string, bool) {
 	return id, ok && id != ""
 }
 
-// tailsOff is BINTRAIL_SQL_TAILS=off (or false, or 0, in any case).
+// tailsOff says the port answers from each table's snapshot alone, which is
+// the default: fast answers first. Tails are opt-in, the "fresh
+// mode": BINTRAIL_SQL_TAILS=on (or true, 1, yes, fresh, in any case). Any
+// other value, a typo included, keeps them off; TailsSetting says what was
+// read so the router can show it.
 func tailsOff() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("BINTRAIL_SQL_TAILS"))) {
-	case "off", "false", "0", "no":
-		return true
+	on, _ := TailsSetting()
+	return !on
+}
+
+// TailsSetting is whether tails are on and the BINTRAIL_SQL_TAILS value read,
+// trimmed ("" when unset).
+func TailsSetting() (on bool, read string) {
+	read = strings.TrimSpace(os.Getenv("BINTRAIL_SQL_TAILS"))
+	switch strings.ToLower(read) {
+	case "on", "true", "1", "yes", "fresh":
+		return true, read
 	}
-	return false
+	return false, read
 }
 
 // tailKeeperFor is server id's keeper over b, nil when the server can have no
