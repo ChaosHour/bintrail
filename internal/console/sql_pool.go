@@ -1,7 +1,9 @@
 package console
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -20,6 +22,17 @@ type SQLPoolInput struct {
 	// the machine's count.
 	Cores    int
 	CoresOwn bool
+	// CoresYield says this process runs at a lower CPU priority than its
+	// siblings (cpuPriorityOf: a container's cpu_shares, a unit's CPUWeight),
+	// so the scheduler hands capture the cores when it needs them (#2531).
+	// CoresPriority says what was read, for the note when it does not yield:
+	// "cpu.weight 100", or why nothing could be read.
+	CoresYield    bool
+	CoresPriority string
+	// InKubernetes: a container's weight there competes only with the other
+	// containers of its own pod, never with capture's pod, so a low weight
+	// protects nothing and the pool keeps half (KUBERNETES_SERVICE_HOST).
+	InKubernetes bool
 	// MemoryBytes is the memory it may use, 0 when not known; MemoryOwn says
 	// it is a ceiling set on this process and not the machine's memory.
 	MemoryBytes uint64
@@ -50,6 +63,11 @@ type SQLPool struct {
 	// warn about: the number the operator set can ask for more memory than
 	// this process may use.
 	Warning string
+	// CoresNote, "" unless the statements were given half the cores because
+	// this process has neither a CPU ceiling nor a lower CPU priority of its
+	// own (#2531): it says so and how to give them all, for the startup
+	// line and the web interface.
+	CoresNote string
 }
 
 const (
@@ -77,11 +95,37 @@ const (
 // A resource with no ceiling of its own is the machine's, which capture
 // uses too: half of it is taken. A service started with its own ceilings
 // (the compose service, the systemd unit) gets all of what it was given.
+// So does one that runs at a lower CPU priority than capture (#2531): the
+// scheduler gives capture the cores back whenever it needs them, so the
+// statements can use all of them the rest of the time.
 func SQLPoolFor(in SQLPoolInput) SQLPool {
-	cores, coresWhy := max(in.Cores, 1), ""
-	if !in.CoresOwn && cores > 1 {
+	cores, coresWhy, coresNote := max(in.Cores, 1), "", ""
+	switch {
+	case in.CoresOwn || cores <= 1:
+	case in.CoresYield && !in.InKubernetes:
+		coresWhy = fmt.Sprintf(" (all of the machine's %d: this process runs below the default CPU priority (%s), so capture, at the default, takes cores back when it needs them)", in.Cores, in.CoresPriority)
+	default:
 		cores = max(cores/2, 1)
 		coresWhy = fmt.Sprintf(" (half of the machine's %d: this process has no CPU ceiling of its own, and capture uses the machine too)", in.Cores)
+		read := in.CoresPriority
+		if read == "" {
+			read = "unknown"
+		}
+		head := fmt.Sprintf("statements use %d of this machine's %d cores and leave the rest to capture, because the router has no CPU ceiling of its own", cores, in.Cores)
+		switch {
+		case in.InKubernetes:
+			coresNote = head + ". On Kubernetes a container's CPU priority competes only inside its own pod, so it cannot protect capture. " +
+				"To give statements more cores, set a CPU limit on the router's container (resources.limits.cpu) and they use all of it"
+		case strings.HasPrefix(read, "unknown"):
+			coresNote = head + fmt.Sprintf(" and its CPU priority could not be read (%s). ", read) +
+				"The cpu controller is probably not available to the router (rootless Docker, or a systemd setup that does not delegate it), " +
+				"and then cpu_shares or CPUWeight has no effect either. Capture keeps its cores either way"
+		default:
+			coresNote = head + fmt.Sprintf(" and does not run below the default CPU priority (its CPU priority: %s). ", read) +
+				"To give them every core, run the router at a lower priority: " +
+				"with Docker Compose, take the current docker-compose.yml (cpu_shares on the router service) and docker compose up -d router; " +
+				"under systemd, CPUWeight=25 on the router's unit. Capture keeps its cores either way"
+		}
 	}
 	byCores := max(cores/sqlPoolMinThreads, 1)
 	workers := byCores
@@ -123,7 +167,7 @@ func SQLPoolFor(in SQLPoolInput) SQLPool {
 		why += fmt.Sprintf("; at most %d run at once", SQLPoolMaxWorkers)
 	}
 	if in.Asked <= 0 {
-		return SQLPool{Workers: workers, Threads: max(cores/workers, sqlPoolMinThreads), Why: why}
+		return SQLPool{Workers: workers, Threads: max(cores/workers, sqlPoolMinThreads), Why: why, CoresNote: coresNote}
 	}
 	// The operator's number. A statement gets its share of the cores, down
 	// to one thread: asked for more statements than the cores divide into
@@ -149,7 +193,7 @@ func SQLPoolFor(in SQLPoolInput) SQLPool {
 				countOfStatements(asked), gibText(uint64(ceiling)), gibText(need), gibText(mem), memoryCountedWhy(in))
 		}
 	}
-	return SQLPool{Workers: asked, Threads: max(cores/asked, 1), Why: said, Warning: warning}
+	return SQLPool{Workers: asked, Threads: max(cores/asked, 1), Why: said, Warning: warning, CoresNote: coresNote}
 }
 
 // memoryCountedWhy says, for the warning over the operator's number, what
@@ -212,7 +256,10 @@ func ThisMachineForSQLPool(memoryLimit string) SQLPoolInput {
 	if !tailsOff() {
 		tails = tailBudgetFromEnv().Bytes
 	}
-	return machineForSQLPool(memoryLimit, runtime.GOMAXPROCS(0), cpuCapped("/"), memoryBudget(), memoryCapped("/"), MemoryShare(), tails, MemoryBudgetWords())
+	in := machineForSQLPool(memoryLimit, runtime.GOMAXPROCS(0), cpuCapped("/"), memoryBudget(), memoryCapped("/"), MemoryShare(), tails, MemoryBudgetWords())
+	in.CoresYield, in.CoresPriority = cpuPriorityOf("/")
+	in.InKubernetes = os.Getenv("KUBERNETES_SERVICE_HOST") != ""
+	return in
 }
 
 // machineForSQLPool is ThisMachineForSQLPool over its inputs: budget is the
@@ -294,6 +341,67 @@ func cpuCapped(root string) bool {
 		}
 	}
 	return false
+}
+
+// cpuPriorityOf reports whether this process's OWN cgroup runs at a CPU
+// priority well below the default, and what it read, for the note when it
+// does not: cpu.weight at most 50 (the default is 100) under cgroup v2,
+// cpu.shares at most 512 (of 1024) under v1. Half the default, not merely
+// below it: a weight of 99 against capture's 100 protects nothing. That is a
+// container's cpu_shares or a systemd unit's CPUWeight.
+//
+// Only its own cgroup: a parent's weight lowers this process and capture
+// beside it alike, which protects nothing. And it is compared with the
+// DEFAULT, not with capture's, which this process cannot see: lowering
+// capture's service too, or a Kubernetes pod (whose container weight competes
+// only inside the pod), defeats it, as docs/docker.md says.
+//
+// The file is looked for at the cgroup path /proc/self/cgroup names and,
+// when that path does not exist, at the root of the mount: inside a container
+// that shares the host's cgroup namespace (cgroup v1, or v2 with cgroupns
+// host) the path names the host's view, while the container's own cgroup is
+// mounted at the root. A line whose file does not read is skipped, and
+// nothing read is "unknown", never "lower": the pool then keeps half the
+// cores, as before #2531.
+func cpuPriorityOf(root string) (yields bool, read string) {
+	b, err := os.ReadFile(filepath.Join(root, "proc/self/cgroup"))
+	if err != nil {
+		return false, "unknown: /proc/self/cgroup could not be read"
+	}
+	read = "unknown: no cpu controller in /proc/self/cgroup"
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		var base, file string
+		var def int64
+		switch {
+		case parts[0] == "0" && parts[1] == "":
+			base, file, def = filepath.Join(root, "sys/fs/cgroup"), "cpu.weight", 100
+		case strings.Contains(","+parts[1]+",", ",cpu,"):
+			base, file, def = filepath.Join(root, "sys/fs/cgroup", parts[1]), "cpu.shares", 1024
+		default:
+			continue
+		}
+		own := filepath.Join(base, filepath.Clean("/"+parts[2]), file)
+		b, err := os.ReadFile(own)
+		if errors.Is(err, fs.ErrNotExist) {
+			own = filepath.Join(base, file)
+			b, err = os.ReadFile(own)
+		}
+		if err != nil {
+			read = "unknown: " + strings.TrimPrefix(own, root) + " could not be read"
+			continue
+		}
+		v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+		if err != nil || v <= 0 {
+			read = fmt.Sprintf("unknown: %s holds %q", strings.TrimPrefix(own, root), strings.TrimSpace(string(b)))
+			continue
+		}
+		return v <= def/2, fmt.Sprintf("%s %d, the default being %d", file, v, def)
+	}
+	return false, read
 }
 
 // hasCPUQuota reads one quota file: the first field is the quota, "max" (v2)
