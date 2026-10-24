@@ -2071,6 +2071,47 @@ of routing. `sql-compare` needs such a connection (`--copy-dsn
 'shop@copy:<password>@tcp(...)/'`) when routing is on. A server whose own
 name ends in `@copy` is found under its name first.
 
+**What a connection the copy answers alone refuses.** Routing off, a server
+that cannot be forwarded for, or a `@copy` user: there is no MySQL to send a
+statement to, and the copy runs DuckDB SQL. A statement written for MySQL
+that DuckDB would answer differently, without an error, is refused with
+error 1235, which names the construct and how to write it for the copy:
+
+| Refused | Write it for the copy as |
+|---|---|
+| `GROUP_CONCAT` | `string_agg(x, ',')` |
+| `WEEK`, `YEARWEEK`, `EXTRACT(WEEK ...)` | `weekofyear(d)` (ISO weeks), `strftime(d, '%U')` (weeks from Sunday) |
+| `DAYOFWEEK`, `WEEKDAY`, `MICROSECOND` | `isodow(d) % 7 + 1` (MySQL's `DAYOFWEEK`), `isodow(d) - 1` (`WEEKDAY`), `microsecond(ts) % 1000000` |
+| `STR_TO_DATE` | `strptime(text, format)`, `try_strptime` for NULL on a bad date |
+| `DATEDIFF`, `TIMESTAMPDIFF`, `TIMEDIFF` | `date_diff('day', start, end)` for a count, `end - start` for a time (the copy's own `datediff('day', a, b)` is answered) |
+| `CAST(x AS SIGNED)`, `AS UNSIGNED` | `CAST(x AS BIGINT)`, `CAST(x AS UBIGINT)` |
+| `a DIV b` | `a // b` |
+| `REGEXP`, `RLIKE` | `regexp_matches(x, 'pattern', 'i')` |
+| `DATABASE()`, `USER()`, `VERSION()`, `CURRENT_USER` and the like | `current_database()`, `current_schema()`, `library_version FROM pragma_version()` |
+| `FOUND_ROWS()`, `LAST_INSERT_ID()`, `ROW_COUNT()`, `@x` and `@@x` variables | nothing on the copy: run it on MySQL (`abs(x)` for the copy's `@x`) |
+| `FOR UPDATE`, `FOR SHARE`, `LOCK IN SHARE MODE`, `INTO OUTFILE` | drop the clause; the copy takes no locks and writes no files |
+| `MATCH ... AGAINST`, `BINARY x` | `ILIKE` or `regexp_matches`; compare the copy's way |
+| `0x10`, `0b101`, `x'41'`, `b'1'` | the number in decimal, `'\x41'::BLOB` |
+| `LIMIT 10, 5`, `_binary'x'`, `/*! ... */` | `LIMIT 5 OFFSET 10`, the string alone, the statement without the comment |
+
+Or turn on Engine Routing, and MySQL answers them. The list is of
+constructs only MySQL's SQL holds; it does not make the copy MySQL. Every
+other difference this page lists still holds on such a connection (text
+compared by case only, `CONCAT` skipping a NULL where MySQL returns NULL,
+and the rest). Answered with the copy's own meaning, because it is also how
+DuckDB SQL is written or because it is a difference listed above: a string
+that reads as a date with a two-digit year (`'26-01-15'` is year 26 here,
+2026 on MySQL; any text of that shape would otherwise be refused), a
+number with underscores (`1_000`), `LIKE` and `DISTINCT` inside an aggregate (the
+copy's case rules), `||`, `^`, `UNION`, `INTERSECT`, `EXCEPT`, `WITH
+RECURSIVE`, JSON functions and `->>`, `COLLATE`, `INTERVAL`, date
+arithmetic, bit operators, `~`, `$$` strings, double-quoted names, a
+backslash in a string, `--` comments, `INSTR` and `POSITION`, and the system
+schemas. `NOW()` and the copy's other clock functions answer in the zone
+the connection set. A statement that DuckDB does not understand at all
+(`CURDATE()`, `UNIX_TIMESTAMP`, `FIELD`, `FIND_IN_SET`) fails with
+DuckDB's own error.
+
 **Its numbers.** The router has no web page, so it answers for itself.
 `SHOW ROUTER STATUS`, on any connection to it, lists the server's copy
 snapshot and its age in seconds, how many of that server's statements the
