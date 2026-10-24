@@ -481,36 +481,42 @@ type spillSpec struct {
 //   - autoinstall_known_extensions / autoload_known_extensions = false,
 //     FIRST: a function or a collation that lives in a not-yet-loaded
 //     extension does not trigger a download or a load; it is simply not
-//     there. First, because the next statement names an ICU collation, and
-//     the product runs air-gapped: with these off, an engine that lacked ICU
-//     fails that SET by name instead of reaching for the network.
-//   - default_collation = 'nocase.icu_noaccent' and default_null_order =
-//     'nulls_first_on_asc_last_on_desc': MySQL semantics for the two things
-//     no statement-level check can catch (#2038). MySQL's default collation
-//     (utf8mb4_0900_ai_ci) treats 'Paid' and 'paid', 'café' and 'cafe' as
-//     EQUAL in WHERE, GROUP BY, SELECT DISTINCT, IN and ORDER BY, and sorts
-//     NULL first on ASC and last on DESC (NULL is its smallest value);
-//     DuckDB's defaults do neither, so a copy-served statement answered
-//     differently from MySQL without any error. The collation is nocase
-//     over ICU's accent-insensitive one (#2083): like MySQL's it also
-//     equates 'ß' with 'ss', full-width forms, ligatures and kana, and sorts
-//     punctuation before digits, where the built-in nocase.noaccent this
-//     used to be folds case and accents and nothing else (57 measured pairs:
-//     1 disagreement with MySQL against 26; collations_2083_test.go). It
-//     costs about twice as much on every comparison of text, which is the
-//     price accepted for the same answers. ICU is statically linked into
-//     the engine (TestLockdown_collationComesFromTheBinary), never loaded
-//     at run time; a collation the engine does not have fails this SET, and
-//     runJob fails the statement on any lock-down error, so no worker can
-//     end up answering under another collation. Close to _ai_ci, not
-//     identical: LIKE/REGEXP, count(DISTINCT ...) and the string-search
-//     functions (instr, position, contains) do NOT fold under either
-//     collation (DuckDB #10416 for LIKE), which the read router vetoes; a
-//     column MySQL declares _cs becomes case-insensitive here. A _bin
-//     column does not: its state view gives it COLLATE C
-//     (views.BaselineTable.BinaryText, #2083), which outranks this default.
-//     The copy's OWN views are immune on purpose:
-//     the delta chain compares "bintrail_pk" as its bytes
+//     there. First, so that nothing set after them can reach for the network
+//     on an air-gapped host: a collation or function an engine lacks fails
+//     by name instead.
+//   - default_collation = 'nocase' and default_null_order =
+//     'nulls_first_on_asc_last_on_desc': MySQL semantics, as far as a
+//     built-in collation goes, for the two things no statement-level check
+//     can catch (#2038). MySQL's default collation (utf8mb4_0900_ai_ci)
+//     treats 'Paid' and 'paid' as EQUAL in WHERE, GROUP BY, SELECT
+//     DISTINCT, IN and ORDER BY, and sorts NULL first on ASC and last on
+//     DESC (NULL is its smallest value); DuckDB's defaults do neither, so a
+//     copy-served statement answered differently from MySQL without any
+//     error. nocase folds case and NOTHING ELSE (#2532): accents, 'ß' and
+//     'ss', full-width forms and ligatures stay apart, where MySQL equates
+//     them, and ORDER BY sorts punctuation by code point and accented
+//     letters after 'z'. For equality (=, IN, a join on equal values) that
+//     means fewer matches than MySQL; for everything built on NOT being
+//     equal or on order it means MORE: <> and NOT IN keep 'café' when asked
+//     to drop 'cafe', an anti-join keeps rows MySQL drops, DISTINCT and
+//     GROUP BY return more rows, a range (> 'y') takes accented words, and
+//     ORDER BY/LIMIT/MIN/MAX pick other rows (collations_2083_test.go
+//     measures the pairs; docs/time-travel-sql.md lists every effect).
+//     nocase.icu_noaccent, the default from #2083 to #2532, matched MySQL
+//     on 56 of the 57 measured pairs but cost 1.6-1.8x on the text-grouping
+//     query it was measured on (nocase: 1.1-1.4x), against no collation;
+//     nocase.noaccent, the default before it,
+//     also folds accents but equated far more texts MySQL keeps apart
+//     (combining marks, Indic vowel signs), the dangerous direction. A
+//     collation the engine does not have fails this SET, and runJob fails
+//     the statement on any lock-down error, so no worker can end up
+//     answering under another collation. LIKE/REGEXP, count(DISTINCT ...)
+//     and the string-search functions (instr, position, contains) do NOT
+//     fold (DuckDB #10416 for LIKE), which the read router vetoes; a column
+//     MySQL declares _cs becomes case-insensitive here. A _bin column does
+//     not: its state view gives it COLLATE C (views.BaselineTable.BinaryText,
+//     #2083), which outranks this default. The copy's OWN views are immune
+//     on purpose: the delta chain compares "bintrail_pk" as its bytes
 //     (baseline.TableDeltaLatestSQL), or two keys differing only in case
 //     would fold into one row. Locked with the rest so a statement cannot
 //     undo them.
@@ -558,13 +564,13 @@ type spillSpec struct {
 // fixedSettings are the session settings that are the same for every job:
 // they name no directory, no limit and nothing a statement brings. They are
 // the first statements of the lockdown, and openSession also runs them before
-// the job is read (#2236), because the first of each kind is slow: setting
-// the collation loads ICU, about 7 ms of the 12 a short statement spent
-// between its job and its first row.
+// the job is read (#2236), because the first of each kind is slow (setting
+// an ICU collation, when that was the default, took about 7 ms of the 12 a
+// short statement spent between its job and its first row).
 var fixedSettings = []string{
 	"SET autoinstall_known_extensions = false",
 	"SET autoload_known_extensions = false",
-	"SET default_collation = 'nocase.icu_noaccent'",
+	"SET default_collation = 'nocase'",
 	"SET default_null_order = 'nulls_first_on_asc_last_on_desc'",
 	"SET ieee_floating_point_ops = false",
 }
@@ -837,9 +843,8 @@ func floatCell(f float64) any {
 // byte exactly. So "SHOP" finds shop, and "été" does not find Été.
 //
 // The comparison is done here and not in SQL on purpose. In SQL it would run
-// under the session's default collation, which equates far more than that
-// ('ß' with 'ss', accents, full-width forms), and lower() folds all of
-// Unicode: both said a schema existed under a name SET search_path then
+// under the session's default collation, which folds case beyond ASCII
+// ('été' with 'ÉTÉ'), and lower() folds all of Unicode: both said a schema existed under a name SET search_path then
 // refused, which failed every statement on the connection. A lookup failure
 // reads as absent, which is the safe side (the default stays).
 func catalogSchema(ctx context.Context, conn *sql.Conn, schema string) (string, bool) {
