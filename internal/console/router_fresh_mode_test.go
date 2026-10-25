@@ -30,10 +30,19 @@ func TestRouterLines_sayTheMode(t *testing.T) {
 					Pool: &RouterPoolNumbers{Workers: 1, ThreadsEach: 2, MemoryEach: "4096MiB", StatementsPerWorker: 500}}}}
 	}
 	fast, fresh := false, true
+	// #2546: the selected server fresh by its own switch, the router's own
+	// setting off.
+	switched := view(&fast)
+	switched.Status.PerServerMode = true
+	switched.Status.Servers = map[string]RouterServerNumbers{"s1": {SQLMode: "fresh", SQLModeFrom: SQLModeFromSaved}}
+	perServerFast := view(&fast)
+	perServerFast.Status.PerServerMode = true
 	payload, err := json.Marshal(map[string]routerViewDTO{
-		"fast":  view(&fast),
-		"fresh": view(&fresh),
-		"old":   view(nil),
+		"fast":     perServerFast,
+		"older":    view(&fast),
+		"fresh":    view(&fresh),
+		"old":      view(nil),
+		"switched": switched,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -65,11 +74,24 @@ console.log(JSON.stringify(out));
 		}
 		return false
 	}
-	if !has("fast", "Fast mode: answers come from each table's last snapshot") || has("fast", "Fresh mode") {
+	if !has("fast", "Fast mode for shop: answers come from each table's last snapshot") || has("fast", "Fresh mode") {
 		t.Errorf("fast: %q", got["fast"])
 	}
-	if !has("fresh", "Fresh mode: each table's newest captured changes") || has("fresh", "Fast mode") {
+	if !has("fresh", "Fresh mode, for every server: each table's newest captured changes") || has("fresh", "Fast mode") {
 		t.Errorf("fresh: %q", got["fresh"])
+	}
+	if !has("switched", "Fresh mode for shop, chosen on its Snapshots page") || has("switched", "Fast mode") {
+		t.Errorf("a server fresh by its own switch: %q", got["switched"])
+	}
+	// A router older than the per-server switch (v0.116, v0.117): one mode
+	// for all, and never sent to a Snapshots choice it ignores.
+	if !has("older", "Fast mode, for every server") {
+		t.Errorf("a router older than the per-server switch: %q", got["older"])
+	}
+	for _, l := range got["older"] {
+		if strings.Contains(l, "choose Fresh on") {
+			t.Errorf("a router that ignores the switch sends the reader to it: %q", l)
+		}
 	}
 	if has("old", "Fast mode") || has("old", "Fresh mode") || len(got["old"]) == 0 {
 		t.Errorf("a router older than the switch: %q", got["old"])
