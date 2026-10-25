@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.117.1] - 2026-10-25
+### Added
+- **Fast or fresh SQL answers, chosen per server in the web interface (#2546).**
+  - **What it does.** **Snapshots**, **Settings**, **How current SQL answers are** chooses, for each server, whether its statements on the MySQL port answer from each table's last snapshot (Fast, the default) or with the newest captured changes laid over it (Fresh, about as far behind as capture). The router reads the choice within a few seconds, with no restart. `PUT /api/servers/{id}/sql-mode` saves it (servers:write).
+  - **What the card says.** What is saved apart from what the router applies. Right after Fresh applies, it says the server has not answered with the newest changes yet. It is locked while `SQL_FRESH=on` (`BINTRAIL_SQL_TAILS=on`) makes every server fresh, and when the router is older than this release.
+  - **Memory.** While at least one server is fresh, the router sets aside the tails' share of its memory and may run fewer statements at once; it gives them back when the last server turns fast. A server turned fast stops updating its tails.
+  - **Status.** The router's `/status` says `sql_mode`, `sql_mode_from` and `sql_mode_warming` per server, and `per_server_mode: true`. Its startup lines name the servers in fresh mode.
+- **Sizing: 16 GB and 4 physical cores minimum, 32 GB and 8 cores recommended (#2551).** Count cores, not vCPUs: on most Intel and AMD cloud instances 4 vCPUs are 2 cores. 8 GB is for evaluation on a small database. See Capacity Planning.
+
+### Fixed
+- **Iceberg export refuses a URL as the warehouse (#2554).** A warehouse like `s3://bucket/path` was taken as a local directory named `s3:` and the export wrote tables there; it is now refused, like an empty one.
+
 ## [0.117.0] - 2026-10-25
 ### Added
 - **Hide tables and columns from SQL, per server (#2529).**
