@@ -34,10 +34,14 @@ type copyAges struct {
 type serverCopyAges struct {
 	// last is the newest answer; lastThrough its instant, zero when unknown;
 	// lastPending says it waits on resolve (lastKey).
-	last        copyAnswer
-	lastThrough time.Time
-	lastPending bool
-	lastKey     string
+	last copyAnswer
+	// lastTailedRan is when the newest answer that read every table it
+	// asked for with its tail ran: the end of fresh mode's warm-up
+	// (Server.SQLModeWarming).
+	lastTailedRan time.Time
+	lastThrough   time.Time
+	lastPending   bool
+	lastKey       string
 	// worst is the largest age of an answer whose instant is known;
 	// unknown counts the answers whose instant is not, which the worst
 	// cannot account for (it is then "at least"), and why the last of them.
@@ -187,6 +191,31 @@ func (c *copyAges) forget(id string) {
 	delete(c.by, id)
 }
 
+// lastTailedRan is when the copy's newest answer for server id that read
+// every table it asked for with its tail ran; zero when none did.
+func (c *copyAges) lastTailedRan(id string) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if s := c.by[id]; s != nil {
+		return s.lastTailedRan
+	}
+	return time.Time{}
+}
+
+// answered are the servers the copy answered for, sorted.
+func (c *copyAges) answered() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0, len(c.by))
+	for id, s := range c.by {
+		if s.last.side == "copy" {
+			out = append(out, id)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 // note records a, an answer the copy gave for server id, for the server and
 // for its statement (a.shape) on one path, so the panel's lag and the
 // detail's never disagree.
@@ -221,6 +250,7 @@ func (c *copyAges) note(id string, a copyAnswer) {
 	}
 	switch {
 	case a.allTailed:
+		s.lastTailedRan = a.ranAt
 		if sh != nil {
 			sh.tailed++
 		}

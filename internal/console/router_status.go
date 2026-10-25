@@ -188,6 +188,10 @@ type RouterServerNumbers struct {
 	// "default". Absent from a router older than the switch.
 	SQLMode     string `json:"sql_mode,omitempty"`
 	SQLModeFrom string `json:"sql_mode_from,omitempty"`
+	// SQLModeWarming: fresh mode applies and is still catching up with
+	// capture (Server.SQLModeWarming): no answer since it applied read every
+	// table it asked for with the newest captured changes.
+	SQLModeWarming bool `json:"sql_mode_warming,omitempty"`
 	// DataAgeUnknown counts the copy's answers whose lag could not be told,
 	// which DataAgeMaxSeconds cannot include: with any, the max is a floor.
 	// DataAgeUnknownReason is the last one's reason.
@@ -223,6 +227,7 @@ func (s *Server) RouterNumbers() RouterNumbers {
 		n := RouterServerNumbers{Copy: t.Copy, MySQL: t.MySQL, Refused: t.Refused, Reasons: reasons,
 			CannotRoute: t.Unavailable != "", AccountRefused: t.AccountRefused != "", SessionUntracked: t.SessionUntracked != ""}
 		n.SQLMode, n.SQLModeFrom = s.SQLModeOf(id)
+		n.SQLModeWarming = n.SQLMode == "fresh" && s.SQLModeWarming(id)
 		if ages := s.copyAges.now(id); ages.known || ages.anyMax || ages.unknown > 0 || ages.pending {
 			// Rounded up: a lag is never said smaller than it was.
 			secs := func(d time.Duration) *int64 { v := int64(math.Ceil(d.Seconds())); return &v }
@@ -249,11 +254,19 @@ func (s *Server) RouterNumbers() RouterNumbers {
 		out.Servers[id] = n
 	}
 	// A server in fresh mode is listed before its first statement: that it
-	// is fresh is what the operator who switched it looks for.
-	for _, id := range s.fresh.ids() {
+	// is fresh is what the operator who switched it looks for. With every
+	// server fresh (BINTRAIL_SQL_TAILS=on), one the copy answered without a
+	// routing decision (routing off, a <server>@copy connection) is listed
+	// too, so its warm-up is read, not assumed.
+	listed := s.fresh.ids()
+	if !tailsOff() {
+		listed = s.copyAges.answered()
+	}
+	for _, id := range listed {
 		if _, ok := out.Servers[id]; !ok {
 			n := RouterServerNumbers{Reasons: map[string]uint64{}}
 			n.SQLMode, n.SQLModeFrom = s.SQLModeOf(id)
+			n.SQLModeWarming = n.SQLMode == "fresh" && s.SQLModeWarming(id)
 			out.Servers[id] = n
 		}
 	}
