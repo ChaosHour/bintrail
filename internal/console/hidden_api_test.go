@@ -2,11 +2,14 @@ package console
 
 import (
 	"encoding/json"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/hiderules"
 )
 
@@ -328,5 +331,216 @@ func TestHiddenGetReadOnlyRegistryIsNotEditable(t *testing.T) {
 	rec, body := doServersReq(t, srv, "GET", "/api/servers/s1/hidden", "")
 	if d := decodeHidden(t, body); rec.Code != 200 || d.Editable || d.Refusal == "" {
 		t.Fatalf("read-only GET = %d %s, want not editable with a reason", rec.Code, body)
+	}
+}
+
+// Rules this build cannot enforce are said on every surface that reports
+// them (#2529): GET and PUT carry the refusal the analytical surfaces give,
+// and the server list keeps the server marked as hiding something even when
+// its rules are ONLY a key a newer build wrote, or a hand edit that does not
+// parse. Without that, the console would say "nothing is hidden" about a
+// server whose SQL is refused.
+func TestHiddenUnenforceableRulesAreSaid(t *testing.T) {
+	cases := []struct {
+		name, hidden, wantRefused string
+		wantKeys                  []string
+		wantTables                []string
+	}{
+		{name: "only an unknown key", hidden: "  hidden:\n    future_rule: keep-me\n",
+			wantRefused: "future_rule, which this build cannot read", wantKeys: []string{"future_rule"}, wantTables: []string{}},
+		{name: "a hand edit that does not parse", hidden: "  hidden:\n    tables:\n    - audit_log\n",
+			wantRefused: "do not parse", wantTables: []string{"audit_log"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := t.TempDir() + "/console-servers.yaml"
+			if err := os.WriteFile(path, []byte("version: 1\nservers:\n- id: s1\n  name: prod\n  dsn: u:p@tcp(h:3306)/db\n"+c.hidden), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			clearStores(t)
+			reg, err := LoadRegistry(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv, err := New(Config{Listen: "127.0.0.1:8090", Token: "t", Registry: reg})
+			if err != nil {
+				t.Fatal(err)
+			}
+			e, _ := reg.Get("s1")
+			_, lerr := hiderules.Load(e.Hidden)
+			if lerr == nil {
+				t.Fatal("the fixture loads; it must not")
+			}
+			_, body := doServersReq(t, srv, "GET", "/api/servers/s1/hidden", "")
+			d := decodeHidden(t, body)
+			if d.Refused != lerr.Error() || !strings.Contains(d.Refused, c.wantRefused) || !slices.Equal(d.UnreadableKeys, c.wantKeys) ||
+				!slices.Equal(d.Tables, c.wantTables) {
+				t.Fatalf("GET = %s, want refused %q", body, lerr.Error())
+			}
+			_, body = doServersReq(t, srv, "GET", "/api/servers/s1", "")
+			var dto serverDTO
+			if err := json.Unmarshal(body, &dto); err != nil {
+				t.Fatal(err)
+			}
+			if dto.Hidden == nil || !dto.Hidden.Unreadable || !slices.Equal(dto.Hidden.Tables, c.wantTables) || dto.Hidden.Columns == nil {
+				t.Fatalf("server DTO hidden = %s, want it present and marked unreadable", body)
+			}
+			// A save that leaves an unknown key in place still answers refused.
+			rec, body := doServersReq(t, srv, "PUT", "/api/servers/s1/hidden", `{"tables":[],"columns":[]}`)
+			if rec.Code != 200 {
+				t.Fatalf("PUT = %d %s", rec.Code, body)
+			}
+			d = decodeHidden(t, body)
+			if (len(c.wantKeys) > 0) != (d.Refused != "") {
+				t.Fatalf("PUT = %s: refused must follow what is still stored", body)
+			}
+		})
+	}
+	// A server whose rules all load carries no refusal and no mark.
+	srv := newRegistryServer(t)
+	id := createHiddenTestServer(t, srv)
+	_, body := doServersReq(t, srv, "PUT", "/api/servers/"+id+"/hidden", `{"tables":["shop.a"],"columns":[]}`)
+	if d := decodeHidden(t, body); d.Refused != "" {
+		t.Fatalf("PUT = %s", body)
+	}
+	_, body = doServersReq(t, srv, "GET", "/api/servers/"+id, "")
+	var dto serverDTO
+	if err := json.Unmarshal(body, &dto); err != nil {
+		t.Fatal(err)
+	}
+	if dto.Hidden == nil || dto.Hidden.Unreadable || !slices.Equal(dto.Hidden.Tables, []string{"shop.a"}) {
+		t.Fatalf("server DTO hidden = %+v, want the rule and not unreadable", dto.Hidden)
+	}
+}
+
+// Rules are reported the way they are enforced: through hiderules.Load. A
+// stored list of blank entries hides nothing, so it is no rule at all on the
+// server list, and GET answers empty lists with no refusal.
+func TestHiddenBlankEntriesHideNothing(t *testing.T) {
+	path := t.TempDir() + "/console-servers.yaml"
+	if err := os.WriteFile(path, []byte("version: 1\nservers:\n- id: s1\n  name: prod\n  dsn: u:p@tcp(h:3306)/db\n"+
+		"  hidden:\n    tables:\n    - \"  \"\n    columns:\n    - \"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clearStores(t)
+	reg, err := LoadRegistry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{Listen: "127.0.0.1:8090", Token: "t", Registry: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, body := doServersReq(t, srv, "GET", "/api/servers/s1", "")
+	var dto serverDTO
+	if err := json.Unmarshal(body, &dto); err != nil {
+		t.Fatal(err)
+	}
+	if dto.Hidden != nil {
+		t.Fatalf("server DTO hidden = %+v, want none", dto.Hidden)
+	}
+	_, body = doServersReq(t, srv, "GET", "/api/servers/s1/hidden", "")
+	if d := decodeHidden(t, body); len(d.Tables)+len(d.Columns) != 0 || d.Refused != "" {
+		t.Fatalf("GET = %s", body)
+	}
+}
+
+// hiddenGet calls the GET handler straight, for a fixture server built
+// without the HTTP routes.
+func hiddenGet(t *testing.T, s *Server, id string) (int, []byte) {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/api/servers/"+id+"/hidden", nil)
+	req.SetPathValue("id", id)
+	rec := httptest.NewRecorder()
+	s.handleHiddenGet(rec, req)
+	return rec.Code, rec.Body.Bytes()
+}
+
+// A rule that matches nothing in the copy is reported (#2529: "a rule that
+// matches no column is reported in the settings"), against the newest
+// snapshot the SQL surfaces read: shop.orders(id, status).
+func TestHiddenUnmatchedAgainstTheCopy(t *testing.T) {
+	f, _ := hiddenSQLFixture(t, &hiderules.Rules{
+		Tables:  []string{"shop.orders", "shop.nothere", "nope.*", "SHOP.*"},
+		Columns: []string{"shop.orders.STATUS", "shop.orders.stauts", "shop.*.status", "shop.missing.status", "other.*.id"},
+	})
+	// shop.customers(id, email) carries its CREATE TABLE, so its columns are
+	// known; shop.orders does not, so a column rule on it is never called
+	// unmatched (shop.orders.stauts counts as a possible match).
+	createSQL := "CREATE TABLE `customers` (\n  `id` int NOT NULL,\n  `email` varchar(64) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n);\n"
+	cols, err := baseline.ParseSchemaText(createSQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := baseline.NewWriter(filepath.Join(f.schemaDir, "customers.parquet"), cols, baseline.WriterConfig{Compression: "none", RowGroupSize: 100,
+		Metadata: map[string]string{baseline.MetaKeyCreateTableSQL: createSQL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.WriteRow([]string{"1", "a@x"}, make([]bool, 2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reg := f.s.cm.reg
+	id := f.s.cm.boot.serverID
+	set, err := hiderules.Parse(hiderules.Rules{
+		Tables:  []string{"shop.orders", "shop.nothere", "nope.*", "SHOP.*"},
+		Columns: []string{"shop.orders.STATUS", "shop.orders.stauts", "shop.*.status", "shop.missing.status", "other.*.id", "shop.customers.EMAIL", "shop.customers.emial"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.SetHidden(id, set); err != nil {
+		t.Fatal(err)
+	}
+	code, body := hiddenGet(t, f.s, id)
+	if code != 200 {
+		t.Fatalf("GET = %d %s", code, body)
+	}
+	d := decodeHidden(t, body)
+	want := []string{"shop.nothere", "nope.*", "shop.missing.status", "other.*.id", "shop.customers.emial"}
+	if d.Unmatched == nil || !slices.Equal(*d.Unmatched, want) || d.Unchecked != "" {
+		t.Fatalf("GET = %s, want unmatched %q", body, want)
+	}
+}
+
+// A copy that cannot be read is never reported as "every rule matches" nor
+// as "no rule matches": the field is left out and the reason given.
+func TestHiddenUnmatchedNotCheckedWithoutACopy(t *testing.T) {
+	f, _ := hiddenSQLFixture(t, &hiderules.Rules{Tables: []string{"shop.nothere"}})
+	id := f.s.cm.boot.serverID
+	f.s.cm.boot.baselineSrc = t.TempDir() // no snapshot in it
+	code, body := hiddenGet(t, f.s, id)
+	d := decodeHidden(t, body)
+	if code != 200 || d.Unmatched != nil || d.Unchecked == "" || strings.Contains(string(body), `"unmatched"`) {
+		t.Fatalf("GET = %d %s, want no unmatched field and a reason", code, body)
+	}
+	if !strings.Contains(d.Unchecked, "no snapshot of this server on this host yet") {
+		t.Fatalf("empty folder reason = %q", d.Unchecked)
+	}
+	// A snapshot folder that will not open is not "no snapshot yet": the
+	// operator would wait for a snapshot that already exists.
+	locked := t.TempDir()
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	f.s.cm.boot.baselineSrc = locked
+	_, body = hiddenGet(t, f.s, id)
+	if d := decodeHidden(t, body); d.Unmatched != nil || !strings.Contains(d.Unchecked, "could not be read") || strings.Contains(d.Unchecked, "yet") {
+		t.Fatalf("unreadable folder GET = %s, want the read error as the reason", body)
+	}
+	f.s.cm.boot.baselineSrc = "s3://bucket/snaps"
+	_, body = hiddenGet(t, f.s, id)
+	if d := decodeHidden(t, body); d.Unmatched != nil || d.Unchecked == "" {
+		t.Fatalf("S3-only GET = %s, want no unmatched field and a reason", body)
+	}
+	// No rules: nothing to check and nothing said.
+	f2, _ := hiddenSQLFixture(t, nil)
+	_, body = hiddenGet(t, f2.s, f2.s.cm.boot.serverID)
+	if d := decodeHidden(t, body); d.Unmatched != nil || d.Unchecked != "" {
+		t.Fatalf("no rules GET = %s", body)
 	}
 }

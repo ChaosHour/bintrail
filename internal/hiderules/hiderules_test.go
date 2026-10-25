@@ -47,6 +47,26 @@ func TestParseEdgeCases(t *testing.T) {
 		{name: "star inside a name is not a prefix wildcard", tables: []string{"shop.user_*"}, wantErr: "stands alone"},
 		{name: "quoted star inside a name is a literal", tables: []string{"shop.`user_*`"}, wantTables: []string{"shop.`user_*`"}},
 		{name: "non-breaking space inside unquoted name", tables: []string{"shop.a\u00a0b"}, wantErr: "backticks"},
+		{name: "zero-width space in an unquoted name", tables: []string{"shop.audit\u200b_log"}, wantErr: "an invisible character was pasted into"},
+		{name: "zero-width space inside backticks", tables: []string{"shop.`audit\u200blog`"}, wantErr: "an invisible character was pasted into"},
+		{name: "byte order mark at the start", tables: []string{"\ufeffshop.audit_log"}, wantErr: "an invisible character was pasted into"},
+		{name: "invisible character in a column", columns: []string{"shop.customers.e\u2060mail"}, wantErr: "an invisible character was pasted into"},
+		{name: "soft hyphen in a quoted column", columns: []string{"shop.customers.`e\u00admail`"}, wantErr: "an invisible character was pasted into"},
+		{name: "ZWNJ between Persian letters is part of a real name", tables: []string{"shop.می\u200cخواهم"}, wantTables: []string{"shop.می\u200cخواهم"}},
+		{name: "ZWJ after a virama in a Devanagari name", columns: []string{"shop.t.क्\u200dष"}, wantColumns: []string{"shop.t.क्\u200dष"}},
+		{name: "Mongolian vowel separator between Mongolian letters", tables: []string{"shop.ᠪᠠ\u180eᠠ"}, wantTables: []string{"shop.ᠪᠠ\u180eᠠ"}},
+		{name: "ZWJ at the start of a name", tables: []string{"shop.\u200dorders"}, wantErr: "an invisible character was pasted into"},
+		{name: "ZWJ at the end of a name", tables: []string{"shop.orders\u200d"}, wantErr: "an invisible character was pasted into"},
+		{name: "ZWNJ between ASCII and a dot", tables: []string{"shop\u200c.orders"}, wantErr: "an invisible character was pasted into"},
+		{name: "ZWNJ beside a digit", tables: []string{"shop.a\u200c1"}, wantErr: "an invisible character was pasted into"},
+		{name: "ZWNJ between Latin letters looks like the real table and hides nothing", tables: []string{"shop.cust\u200comers"}, wantErr: "an invisible character was pasted into"},
+		{name: "ZWJ between Latin letters in a column", columns: []string{"shop.customers.e\u200dmail"}, wantErr: "an invisible character was pasted into"},
+		{name: "ZWNJ between CJK letters", tables: []string{"shop.中\u200c文"}, wantErr: "an invisible character was pasted into"},
+		{name: "ZWNJ between an Arabic and a Latin letter", tables: []string{"shop.م\u200ca"}, wantErr: "an invisible character was pasted into"},
+		{name: "ZWNJ between Devanagari and Bengali letters", tables: []string{"shop.क\u200cক"}, wantErr: "an invisible character was pasted into"},
+		{name: "ZWNJ after an Arabic letter carrying a vowel mark", tables: []string{"shop.مَ\u200cخ"}, wantTables: []string{"shop.مَ\u200cخ"}},
+		{name: "ZWNJ after a virama in a Malayalam name", tables: []string{"shop.ന്\u200cമ"}, wantTables: []string{"shop.ന്\u200cമ"}},
+		{name: "Mongolian separator between Latin letters", tables: []string{"shop.a\u180eb"}, wantErr: "an invisible character was pasted into"},
 		{name: "every bad entry is named", tables: []string{"a", "b"}, wantErr: `"b"`},
 	}
 	for _, c := range cases {
@@ -141,8 +161,8 @@ func TestEmptyAndNil(t *testing.T) {
 // meaning on the next load.
 func TestCanonicalRoundTrips(t *testing.T) {
 	in := Rules{
-		Tables:  []string{"`my.db`.t", "shop.`we``ird`", "shop.`*`", "hr.*", "`shop`.plain", "s.`\u00a0users`", "s.`users\v`", "s.` users`", "s.`user_*`"},
-		Columns: []string{"`a b`.t.c", "shop.*.ssn"},
+		Tables:  []string{"`my.db`.t", "shop.`we``ird`", "shop.`*`", "hr.*", "`shop`.plain", "s.`\u00a0users`", "s.`users\v`", "s.` users`", "s.`user_*`", "shop.می\u200cخواهم", "`a b`.می\u200cخواهم"},
+		Columns: []string{"`a b`.t.c", "shop.*.ssn", "shop.t.क्\u200dष"},
 	}
 	s1, err := Parse(in)
 	if err != nil {

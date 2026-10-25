@@ -2969,6 +2969,9 @@ function renderSQLPanel(box) {
   const right = el("div", { class: "sqlp-q" },
     el("label", { class: "sqlp-sr", for: "sqlp-sql", text: "SQL statement" }), ta,
     el("div", { class: "sqlp-bar" }, run, cancel, count, csv), msg, results);
+  // What this server hides (#2529), said above the list, so an empty result
+  // is not read as no data.
+  box.append(liveHiddenNote("sqlp-hidden", hiddenSQLNoteText));
   box.append(el("div", { class: "sqlp" }, tables, right), el("p", { class: "sqlp-foot" }, meta));
 
   const insert = (name) => {
@@ -3160,6 +3163,10 @@ const USE_PANELS = {
       row.append(vb);
     }
     body.append(row, msg);
+    // Both buttons hand over what SQL hides: the data, and a file that reads it.
+    // With row data, the download note; with only views.sql, the file's.
+    const dataDrawn = sessionMay("query:execute");
+    if (row.children.length) body.append(liveHiddenNote("use-note hidden-dl-note", (h) => !h ? "" : dataDrawn ? HIDDEN_DOWNLOAD_NOTE : HIDDEN_FILE_NOTE));
   },
   dash(body) {
     // The always-current path (#2014): see dashPanelBody. The local folder's
@@ -3278,6 +3285,7 @@ function dashPanelBody(doc) {
   const dl = el("button", { class: "btn btn-primary", type: "button", text: "Download " + DUCKDB_VIEWS_FILE,
     onclick: () => downloadBlob(DUCKDB_VIEWS_FILE, doc.views_sql || "", "text/plain") });
   box.append(el("div", { class: "use-acts" }, dl));
+  box.append(liveHiddenNote("form-hint hidden-dl-note", (h) => h ? HIDDEN_FILE_NOTE : ""));
   box.append(hint("Then open it in DuckDB:"), duckdbCommandLine(DUCKDB_VIEWS_FILE, DASH_DB));
   box.append(hint("In a DuckDB session already open: ", el("code", { text: ".read " + DUCKDB_VIEWS_FILE }), "."));
   // Every session, not once: the S3 secret and the snapshot the views read
@@ -7935,6 +7943,7 @@ async function renderSnapshots() {
   snapStorage = storage;
   snapSharedWith = (baselines && baselines.shared_with) || [];
   snapRegistry = (serversRes && serversRes.servers) || [];
+  if (serversRes && !serversRes.error && serversRes.servers) rememberHiddenRules(serversRes.servers);
   // Run states for the selected server: only the endpoints this daemon
   // actually serves (each 403s when its feature is off).
   const selId = currentServer || defaultServerId;
@@ -11224,7 +11233,10 @@ async function loadBackupDetail(at, box) {
   if (d.incomplete) dl.disabled = true;
   dl.onclick = (ev) => { ev.stopPropagation(); downloadBackup(at, dl, d.total_bytes || 0); };
   // The download hands over every row, unredacted: query:execute.
-  if (sessionMay("query:execute")) top.append(dl);
+  if (sessionMay("query:execute")) {
+    top.append(dl);
+    if (hiddenRulesOf()) lines.push(el("span", { class: "bk-fact hidden-dl-note", text: HIDDEN_DOWNLOAD_NOTE }));
+  }
   facts.append(top);
   // One fact per line, wrapped, never cut (#2002): the why, read and
   // point-in-time lines are whole sentences.
@@ -12168,7 +12180,7 @@ const SQL_EXPORT_QUIET = new Set(["idle", "downloaded", "expired"]);
 const SQL_EXPORT_KNOWN = new Set(["idle", "running", "succeeded", "failed", "downloaded", "expired"]);
 
 function backupTakeAway(cur, b, sqlSt) {
-  const duck = backupDuckLane(b);
+  const duck = backupDuckLane(b, cur);
   const sql = backupSQLLane(cur, b, sqlSt);
   if (!duck && !sql) return null;
   // FOLDED (#1573). Measured on this page with a real snapshot, these two
@@ -12323,7 +12335,7 @@ function backupLane(title, files, tail, ico, downloads) {
 // card below the lanes, for a DuckDB that reads the copy where it lives.
 // Downloading what is already stored asks for no capability, so the lane is
 // gated on there being a backup and on query:execute (it is row data).
-function backupDuckLane(b) {
+function backupDuckLane(b, cur) {
   if (!b || b.error || !b.configured) return null;
   if (!sessionMay("query:execute")) return null;
   const snaps = (b.snapshots || []);
@@ -12344,6 +12356,8 @@ function backupDuckLane(b) {
     msg.hidden = !err;
   };
   lane.append(el("div", { class: "bk-lane-go" }, dl), msg);
+  const hn = hiddenDownloadNote(hiddenRulesOf(cur));
+  if (hn) lane.append(hn);
   lane.append(el("p", { class: "form-hint", text: "Unpack it, go into its folder, and run:" }));
   lane.append(duckdbCommandLine(DUCKDB_VIEWS_FILE));
   // snapshotViewsRelative leaves the file out when a table's changes are
@@ -12389,6 +12403,8 @@ function snapshotInPlace(cur, b) {
   fold.append(el("summary", { class: "ov-panel-head bk-take-sum" },
     el("h2", { class: "ov-panel-title", text: "Use it where it lives" }),
     el("span", { class: "bk-take-note", text: "Your own DuckDB on this server or in S3, or an Iceberg table, without downloading." })));
+  const hn = hiddenDownloadNote(hiddenRulesOf(cur), "form-hint", HIDDEN_INPLACE_NOTE);
+  if (hn) fold.append(hn);
   for (const p of parts) fold.append(p);
   return fold;
 }
@@ -12580,6 +12596,12 @@ function backupSQLLane(cur, b, sqlSt) {
   // them, only when this lane exists. A first version of this guard counted
   // only the lines drawn here, and a view-only reader whose status read
   // failed saw a page identical to "no build has ever run".
+  // What this server hides from SQL is in the .sql files all the same (#2529).
+  const dlDrawn = !!(st && st.state === "succeeded" && mayDownload && !st.removal_owed);
+  if (mayCreate || dlDrawn) {
+    const hn = hiddenDownloadNote(hiddenRulesOf(cur));
+    if (hn) body.append(hn);
+  }
   const unknownState = !!(st && st.state && !SQL_EXPORT_KNOWN.has(st.state));
   if (!mayCreate && !body.childNodes.length && !(sqlSt && sqlSt.error) && !unknownState) return null;
   const staged = stagedDownloadsNote(snapStorage, cur, snapRegistry);
@@ -14067,6 +14089,7 @@ async function renderMySQLClients() {
   try {
     const r = await api("/api/servers");
     servers = r.servers || [];
+    rememberHiddenRules(servers);
   } catch (err) { serversFailed = err.status !== 403 && err.status !== 404; }
   // Time-travel port status (#1446): on/off plus its address, never the token.
   // null on failure — the SQL client panel says it could not check.
@@ -14170,9 +14193,289 @@ function buildMySQLClients(servers, fbStatus, sqlMem, rtView, serversFailed) {
     mem.className += " sqlc";
     v.append(mem);
   }
+  // Hidden from SQL (#2529): per server, so for the one picked in the sidebar.
+  const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
+  if (cur && sessionMay("servers:read")) {
+    v.append(cnSection("This server", "", "Tables and columns that SQL on the copy, the MySQL port and the AI connector's SQL tool do not show.", "violet"));
+    v.append(hiddenRulesPanel(cur));
+  }
   // The Iceberg export is on Snapshots -> Download (snapshotInPlace): it is
   // what this server's snapshots can become, not a use of the MySQL port.
   viewEnter();
+}
+
+// ── Hidden from SQL (#2529) ─────────────────────────────────────────────────
+//
+// Per server, the tables and columns SQL on the copy, the MySQL port and the
+// AI connector leave out. Edited here (GET and PUT /api/servers/{id}/hidden);
+// the server list carries them (hidden: {tables, columns, unreadable}) so the
+// pages that offer SQL or a download can say what is hidden and that a
+// download still holds it.
+
+// serverHiddenRules: id to {tables, columns, unreadable}, from the last server
+// list read, refreshed per server when SQL or a download is offered, and on
+// every save.
+let serverHiddenRules = new Map();
+
+function rememberHiddenRules(servers) {
+  serverHiddenRules = new Map((servers || []).filter((s) => s && s.id && s.hidden).map((s) => [s.id, s.hidden]));
+}
+
+// rememberHiddenAnswer keeps what GET or PUT .../hidden answered for id.
+// unreadable: the stored rules cannot be enforced (refused), which counts as
+// hiding something even with both lists empty.
+function rememberHiddenAnswer(id, d) {
+  if (!id || !d) return;
+  const h = { tables: Array.isArray(d.tables) ? d.tables : [], columns: Array.isArray(d.columns) ? d.columns : [],
+    unreadable: !!(d.refused || (Array.isArray(d.unreadable_keys) && d.unreadable_keys.length)) };
+  if (h.tables.length || h.columns.length || h.unreadable) serverHiddenRules.set(id, h);
+  else serverHiddenRules.delete(id);
+}
+
+// refreshHiddenRules reads the rules of the server picked in the sidebar
+// again, so a note drawn now does not lean on a list read before someone
+// changed them. Never rejects; resolves when the map is up to date (or the
+// read could not be made).
+function refreshHiddenRules() {
+  const id = currentServer || defaultServerId;
+  if (!id || !sessionMay("servers:read")) return Promise.resolve();
+  return api("/api/servers/" + encodeURIComponent(id) + "/hidden").then((d) => rememberHiddenAnswer(id, d), () => {});
+}
+
+// hiddenRulesOf returns the rules of a server entry, or of the server picked
+// in the sidebar when entry is not given; null when it hides nothing.
+function hiddenRulesOf(entry) {
+  const h = entry !== undefined && entry !== null ? entry.hidden : serverHiddenRules.get(currentServer || defaultServerId);
+  if (!h) return null;
+  const tables = Array.isArray(h.tables) ? h.tables.map(String) : [];
+  const columns = Array.isArray(h.columns) ? h.columns.map(String) : [];
+  const unreadable = !!h.unreadable;
+  return tables.length || columns.length || unreadable ? { tables, columns, unreadable } : null;
+}
+
+const HIDDEN_DOWNLOAD_NOTE = "This server hides some tables and columns from SQL; this download includes them.";
+const HIDDEN_FILE_NOTE = "This server hides some tables and columns from SQL; this file reads them too.";
+const HIDDEN_INPLACE_NOTE = "This server hides some tables and columns from SQL; the files and the export below include them.";
+
+function hiddenDownloadNote(h, cls, text) {
+  return h ? el("p", { class: (cls || "form-hint") + " hidden-dl-note", text: text || HIDDEN_DOWNLOAD_NOTE }) : null;
+}
+
+// hiddenSQLNoteText names what is hidden, so an empty result is not read as
+// no data. At most six names; the rest are counted.
+function hiddenSQLNoteText(h) {
+  if (!h) return "";
+  const all = h.tables.concat(h.columns);
+  const where = sessionMay("servers:write") ? " Change it in Settings, MySQL clients." : "";
+  if (!all.length) return "This server holds hidden rules this DBTrail cannot read, so its SQL is refused." + where;
+  const shown = all.slice(0, 6).join(", ") + (all.length > 6 ? " and " + (all.length - 6) + " more" : "");
+  return "This server hides some tables and columns from SQL: " + shown + "." +
+    (h.unreadable ? " Some of its rules cannot be read by this DBTrail, so its SQL is refused." : "") + where;
+}
+
+// liveHiddenNote is a note drawn from the rules as last read, redrawn once
+// they are read again. text(h) gives its words ("" hides it).
+function liveHiddenNote(cls, text) {
+  const p = el("p", { class: cls });
+  const paint = () => { const t = text(hiddenRulesOf()); p.textContent = t; p.hidden = !t; };
+  paint();
+  refreshHiddenRules().then(paint);
+  return p;
+}
+
+// hiddenRulesLines splits a textarea into entries: one per line, trimmed,
+// blank lines dropped. Pure, for the tests.
+function hiddenRulesLines(text) {
+  return String(text || "").split(/\r?\n/).map((s) => s.trim()).filter((s) => s !== "");
+}
+
+function hiddenCap(s, keepEnd) {
+  s = String(s || "").trim();
+  if (!s) return "";
+  s = s.charAt(0).toUpperCase() + s.slice(1);
+  return keepEnd || /[.!?]$/.test(s) ? s : s + ".";
+}
+
+// The route-grants error for a forwarding account that is the capture
+// account (route_grants.go, routeIsCapture): the port does not forward for
+// this server, which is not a failure to read.
+const ROUTE_IS_CAPTURE_PREFIX = "the forwarding account is the account DBTrail captures with";
+
+// hiddenGrantsBlock says what the forwarding account's MySQL grants let it
+// read of what the rules hide (GET /api/servers/{id}/route-grants, field
+// hidden). g: the route's answer; undefined when this session may not read
+// it; null when the read failed. Nothing when the server hides nothing or has
+// no forwarding account. blocked: the server holds rules this build cannot
+// enforce, so no line may sound like an all-clear. Pure, for the tests.
+function hiddenGrantsBlock(g, hasRules, blocked) {
+  if (!hasRules) return [];
+  if (g && g.none) return [];
+  if (g && g.error && String(g.error).startsWith(ROUTE_IS_CAPTURE_PREFIX)) {
+    return [el("p", { class: "form-hint", text: "No forwarding account: the port does not forward for this server." })];
+  }
+  if (g === undefined) return [el("p", { class: "form-hint", text: "Your session may not check what the forwarding account can read." })];
+  if (g === "gone") return [el("p", { class: "form-msg err", text: "This server is no longer in the list." })];
+  const head = el("p", { class: "cn-grants-head" }, "Forwarding account ", g && g.user ? el("code", { text: String(g.user) }) : "");
+  if (g === null) return [head, el("p", { class: "form-msg err", text: "Could not check what the forwarding account can read. Reload the page to try again." })];
+  if (g.skipped) return [head, el("p", { class: "form-msg err", text: "Could not check what it can read: " + g.skipped + "." })];
+  if (g.error) return [head, el("p", { class: "form-msg err", text: "Could not check what it can read: " + g.error + "." })];
+  const h = g.hidden;
+  if (!h) return [head, el("p", { class: "form-msg err", text: "This DBTrail did not check its grants against these rules." })];
+  const out = [head];
+  const exposed = Array.isArray(h.exposed) ? h.exposed.map(String) : [];
+  const unsure = Array.isArray(h.unsure) ? h.unsure.map(String) : [];
+  const unloadable = unsure.some((x) => /do not parse|cannot read/.test(x));
+  if (exposed.length) {
+    out.push(el("p", { class: "cn-grants-verdict is-bad", text: "The forwarding account can read these through MySQL:" }));
+    out.push(el("ul", { class: "hidden-exposed" }, ...exposed.map((x) => el("li", {}, el("code", { text: x })))));
+    out.push(el("p", { class: "form-hint", text: "With Engine Routing on, a statement the port sends to your MySQL runs as this account, and MySQL's grants decide what it reads, not these rules. Change the grant on your MySQL to hide it there too." }));
+  } else if (!blocked && !unloadable) {
+    // A fact, not an all-clear: what grants cannot settle follows.
+    out.push(el("p", { class: "cn-sql-row", text: "No grant line names a hidden table or column." }));
+  }
+  if (unsure.length) {
+    out.push(el("p", { class: "form-hint", text: "What its grants cannot settle:" }));
+    // Kept as written: a line may end in a GRANT statement.
+    out.push(el("ul", { class: "hidden-unsure form-hint" }, ...unsure.map((x) => el("li", { text: hiddenCap(x, true) }))));
+  }
+  return out;
+}
+
+const HIDDEN_DOES = "Hidden tables and columns disappear from SQL on the copy, the MySQL port and the AI connector's SQL tool, and the port's time travel (_flashback, _snapshot, _diff) is off for this server.";
+const HIDDEN_DOES_NOT = "The data stays in the copy's files and in the index, so time travel in this console and the AI connector's history tools (both follow access profiles) still see full rows, and so do downloads and anyone with the files.";
+
+// hiddenRulesBody draws the section from GET .../hidden (h) and the grants
+// check (g, as hiddenGrantsBlock takes it) into box, with the form when the
+// server and this session may change the rules. said: a line to show under
+// Save (after a save). Saving repaints from the server's answer, never from
+// what was typed.
+function hiddenRulesBody(box, cur, h, g, said) {
+  clear(box);
+  const id = cur && cur.id;
+  if (!h) {
+    box.append(el("p", { class: "form-msg err", text: "Could not read this server's hidden tables and columns. Reload the page to try again." }));
+    return;
+  }
+  const tables = Array.isArray(h.tables) ? h.tables.map(String) : [];
+  const columns = Array.isArray(h.columns) ? h.columns.map(String) : [];
+  const unreadable = Array.isArray(h.unreadable_keys) ? h.unreadable_keys.map(String) : [];
+  const refused = String(h.refused || "");
+  // blocked: rules are stored that this build cannot enforce, so the
+  // analytical surfaces refuse this server. Never "nothing is hidden" then.
+  const blocked = unreadable.length > 0 || refused !== "";
+  const has = tables.length + columns.length > 0 || blocked;
+  if (unreadable.length) {
+    box.append(el("p", { class: "form-msg err hidden-unreadable", text:
+      "A newer DBTrail saved rules this version cannot read (" + unreadable.join(", ") + "); this server's SQL is refused until you upgrade." }));
+  } else if (refused) {
+    box.append(el("p", { class: "form-msg err hidden-unreadable", text: "This server's SQL is refused: " + hiddenCap(refused) }));
+  }
+  // Rules that match nothing in the newest snapshot. Not proof of a typo: a
+  // table or column added after that snapshot exists only in the change
+  // history, where the rule still hides it, so the line never tells the
+  // operator to delete the rule. Not checked (no snapshot here, or only in
+  // S3) is said as such, never as an empty list.
+  const unmatched = Array.isArray(h.unmatched) ? h.unmatched.map(String) : null;
+  if (unmatched && unmatched.length) {
+    box.append(el("p", { class: "form-msg hidden-unmatched" }, "Not in this server's newest snapshot: ",
+      ...unmatched.flatMap((x, i) => [i ? ", " : "", el("code", { text: x })]),
+      ". A table or column added after that snapshot still has its changes hidden; anything else, check the spelling."));
+  } else if (!unmatched && h.unmatched_unchecked && tables.length + columns.length > 0) {
+    box.append(el("p", { class: "form-hint hidden-unchecked", text: hiddenCap(h.unmatched_unchecked) }));
+  }
+  const names = (label, xs) => el("p", { class: "cn-sql-row" }, label, ...xs.flatMap((x, i) => [i ? ", " : "", el("code", { text: x })]));
+  const listed = () => tables.length + columns.length
+    ? el("div", { class: "hidden-list" }, tables.length ? names("Tables: ", tables) : null, columns.length ? names("Columns: ", columns) : null)
+    : el("p", { class: "cn-sql-row", text: blocked ? "No table or column is listed, and the rules above still apply." : "Nothing is hidden on this server." });
+  const grantsBox = () => el("div", { class: "cn-grants hidden-grants" }, ...hiddenGrantsBlock(g, has, blocked));
+  if (!h.editable) {
+    box.append(el("p", { class: "cn-sql-row hidden-refusal", text: hiddenCap(h.refusal || "these rules cannot be changed by this DBTrail") }));
+    if (has) box.append(listed());
+    box.append(grantsBox());
+    return;
+  }
+  if (!sessionMay("servers:write")) {
+    box.append(listed());
+    box.append(el("p", { class: "form-hint", text: "Someone who can change servers can edit this." }));
+    box.append(grantsBox());
+    return;
+  }
+  const ta = (name, label, lines) => {
+    const t = el("textarea", { class: "input hidden-ta", name, rows: "4", spellcheck: "false", autocomplete: "off", autocapitalize: "off", "aria-label": label });
+    t.value = lines.join("\n");
+    return t;
+  };
+  const tTA = ta("tables", "Hidden tables", tables), cTA = ta("columns", "Hidden columns", columns);
+  const save = el("button", { class: "btn btn-primary", type: "button", text: "Save" });
+  const msg = el("p", { class: "form-msg" + (said ? " ok" : ""), role: "status", text: said || "" });
+  msg.hidden = !said;
+  box.append(
+    el("label", { class: "field" }, el("span", { class: "field-label", text: "Tables" }), tTA,
+      el("span", { class: "form-hint", text: "One per line, like shop.audit_log, or shop.* for every table in shop." })),
+    el("label", { class: "field" }, el("span", { class: "field-label", text: "Columns" }), cTA,
+      el("span", { class: "form-hint", text: "One per line, like shop.customers.email, or shop.*.email for that column in every table in shop. Put odd names in backticks." })),
+    el("p", { class: "form-hint hidden-does", text: HIDDEN_DOES }),
+    el("p", { class: "form-hint hidden-does-not", text: HIDDEN_DOES_NOT }),
+    el("div", { class: "bk-restore-row" }, save), msg,
+    grantsBox());
+  save.onclick = async () => {
+    const gen = serverGen;
+    save.disabled = true;
+    msg.hidden = true;
+    let saved;
+    try {
+      saved = await api("/api/servers/" + encodeURIComponent(id) + "/hidden",
+        { method: "PUT", body: { tables: hiddenRulesLines(tTA.value), columns: hiddenRulesLines(cTA.value) } });
+    } catch (err) {
+      if (gen !== serverGen) return;
+      save.disabled = false;
+      msg.className = "form-msg err";
+      msg.textContent = (err && err.message) || String(err);
+      msg.hidden = false;
+      return;
+    }
+    // Stored whatever the sidebar picked meanwhile: the notes of that server
+    // read this map, and the save did land.
+    rememberHiddenAnswer(id, saved);
+    if (cur) cur.hidden = serverHiddenRules.get(id);
+    if (gen !== serverGen) return;
+    // The grants check is about the rules, so it is read again for the new ones.
+    const g2 = await hiddenGrantsFetch(id);
+    if (gen !== serverGen) return;
+    const now = serverHiddenRules.get(id);
+    const empty = !now;
+    hiddenRulesBody(box, cur, saved, g2, empty ? "Saved: nothing is hidden on this server now." : "Saved.");
+  };
+}
+
+// hiddenGrantsFetch reads the forwarding account's grants check: undefined
+// when this session may not read it (no settings:read, or a 403), "gone"
+// when the server is no longer in the list (404), null when the read failed.
+function hiddenGrantsFetch(id) {
+  if (!sessionMay("settings:read")) return Promise.resolve(undefined);
+  return api("/api/servers/" + encodeURIComponent(id) + "/route-grants").then((v) => v,
+    (err) => (err && err.status === 403 ? undefined : err && err.status === 404 ? "gone" : null));
+}
+
+// hiddenRulesPanel is the "Hidden from SQL" panel of the server picked in the
+// sidebar, on Settings, MySQL clients. Its own panel, apart from the SQL
+// client panel, which repaints when the router's numbers are read again and
+// would throw away what is being typed.
+function hiddenRulesPanel(cur) {
+  const panel = el("section", { class: "ov-panel cn-hidden sqlc", style: "margin-top:18px" });
+  panel.append(el("div", { class: "ov-panel-head" }, el("h2", { class: "ov-panel-title" }, "Hidden from SQL on ", el("code", { text: serverLabel(cur) }))));
+  const box = el("div", { class: "cn-sql-body" }, el("p", { class: "form-hint", text: "Reading this server's rules..." }));
+  panel.append(box);
+  const gen = serverGen, vgen = viewGen;
+  Promise.all([
+    api("/api/servers/" + encodeURIComponent(cur.id) + "/hidden").catch(() => null),
+    hiddenGrantsFetch(cur.id),
+  ]).then(([h, g]) => {
+    if (h) rememberHiddenAnswer(cur.id, h);
+    if (gen !== serverGen || vgen !== viewGen) return;
+    hiddenRulesBody(box, cur, h, g);
+  });
+  return panel;
 }
 
 // ── Access profiles (#1445) ──────────────────────────────────────────────────
@@ -16118,6 +16421,7 @@ async function loadServers() {
   defaultServerId = data.default_id || "";
   const servers = data.servers || [];
   serverNames = new Map(servers.map((s) => [s.id, s.name]));
+  rememberHiddenRules(servers);
   // Reconcile a stale selection (server deleted elsewhere).
   if (currentServer && !servers.some((s) => s.id === currentServer)) setCurrentServer("");
   serversEmpty = !servers.length;
