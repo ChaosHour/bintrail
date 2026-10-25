@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.117.0] - 2026-10-25
 ### Added
 - **Hide tables and columns from SQL, per server (#2529).**
   - **What it does.** **Settings**, **MySQL clients**, **Hidden from SQL on `<server>`** lists tables (`shop.audit_log`, `hr.*`) and columns (`shop.customers.email`, `shop.*.ssn`) that SQL on the copy, ordinary SQL on the MySQL port and the AI connector's `sql` tool treat as if they did not exist. It works like a view in MySQL: hiding is not deleting. The same rules are on `GET` and `PUT /api/servers/{id}/hidden`, and `GET /api/status` lists them under `hidden_from_sql`.
