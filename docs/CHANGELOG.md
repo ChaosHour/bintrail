@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.116.0] - 2026-10-24
+
 ### Changed
 
 - **A new server gets a snapshot every 5 minutes once its first snapshot is taken.**
@@ -20,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **What changed.** By default a statement on the copy is answered from each table's last snapshot, as old as its last refresh. Before, the newest captured changes ("tails") were always laid over the snapshot. That cost a fifth of the router's memory, an update every second, and a share of every statement's time.
   - **The fresh mode.** `SQL_FRESH=on` in the compose `.env` (compose file version 8), then `docker compose up -d router`, brings the tails back: answers about as far behind as capture. Outside Compose, `BINTRAIL_SQL_TAILS=on`. The router's startup line and its card in the web interface say which mode is on.
   - **Upgrading.** An install that relied on answers seconds behind capture must set `SQL_FRESH=on`. Otherwise its answers become as old as each table's last snapshot, so check the refresh cadence on the Snapshots page.
+
+### In progress
+
+- **Hidden tables and columns per server (#2529)** are partly in: the model and API, enforcement on SQL on the copy, the MySQL port and MCP `sql`, and the port's time-travel refusal. The web interface for them is not in yet. They do nothing until rules are saved through the API.
 
 ## [0.115.0] - 2026-10-24
 
