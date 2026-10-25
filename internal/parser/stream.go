@@ -48,6 +48,19 @@ type StreamParser struct {
 	// onFileOpened, when set, is told the identity of every binlog file the
 	// stream opens (see SetFileOpenedHook). Set before Run starts.
 	onFileOpened func(file, identity string)
+	// heartbeatPeriod is the replication heartbeat period the stream asked
+	// the source for (see SetHeartbeatPeriod); zero = unknown, and no
+	// EventCaughtUp is ever emitted.
+	heartbeatPeriod time.Duration
+}
+
+// SetHeartbeatPeriod tells Run the heartbeat period the replication client
+// asked the source for, which onHeartbeat needs to tell a heartbeat that
+// came straight off the wire from one that waited in a queue (#2556). Zero,
+// the default, turns EventCaughtUp off. Set before Run starts (the
+// SetFlavor contract).
+func (sp *StreamParser) SetHeartbeatPeriod(d time.Duration) {
+	sp.heartbeatPeriod = d
 }
 
 // NewStreamParser creates a StreamParser that resolves column names via
@@ -251,6 +264,16 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 	//     next transaction starts.
 	var lastCommittedGTID, ddlTxnGTID string
 	var afterRotate, skipTxn bool
+	// The last replication heartbeat (#2556): its file and position, and
+	// hbIdle while no other event arrived after it. See onHeartbeat.
+	var hbFile string
+	var hbPos uint64
+	var hbIdle bool
+	// waited is how long the last GetEvent blocked before it returned: the
+	// time this parser sat with nothing to read. prevReadAt is when the
+	// packet before the current one was read (zero before the first).
+	var waited time.Duration
+	var prevReadAt time.Time
 	// txnRows counts the row events emitted for the transaction in flight.
 	var txnRows int
 
@@ -379,8 +402,78 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 	// protocol — which go-mysql hands over pre-decoded in ev.Events.
 	// Returns ctx.Err() on cancellation; the Run loop translates that into
 	// a graceful nil.
+	// onHeartbeat turns a replication heartbeat into EventCaughtUp when it
+	// shows the source has nothing left to send this stream (#2556). A source
+	// sends one when it has had nothing newer for the heartbeat period; it is
+	// a message of the replication protocol, asked for with a session
+	// variable on this connection, and nothing is written anywhere.
+	//
+	// Caught up when either:
+	//   - the heartbeat is at the position of the last event received, in the
+	//     same file: everything before it arrived;
+	//   - two heartbeats in a row are at the same file and position, with no
+	//     event between them: the source sits idle at its binlog's end. This
+	//     is the case after a reconnect under GTID auto-position, where the
+	//     source skips what this stream already has and idles at a position
+	//     this stream never received an event at. While it skips, its
+	//     heartbeats move, so the pair never forms.
+	//
+	// Only a heartbeat that came straight off the wire counts: GetEvent must
+	// have blocked for at least half the heartbeat period before returning
+	// it. The client queues up to thousands of events ahead of this parser;
+	// a heartbeat that waited behind a backlog was sent long before it is
+	// read, and changes the source made in between sit behind it, unread,
+	// while its read time would claim them. A source sends a heartbeat only
+	// after a full period with nothing to send, so a parser keeping up waits
+	// about that long; one draining a queue gets it at once.
+	//
+	// The marker's time is capped at the previous packet's read time plus one
+	// period. The source sends a heartbeat one period after the last thing
+	// it sent, and that thing was read at prevReadAt, after it was sent: so
+	// the heartbeat left no later than prevReadAt + period. Its own read
+	// time is later than that when the network or this process stalled on
+	// the way, and changes the source made after sending it may still be on
+	// that way. The cap keeps the time to what the heartbeat proves; the
+	// error left is how late the previous packet was read, one normal hop.
+	//
+	// It is compared with the position as it stood BEFORE this heartbeat:
+	// heartbeats never move lastLogPos, so the wraparound guard and this
+	// check only ever see positions of events. Not during a re-sent
+	// transaction (skipTxn): the stream is mid-way through it. skipTxn ends
+	// only at the next transaction start, so after a reconnect that re-sends
+	// the last transaction and then sits idle, no marker comes until the next
+	// write. Accepted: that only delays a stamp, and ending the skip earlier
+	// would touch the guard against duplicated rows.
+	onHeartbeat := func(hb *replication.HeartbeatEvent, hdr *replication.EventHeader) error {
+		pos := uint64(hdr.LogPos)
+		if hb.Version == 2 {
+			pos = hb.Offset
+		}
+		caught := false
+		offWire := sp.heartbeatPeriod > 0 && waited >= sp.heartbeatPeriod/2
+		if hb.Filename != "" && !skipTxn && offWire {
+			atReceived := hb.Filename == currentFile && lastLogPos != 0 && pos == uint64(lastLogPos)
+			idlePair := hbIdle && hb.Filename == hbFile && pos == hbPos
+			caught = atReceived || idlePair
+		}
+		hbFile, hbPos, hbIdle = hb.Filename, pos, true
+		if !caught || prevReadAt.IsZero() {
+			return nil
+		}
+		marker := em
+		if latest := prevReadAt.Add(sp.heartbeatPeriod); latest.Before(marker.readAt) {
+			marker.readAt = latest
+		}
+		return marker.send(ctx, Event{EventType: EventCaughtUp})
+	}
+
 	var handleEvent func(binlogEv *replication.BinlogEvent) error
 	handleEvent = func(binlogEv *replication.BinlogEvent) error {
+		if hb, ok := binlogEv.Event.(*replication.HeartbeatEvent); ok {
+			return onHeartbeat(hb, binlogEv.Header)
+		}
+		// Any other event breaks a pair of idle heartbeats.
+		hbIdle = false
 		// Post-reconnect fill correction (#1117) — must run before the
 		// wraparound guard so both the guard and the emitted events see true
 		// file offsets, not FillZeroLogPos's ghost-FDE overshoot.
@@ -683,6 +776,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 	}
 
 	for {
+		asked := time.Now()
 		binlogEv, err := streamer.GetEvent(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -696,7 +790,9 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 		// and not where the consumer receives off `out`, because `out` is
 		// buffered and a receive-side stamp would swallow the queue wait, which
 		// is the largest part of the lag precisely when the indexer is behind.
+		prevReadAt = em.readAt
 		em = emitter{ch: out, readAt: time.Now(), rows: &txnRows}
+		waited = em.readAt.Sub(asked)
 
 		if err := handleEvent(binlogEv); err != nil {
 			if ctx.Err() != nil {
