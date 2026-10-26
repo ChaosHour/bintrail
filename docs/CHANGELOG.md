@@ -6,10 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.119.0] - 2026-10-26
 ### Changed
 - **The sidebar no longer has a Rotation entry.** It only opened the dialog the Retention page's **Edit rotation…** opens; the rotation settings are there, beside what they keep, and the search box (⌘K) still offers "Configure rotation…".
 - **Access profiles are no longer shown in the open-source build.** With one operator and nothing that assigns a profile to anyone, they described a mechanism with no one to apply it to. The console's Access profiles page is gone from the sidebar, the search box (⌘K) and its address; `flag`, `profile` and `access` are gone from `bintrail --help`, and `--profile` and `--flag` from the help of `query`, `recover` and `serve`; the docs no longer describe them. Nothing stops working: profiles and rules already in an index are still enforced, the commands and flags still run when typed, the `/api/access-profiles` API is still served, and an embedding build can show all of it again with `ext.SetAccessProfilesVisible(true)`.
 
+### Fixed
+- **Snapshots in an S3-compatible store with its own keys no longer time out off AWS.** Before every read the console asked the AWS credential chain for credentials, which off AWS waits about 5 seconds on an address that only answers inside AWS; on the Snapshots page those waits used up the time the page has for its reads, so each snapshot's age went ungraded and the log filled with `context deadline exceeded`. A bucket whose store carries its own keys now skips that lookup entirely, and when time does run out the message says so instead of asking whether httpfs is loaded.
+- **No more `Response has no supported checksum` lines for S3-compatible stores.** The AWS SDK logged one on every download from a store that sends no checksum headers, which is normal for them. Downloads that do carry a checksum are still checked, and snapshots keep their own integrity check.
 
 ## [0.118.1] - 2026-10-26
 ### Fixed
