@@ -1535,9 +1535,9 @@ function covCard(c, stamp) {
     const age = typeof c.checkpoint_age_seconds === "number" ? " for " + plainDuration(c.checkpoint_age_seconds) : "";
     card.append(el("p", { class: "cov-line bad", text:
       "Capture is STALLED: DBTrail has not checkpointed" + age + ". The window's upper edge is frozen: changes since then are NOT recoverable. Check that the stream is running." }));
-  } else if (asked === "up_to_date") {
+  } else if (covUpToDate(c)) {
     // Said only when the source was asked and holds nothing capture has not
-    // recorded. "captured" because the source may have written to schemas
+    // recorded, or told capture so itself over replication (#2556). "captured" because the source may have written to schemas
     // or tables capture does not read. The time is the newest captured change, in UTC like the
     // rest of the card; past a day it carries its date.
     const since = String(c.delta_to || "");
@@ -1909,7 +1909,7 @@ function copyDataAge(snap, cov) {
   const held = flowParseStamp(snap.data_as_of);
   let sec, asOf;
   if (isFinite(held)) {
-    if (isFinite(to) && held >= to && covCaptureState(cov) === "up_to_date") return files;
+    if (isFinite(to) && held >= to && covUpToDate(cov)) return files;
     const filesAt = flowParseStamp(snap.time);
     sec = isFinite(filesAt) ? filesSec + Math.max(0, (filesAt - held) / 1000) : filesSec;
     if (isFinite(to) && held <= to) sec = Math.max(sec, lag + (to - held) / 1000);
@@ -2091,7 +2091,7 @@ function ovFlowModel(inp) {
   // sets prove capture read all it can, not that nothing was written to
   // what it does not read. When it could not be asked the box says no word.
   const source = piece("Your MySQL", "none", srv && srv.source_host ? srv.source_host : "", "");
-  if (!cut && capture.tone === "ok" && capture.line === "connected" && covCaptureState(cov) === "up_to_date") source.line = "up to date";
+  if (!cut && capture.tone === "ok" && capture.line === "connected" && covUpToDate(cov)) source.line = "up to date";
 
   // Table definitions (the DBTrail box): what the schema snapshot last did,
   // the count of captured tables, and a schema change that stopped the copy.
@@ -11604,8 +11604,11 @@ function choicePills(choices, value, label, onChange) {
 function sqlModeModel(cur, rt, mayWrite) {
   const saved = cur && cur.sql_fresh ? "fresh" : "fast";
   const word = (m) => (m === "fresh" ? "Fresh" : "Fast");
-  const out = { pick: saved, editable: !!mayWrite, state: "", tone: "", note: "" };
+  const out = { pick: saved, editable: !!mayWrite, state: "", tone: "", note: "", behind: null };
   const st = rt && rt.status;
+  // #2556: how far behind your MySQL this server's last query read, said
+  // under whatever mode applies.
+  if (st && st.servers && cur) out.behind = behindSourceLine(st.servers[cur.id]);
   if (!st) {
     const why = rt === undefined ? "This session cannot read the router's numbers"
       : rt && rt.configured === false ? "This DBTrail does not know where its router runs (ROUTER_URL in the compose .env)"
@@ -11663,6 +11666,7 @@ function sqlModeCard(cur, rt) {
   card.append(el("div", { class: "ov-panel-head" },
     el("h2", { class: "ov-panel-title stg-card-t" }, icon("clock", "stg-ico stg-ico-sun"), "How current SQL answers are")));
   card.append(el("p", { class: "form-hint bk-card-state" + (m.tone ? " " + m.tone : ""), text: m.state }));
+  if (m.behind) card.append(el("p", { class: "form-hint sql-mode-behind", text: m.behind.text }));
   const pills = choicePills([["fast", "Fast"], ["fresh", "Fresh"]], m.pick, "How current SQL answers are", () => { paintCost(); save.classList.add("btn-primary"); });
   pills.classList.add("sql-mode-pills");
   const cost = el("p", { class: "form-hint sql-mode-cost" });
@@ -15797,6 +15801,54 @@ function routerSecs(sec) {
   if (s < 60) return s.toFixed(1).replace(/\.0$/, "") + " s";
   return plainDuration(s);
 }
+// behindSourceLine (#2556) is the one sentence that says how far behind
+// the source the last query on the copy read, from the router's status for
+// one server (behind_source_*): read like MySQL's Seconds_Behind_Source, 0
+// when capture was caught up and the query read every change DBTrail had.
+// One number and nothing under it. Null when the router does not say (an
+// older router, or the copy answered nothing for this server yet).
+function behindSourceLine(t) {
+  if (!t) return null;
+  const sec = Number(t.behind_source_seconds);
+  if (t.behind_source_seconds != null && isFinite(sec) && sec >= 0) {
+    const ran = t.behind_source_ran ? new Date(t.behind_source_ran) : null;
+    return { state: "known", seconds: sec, words: routerBehindWords(sec),
+      text: "The last query read data " + routerBehindWords(sec) + " behind your MySQL.",
+      ran: ran && !isNaN(ran) ? ran : null };
+  }
+  if (t.behind_source_pending === true) {
+    return { state: "pending", text: "How far behind your MySQL the last query read is being worked out. Refresh in a few seconds." };
+  }
+  if (t.behind_source_unknown_reason) {
+    return { state: "unknown", text: "How far behind your MySQL the last query read cannot be told: " + t.behind_source_unknown_reason + "." };
+  }
+  return null;
+}
+
+// CAUGHT_UP_WINDOW_SECONDS is how recent capture's caught-up stamp must be
+// for it to count as caught up now: two replication heartbeat periods, the
+// router's caughtUpWindow. A quiet source is stamped about every 30 to 40
+// seconds.
+const CAUGHT_UP_WINDOW_SECONDS = 60;
+
+// captureCaughtUp says the coverage document shows capture caught up with
+// its source within the window (caught_up_ago_seconds, #2556), and only
+// while capture is idle: the stamp says when capture was LAST caught up, so
+// with recent changes being indexed ("current") a burst or a restart after
+// it could be hiding a backlog, and only a quiet capture keeps it true.
+function captureCaughtUp(cov) {
+  return !!cov && cov.freshness === "idle" && typeof cov.caught_up_ago_seconds === "number" &&
+    cov.caught_up_ago_seconds >= 0 && cov.caught_up_ago_seconds <= CAUGHT_UP_WINDOW_SECONDS;
+}
+
+// covUpToDate says capture holds everything its source had: the source said
+// so when asked (#1794), or told capture so itself over replication within
+// the window (#2556). The source's own "behind" wins over a stamp.
+function covUpToDate(cov) {
+  const asked = covCaptureState(cov);
+  return asked === "up_to_date" || (asked !== "behind" && captureCaughtUp(cov));
+}
+
 // routerBehindWords says a lag in words, in its two largest units, the
 // smaller ROUNDED UP: a lag is never said smaller than it was ("3 seconds",
 // "1 minute 29 seconds", "1 hour 30 minutes", "2 days 10 hours").
@@ -15832,7 +15884,7 @@ function routerSidesModel(view, cur) {
     };
   };
   const out = { mysql: side("mysql", mysql), copy: side("copy", copy), refused: refused, total: mysql + copy,
-    share: mysql + copy > 0 ? copy / (mysql + copy) : 0, data: null };
+    share: mysql + copy > 0 ? copy / (mysql + copy) : 0, data: null, behind: copy > 0 ? behindSourceLine(t) : null };
   // How far behind capture the copy's data was (#2369): the last answer's,
   // when it ran, and the worst since counting began, as the router measured
   // them. Not the snapshot's age: with tails the copy answers newer than its
@@ -16115,7 +16167,15 @@ function routerSides(m) {
     if (s.slowest) facts.append(el("span", { class: "rs-fact" }, "slowest ", el("b", { text: s.slowest })));
     if (s.errors) facts.append(el("span", { class: "rs-fact bad" }, el("b", { text: String(s.errors) }), s.errors === 1 ? " error" : " errors",
       s.timeouts ? " (" + s.timeouts + " out of time)" : ""));
-    if (s.key === "copy" && m.data) {
+    if (s.key === "copy" && m.behind) {
+      // #2556: one number, how far behind your MySQL the last query read.
+      // It replaces the lag and the max lag, which measure the data's age
+      // and read an hour behind on a source that was only quiet.
+      const b = m.behind;
+      const word = b.state === "known" ? b.words : b.state === "pending" ? "being worked out" : "unknown";
+      facts.append(el("span", { class: "rs-fact", title: b.text + (b.ran ? " That query ran " + b.ran.toLocaleString() + "." : "") },
+        "Behind your MySQL: ", el("b", { text: word }), " (last query)"));
+    } else if (s.key === "copy" && m.data) {
       const d = m.data;
       if (d.state === "known") facts.append(el("span", { class: "rs-fact", title: "Its data reached " + d.at.toLocaleString() }, "Lag: ", el("b", { text: d.age }), " (last answer)"));
       else if (d.pending) facts.append(el("span", { class: "rs-fact", title: "The router works out the lag of an answer over a snapshot within 30 seconds. Refresh to see it." }, "Lag: ", el("b", { text: "being worked out" }), " (last answer)"));
