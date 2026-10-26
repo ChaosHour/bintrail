@@ -99,7 +99,35 @@ const NotInDestinationFile = ".not-in-destination.json"
 type NotInDestination struct {
 	At    time.Time `json:"at"`
 	Count int       `json:"count"`
+	// Names are the first of them (notInDestinationNamesKept), oldest
+	// first, so the page can say which; absent in a record an older build
+	// wrote.
+	Names []string `json:"names,omitempty"`
+	// Resending says this daemon sends them again after each cleanup
+	// (#2563); false, or absent, when nothing here will, and the page says
+	// to send or remove them by hand.
+	Resending bool `json:"resending,omitempty"`
 }
+
+// RewriteNotInDestination replaces dir's record after the cleanup's resends
+// (#2563): with nothing left it is removed, so the page stops saying a
+// snapshot S3 now has is missing until the next cleanup.
+func RewriteNotInDestination(dir string, rec NotInDestination) error {
+	if rec.Count <= 0 {
+		if err := removeRecord(filepath.Join(dir, NotInDestinationFile)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	if len(rec.Names) > notInDestinationNamesKept {
+		rec.Names = rec.Names[:notInDestinationNamesKept]
+	}
+	return writeNotInDestRecord(dir, rec)
+}
+
+// notInDestinationNamesKept bounds Names: the page names a few, the count
+// says how many.
+const notInDestinationNamesKept = 5
 
 // ReadNotInDestination reads dir's record; ok is false when the last attempt
 // found every old snapshot at the destination. An unreadable record is an
